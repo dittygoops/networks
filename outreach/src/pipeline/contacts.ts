@@ -195,6 +195,11 @@ export interface PaperContext {
 export interface ExtractOptions {
   paperAgeMonths?: number;
   paperContext?: PaperContext;
+  // Task A: the author's CURRENT affiliation (resolved via OpenAlex upstream).
+  // When present it takes precedence over paperContext.affiliationHint /
+  // person.affiliation for both the web query and the D5a guard, so a mover's
+  // current institution drives discovery instead of the paper's stale one.
+  currentAffiliation?: string;
 }
 
 const FRESH_PAPER_MONTHS = 12;
@@ -217,7 +222,7 @@ export async function extractContact(
   const paperPick = selectEmail(paperCandidates, person.name, paperAgeMonths);
   if (paperPick && paperAgeMonths < FRESH_PAPER_MONTHS) return paperPick;
 
-  const affiliation = options.paperContext?.affiliationHint ?? person.affiliation ?? '';
+  const affiliation = options.currentAffiliation ?? options.paperContext?.affiliationHint ?? person.affiliation ?? '';
 
   // D5a guard: affiliation is the disambiguator. Without it, a common name
   // can't be safely resolved from the web, so web emails route to manual.
