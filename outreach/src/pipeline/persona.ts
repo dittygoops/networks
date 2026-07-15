@@ -2,7 +2,7 @@
 // self-interview. Writes facts with person_id NULL. Spec: docs/spec-persona.md.
 import type { LLMClient } from '../llm/client.js';
 import { SELF_EXTRACT_SYSTEM, buildSelfExtractUser } from '../llm/prompts.js';
-import { normalizeKey, type OntologyFact } from './research.js';
+import { normalizeKey, splitHobbyFacts, type OntologyFact } from './research.js';
 
 const SELF_SOURCE = 'self';
 const DEFAULT_DOC_CONFIDENCE = 0.85; // first-person authoritative materials
@@ -104,25 +104,8 @@ export interface PersonaInput {
   answers?: Record<string, string>;
 }
 
-// Hobbies often arrive as one list ("Chess, Football, Running"). Split hobby
-// facts into one per item so a recipient who plays chess matches "chess"
-// specifically, not the whole list.
-function expandHobbies(facts: OntologyFact[]): OntologyFact[] {
-  const out: OntologyFact[] = [];
-  for (const f of facts) {
-    if (f.facet === 'interest' && f.key === 'hobby' && /[,;]|\band\b/i.test(f.value)) {
-      for (const part of f.value.split(/[,;]|\band\b/i).map((s) => s.trim()).filter(Boolean)) {
-        out.push({ ...f, value: part });
-      }
-    } else {
-      out.push(f);
-    }
-  }
-  return out;
-}
-
 // P5: extract from each document (failures skip that doc), add interview facts,
-// split hobby lists, dedupe exact (facet,key,value). Caller persists.
+// split hobby lists (shared helper), dedupe exact (facet,key,value). Caller persists.
 export async function buildSelfOntology(deps: PersonaDeps, input: PersonaInput): Promise<OntologyFact[]> {
   const all: OntologyFact[] = [];
   for (const doc of input.documents) {
@@ -132,7 +115,7 @@ export async function buildSelfOntology(deps: PersonaDeps, input: PersonaInput):
 
   const seen = new Set<string>();
   const deduped: OntologyFact[] = [];
-  for (const f of expandHobbies(all)) {
+  for (const f of splitHobbyFacts(all)) {
     const k = `${f.facet}|${f.key}|${f.value.toLowerCase()}`;
     if (seen.has(k)) continue;
     seen.add(k);
