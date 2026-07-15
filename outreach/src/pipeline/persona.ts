@@ -8,20 +8,17 @@ const SELF_SOURCE = 'self';
 const DEFAULT_DOC_CONFIDENCE = 0.85; // first-person authoritative materials
 const INTERVIEW_CONFIDENCE = 0.95; // self-reported
 
-// P4: facet tier caps for self-facts (clamp only lowers). A hobby should never
-// be a lead-with-it Tier A.
-const FACET_TIER_CAP: Record<OntologyFact['facet'], 'A' | 'B' | 'C'> = {
+// P4: self-fact tiers are deterministic by facet, NOT taken from the model.
+// These are Aditya's own curated facts, so the "dig-only" Tier C does not apply:
+// his professional work is lead-with-it (A) and his openly-listed personal facts
+// (hobbies, communities) are mention-if-natural (B). The intersection engine
+// takes min(self, person), so the person side still enforces the creepiness
+// boundary. This is what keeps a resume-listed hobby (chess) usable as a hook.
+const SELF_FACET_TIER: Record<OntologyFact['facet'], 'A' | 'B' | 'C'> = {
   academic: 'A',
   trajectory: 'A',
   interest: 'B',
 };
-const TIER_RANK: Record<string, number> = { A: 0, B: 1, C: 2 };
-
-function clampToCap(proposed: string | undefined, cap: 'A' | 'B' | 'C'): 'A' | 'B' | 'C' {
-  const capRank = TIER_RANK[cap] ?? 2;
-  const proposedRank = TIER_RANK[proposed ?? ''] ?? capRank;
-  return (['A', 'B', 'C'] as const)[Math.max(proposedRank, capRank)] ?? cap;
-}
 
 interface RawFact {
   facet?: string;
@@ -63,7 +60,7 @@ export async function factsFromDocument(llm: LLMClient, docText: string, sourceL
       value: String(rf.value).trim(),
       sourceUrl: `${SELF_SOURCE}:${sourceLabel}`,
       confidence,
-      tier: clampToCap(rf.proposedTier, FACET_TIER_CAP[rf.facet]),
+      tier: SELF_FACET_TIER[rf.facet],
     });
   }
   return facts;
@@ -107,8 +104,25 @@ export interface PersonaInput {
   answers?: Record<string, string>;
 }
 
+// Hobbies often arrive as one list ("Chess, Football, Running"). Split hobby
+// facts into one per item so a recipient who plays chess matches "chess"
+// specifically, not the whole list.
+function expandHobbies(facts: OntologyFact[]): OntologyFact[] {
+  const out: OntologyFact[] = [];
+  for (const f of facts) {
+    if (f.facet === 'interest' && f.key === 'hobby' && /[,;]|\band\b/i.test(f.value)) {
+      for (const part of f.value.split(/[,;]|\band\b/i).map((s) => s.trim()).filter(Boolean)) {
+        out.push({ ...f, value: part });
+      }
+    } else {
+      out.push(f);
+    }
+  }
+  return out;
+}
+
 // P5: extract from each document (failures skip that doc), add interview facts,
-// dedupe exact (facet,key,value). Caller persists via replaceSelfFacts.
+// split hobby lists, dedupe exact (facet,key,value). Caller persists.
 export async function buildSelfOntology(deps: PersonaDeps, input: PersonaInput): Promise<OntologyFact[]> {
   const all: OntologyFact[] = [];
   for (const doc of input.documents) {
@@ -118,7 +132,7 @@ export async function buildSelfOntology(deps: PersonaDeps, input: PersonaInput):
 
   const seen = new Set<string>();
   const deduped: OntologyFact[] = [];
-  for (const f of all) {
+  for (const f of expandHobbies(all)) {
     const k = `${f.facet}|${f.key}|${f.value.toLowerCase()}`;
     if (seen.has(k)) continue;
     seen.add(k);
