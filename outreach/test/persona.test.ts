@@ -60,6 +60,25 @@ describe('factsFromDocument (P2)', () => {
     const facts = await factsFromDocument(fakeLLM('not json'), 'text', 'label');
     expect(facts).toEqual([]);
   });
+
+  test('a self interest fact is tier B even when the model proposes C (resume hobbies are shareable)', async () => {
+    const facts = await factsFromDocument(fakeLLM(JSON.stringify([
+      { facet: 'interest', key: 'hobby', value: 'chess', proposedTier: 'C' },
+    ])), 'resume', 'resume');
+    expect(facts[0]?.tier).toBe('B');
+  });
+});
+
+describe('buildSelfOntology hobby splitting', () => {
+  test('splits a comma-separated hobby list into one Tier-B fact each', async () => {
+    const llm = fakeLLM(JSON.stringify([
+      { facet: 'interest', key: 'hobby', value: 'Chess, Football, Running', proposedTier: 'B' },
+    ]));
+    const facts = await buildSelfOntology({ llm }, { documents: [{ label: 'resume', text: 't' }] });
+    const hobbies = facts.filter((f) => f.key === 'hobby');
+    expect(hobbies.map((f) => f.value).sort()).toEqual(['Chess', 'Football', 'Running']);
+    expect(hobbies.every((f) => f.tier === 'B')).toBe(true);
+  });
 });
 
 describe('interviewFacts (P3)', () => {
