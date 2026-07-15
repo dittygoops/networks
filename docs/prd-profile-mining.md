@@ -40,13 +40,13 @@ Writing a credible personalized email to a researcher requires knowing them well
 **F1. Contact extraction (tiered, confidence-gated)**
 - Confidence is a 0 to 1 score assigned deterministically by source and name-match quality (exact table in the spec). **Threshold: ≥ 0.7 is send-eligible.**
 - Tier 1: emails in the paper PDF (corresponding-author markers score highest).
-- Tier 2: Google Scholar profile → university/lab homepage (most reliable `.edu` source).
+- Tier 2: university/lab homepage or directory page found via web search (most reliable `.edu` source).
 - Tier 3: GitHub profile or commit metadata (GitHub `noreply` addresses are always discarded).
 - An email is only attributed to the target if its local part matches the person's name (matching rule in the spec). Each found email is stored with source and confidence.
 - Below threshold, the person enters the **manual-lookup queue**: extraction returns "not found," the owning record is flagged, and the queue is visible via CLI (`outreach list --needs-email`) and the review page. Resolution is manual (`outreach set-email`).
 
 **F2. Person ontology**
-- Sources: Google Scholar, personal/lab homepage, GitHub, X/Twitter (only as surfaced by web search), personal blogs, conference bios, podcast/talk appearances.
+- Sources: OpenAlex (structured academic data: papers, co-authors, time-stamped affiliations, research concepts), personal/lab homepage, GitHub, X/Twitter (only as surfaced by web search), personal blogs, conference bios, podcast/talk appearances. (Google Scholar is not scraped: it blocks automated access and OpenAlex covers the same academic facts reliably.)
 - Research effort is bounded: at most 6 web-search queries per person (query plan in the spec).
 - Structured facets, each fact stored with source URL, confidence, and retrieved-at date:
   - *Academic*: research areas, methods, key papers, venues, advisors/lab lineage.

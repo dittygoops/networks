@@ -4,23 +4,25 @@
 
 ## Overview
 
-TypeScript modules inside the `outreach/` project that take a target person (name plus paper context) and produce: a confident contact email (or a not-found result), a structured person ontology in SQLite, and ranked, tiered intersections against the self-ontology. Pipeline: contact extraction (PDF → Scholar/homepage → GitHub) → Tavily research → cheap-tier LLM fact extraction → intersection scoring. Consumed downstream by draft generation and the review page; consumes the self-ontology produced by the persona subsystem.
+TypeScript modules inside the `outreach/` project that take a target person (name plus paper context) and produce: a confident contact email (or a not-found result), a structured person ontology in SQLite, and ranked, tiered intersections against the self-ontology. Pipeline: contact extraction (PDF → homepage/directory/GitHub via Tavily) → research (OpenAlex for academic facts + identity, Tavily for personal free-text facets) → cheap-tier LLM fact extraction → intersection generation. Consumed downstream by draft generation and the review page; consumes the self-ontology produced by the persona subsystem.
 
 ## Architecture
 
 ### Stack (subsystem-relevant slice)
 | Concern | Choice | Notes |
 |---|---|---|
-| Web search | `@tavily/core` | Free tier 1,000 credits/mo; returns extracted page content |
+| Web search | `@tavily/core` | Free tier 1,000 credits/mo; snippets + full-page `extract` |
+| Academic data | OpenAlex REST (`fetch`, no SDK, no key) | Author identity, co-authors, time-stamped affiliations, concepts, works; polite `User-Agent` |
 | PDF text | `unpdf` | Tier-1 email extraction from paper PDFs |
+| Registrable domain | `tldts` | Public-suffix-aware domain reduction (D-domain) |
 | LLM | OpenRouter, `cheap` tier (`MODEL_CHEAP`, default `deepseek/deepseek-chat` class), temperature 0 | Fact extraction, profile summarization, intersection scoring |
 | DB | shared `better-sqlite3` ledger (`outreach/data/outreach.db`) | Tables below |
 
 ### Modules
 ```
 outreach/src/pipeline/
-├── contacts.ts     # tiered email extraction: PDF → Scholar/homepage → GitHub
-├── research.ts     # Tavily searches → person ontology facts
+├── contacts.ts     # tiered email extraction: PDF → homepage/directory/GitHub (Tavily)
+├── research.ts     # OpenAlex (academic/identity) + Tavily (personal) → ontology facts
 └── intersect.ts    # self × person ontology → ranked, tiered intersections
 ```
 
@@ -73,29 +75,29 @@ Search returns ranked result pages; emails rarely appear in the search *snippet*
 An email local part matches a person if, after lowercasing and stripping digits/punctuation, it contains (a) the full last name, or (b) the full first name, or (c) an initials pattern (first initial + last name, or first name + last initial). Example: for "Aditya Gupta", `agupta`, `aditya.g`, `gupta3` match; `avsim.lab` does not.
 
 ### D3. Tier-cap table (source class → maximum usability tier)
-The extractor proposes a tier; code clamps it to the cap. A Tier-C source can never yield an A or B fact.
+The extractor proposes a tier; code clamps it to the cap. A Tier-C source can never yield an A or B fact. **Source class is assigned deterministically**, not by the LLM: OpenAlex → `openalex`; a fetched web page → its `classifyWebPage` result (`homepage`/`directory`/`github_profile`/`aggregator`) refined by URL path (a `/blog/` or `/posts/` path under a homepage → `blog`; a known social host → `social`).
 
-| Source class | Cap |
-|---|---|
-| arXiv, DBLP, Google Scholar | A |
-| University or lab page, official directory | A |
-| GitHub repos, profile README, contribution history | A |
-| Conference program/workshop pages | A |
-| Person's own blog posts | B |
-| Personal-homepage bio/about sections (non-research content) | B |
-| Conference bios, podcast/talk appearances | B |
-| X/social posts, archived/old profiles, forums, personal social media | C |
-| Anything else | C |
+| Source class (detectable) | Cap | Notes |
+|---|---|---|
+| `openalex` | A | structured academic/institutional data |
+| `homepage` (research/about), `directory`, `github_profile` | A | institutional / professional |
+| `blog` (own blog posts), homepage bio/personal sections | B | professional-adjacent personal |
+| conference bios, podcast/talk pages | B | |
+| `social`, archived/old profiles, forums | C | dig-only; never referenced in an email |
+| anything else / `aggregator` | C | aggregators contribute no facts anyway |
 
-### D4. Research query plan (max 6 Tavily queries per person)
-1. `"<name>" <affiliation>`
-2. `"<name>" Google Scholar`
-3. `"<name>" <affiliation> homepage`
-4. `"<name>" GitHub`
-5. `"<name>" blog OR talk OR podcast`
-6. One free follow-up query, chosen by the extractor only if a specific lead needs confirmation (e.g. a homepage URL found in query 1).
+### D3a. External data sources (OpenAlex + Tavily) — grounds D4/D5b/D6a
+Validated with live OpenAlex calls (Kerbl):
+- **OpenAlex** (`api.openalex.org`, free, no key, polite `User-Agent` carrying `apgupta3@asu.edu`) is the backbone for academic + institutional facts and identity. One author-search + author-detail + recent-works query yields: disambiguated author identity, **co-author full names per work**, **time-stamped affiliations** (so current affiliation = the most recent affiliation year: Kerbl resolves to TU Wien 2020–2025 over INRIA 2023–2024), research **concepts**, and work **titles/venues/years**. This replaces Google Scholar (scraping is blocked; Tavily returns only thin Scholar snippets).
+- **Tavily** is used only for the free-text facets OpenAlex lacks: personal-homepage bio, blog posts, GitHub activity, talks/podcasts (the `interest` facet and B/C-tier personal facts).
+- No Scholar / LinkedIn scraping (PRD non-goal).
+- Bonus coupling: OpenAlex's current affiliation can be fed back to contact extraction (Step A) to sharpen a mover's email search, replacing the stale paper affiliation.
 
-Fact extraction batches all accepted pages into at most 3 cheap-tier LLM calls; one more call produces the short profile summary. Total per person: ≤ 6 searches, ≤ 4 LLM calls.
+### D4. Research plan and budget (per person)
+- **OpenAlex (≤ 3 HTTP calls)**: (1) `/authors?search=<name>`; (2) resolve to the paper's author via D5b; (3) `/works?filter=author.id:<id>&sort=publication_date:desc&per_page=25` for co-authors, venues, current affiliation, concepts.
+- **Tavily (≤ 3 searches, ≤ 3 fetches)**: `"<name>" <currentAffiliation> homepage`, `"<name>" blog OR talk`, `"<name>" github` — using the **current** affiliation from OpenAlex, not the stale paper one.
+- **LLM (cheap tier, ≤ 4 calls)**: extract facts from the fetched Tavily free-text pages (OpenAlex data is structured and needs no LLM) in ≤ 3 calls; 1 call for the short profile summary.
+- Hard caps: ≤ 3 OpenAlex calls, ≤ 3 Tavily searches, ≤ 3 fetches, ≤ 4 cheap LLM calls per person.
 
 ### D5. Identity corroboration (split: retrieval-time now, semantic in Step B)
 Common names are the core risk: a plain `"Jonathan Barron"` search returns a lawyer, a med student, and an honors undergrad before the researcher, whose homepage is not even in the top 8. Two empirical facts drive the split:
@@ -108,23 +110,34 @@ Common names are the core risk: a plain `"Jonathan Barron"` search returns a law
 - The two-pass domain discovery (D1c) handles movers: the affiliation-enriched (or, when affiliation is absent, plain-name) pass-1 search surfaces the current homepage, whose domain then drives pass 2.
 - **Conservative guard**: if no `affiliationHint` is available, web-sourced emails are not send-eligible (they route to the manual queue), because without an affiliation a common name cannot be safely disambiguated. In the real pipeline this rarely fires (intake always provides affiliation); it exists so a context-free call can never confidently pick a homonym.
 
-**D5b — semantic identity corroboration (Step B, deferred).** Before trusting a person's footprint, confirm it belongs to the paper's author by reading Scholar/DBLP/homepage content for: a co-author's **full** name (last name ≥ 4 chars, to avoid the "Ng" trap), the paper title, or the arXiv ID; falling back to LLM research-area overlap with the paper's primary category. This needs fetched page content and the cheap-tier LLM, so it lives in `research.ts`, not snippet-based contact extraction. A page contributes ontology facts only if it passes this check.
+**D5b — identity corroboration via OpenAlex (Step B, deterministic-first).** Resolve the paper's author to a single OpenAlex author; that author's record then *is* the corroborated footprint.
+- Score each `/authors?search=<name>` candidate against `PaperContext`: **strong** signal if one of the candidate's works has a co-author whose full name matches a paper co-author (last name ≥ 4 chars, avoiding the "Ng" trap), or a work title matches the paper title, or the arXiv ID / DOI matches; **weak** signal if a candidate research concept overlaps the paper's primary area and a listed affiliation matches `affiliationHint`.
+- Accept the top candidate if it has ≥ 1 strong signal or ≥ 2 weak signals; otherwise the person is **UNRESOLVED** → skip academic facts and flag the person "identity unconfirmed" for the drafter. LLM area-overlap is only a last-resort tie-break between two otherwise-equal candidates.
+- A Tavily free-text page contributes facts only if its domain matches the resolved author's current/known affiliation domain or homepage, or it is linked from an OpenAlex-listed URL. This is what stops a same-named homonym's homepage from injecting facts.
 
-### D6. Intersection scoring rubric
-Cheap-tier LLM scores each candidate pair 0 to 1 with this rubric in the prompt:
+### D6a. Fact schema, confidence, and extraction
+Every `ontology_facts` row: `{ facet, key, value, source_url, confidence 0-1, usability_tier }`.
+- **OpenAlex facts (no LLM, deterministic confidence)**: current affiliation 0.9, prior affiliations 0.8, research concepts 0.85, venues 0.8, co-authors→advisor/lab inference 0.7. Facet `academic` or `trajectory`; tier A (source class `openalex`).
+- **Tavily free-text facts (cheap LLM)**: the extractor returns a JSON array of `{ facet, key, value, confidence, proposedTier }`; code clamps `proposedTier` to the page's D3 source-class cap. Confidence rubric in the prompt: 0.8 explicit first-person statement on the person's own page; 0.6 stated on a corroborated third-party page; < 0.5 inferred/uncertain (stored but excluded from intersections). Temperature 0, JSON mode; on parse failure retry once, then skip that page (never crash the run).
+- `key` is drawn from the D-vocabulary constant (below the schema). Facts below confidence 0.5 are excluded from intersections (D6) and from hooks.
+
+### D6. Intersection generation (bounded LLM, not pairwise)
+Do **not** score all self×person pairs (O(n·m) calls). A single cheap-tier LLM call receives the full self-fact list and the full person-fact list (both pre-filtered to confidence ≥ 0.5) and returns candidate intersections as JSON `{ selfKey, personKey, strength, rationale }`. A second chunked call runs only if either list > 40 facts. Code maps keys back to fact ids, sets `tier = min(self_fact.tier, person_fact.tier)`, drops strength < 0.3, keeps the top 20 by strength.
+
+Strength rubric (in the prompt):
 - 0.9 to 1.0: same specific research problem, method, or artifact (e.g. both worked with nuScenes evaluation, both built 3DGS pipelines).
 - 0.7 to 0.8: same subfield plus a concrete shared element (venue, dataset, open-source ecosystem, institution).
 - 0.5 to 0.6: same broad field, or a specific non-academic overlap (same city lived in, same community).
 - 0.3 to 0.4: generic overlap (both do ML, both like hiking).
 - Below 0.3: discarded, not stored.
 
-Storage cap: top 20 per person, ranked by strength descending. `tier = min(self_fact.tier, person_fact.tier)`. Facts with confidence < 0.5 never enter scoring. If nothing scores ≥ 0.5, `computeIntersections` returns `{ noStrongHook: true }` alongside whatever weak intersections exist.
+If nothing scores ≥ 0.5, `computeIntersections` returns `{ noStrongHook: true }` alongside whatever weak intersections exist.
 
 ### D7. Staleness
 Facts with `retrieved_at` older than **180 days** are re-verified before backing a hook: one targeted Tavily query re-checks the fact; confirmed → `retrieved_at` refreshed; contradicted → confidence dropped to 0.4 (excluded from hooks) and the fresh fact inserted. Re-verification is lazy (only for facts backing the top-ranked intersections handed to the drafter).
 
 ### D8. Conflict rule
-Two facts with the same `(person, facet, key)` but different values: the one from the more recent primary source keeps its confidence; the other is set to 0.4. Primary-source order: person's own homepage > Scholar > university page > everything else.
+Two facts with the same `(person, facet, key)` but different values: the one from the more recent primary source keeps its confidence; the other is set to 0.4. Primary-source order: OpenAlex (structured) > person's own homepage > university page > everything else.
 
 ### D9. Self-ontology dependency
 `intersect.ts` reads `ontology_facts WHERE person_id IS NULL`, read-only. If zero self facts exist it throws `SelfOntologyMissingError` with the message "Run persona setup first." For development and tests before the persona subsystem exists, a fixture file (`test/fixtures/self-ontology.json`) is loaded by test setup and by an interim dev command `outreach dev:seed-self <file>`; that command is deleted when the persona subsystem lands.
@@ -184,7 +197,7 @@ Tier 1 PDF emails → Tier 2 Tavily (Scholar profile, homepage) → Tier 3 GitHu
 ✅ *Human: run on 3 papers; spot-check each found email against the person's real homepage. Verify a paper with no findable email returns null and surfaces in the queue.*
 
 **Step B — Person ontology** (`research.ts`)
-D4 query plan → D5 corroboration filter → cheap-tier extraction into `ontology_facts` with facet, source, confidence, D3 tier caps.
+OpenAlex resolve+corroborate (D5b) → structured academic/trajectory facts → Tavily personal-facet pages (domain-gated by D5b) → cheap-tier extraction (D6a) into `ontology_facts` with facet, source, deterministic confidence, D3 tier caps. Budget per D4.
 ✅ *Human: review one generated person ontology: are facts accurate and sourced? Are the A/B/C tiers assigned the way you'd judge them? This gate calibrates the creepiness boundary (and the D1/D3 tables), take it seriously.*
 
 **Step C — Intersection engine** (`intersect.ts`)
@@ -198,7 +211,7 @@ flowchart LR
     P[Paper + target author] --> CE[contacts.ts<br/>D1/D2 tables]
     CE -->|confidence ≥ 0.7| PPL[(people)]
     CE -->|null| MQ[manual-lookup queue<br/>owned by intake]
-    P --> R[research.ts<br/>D4 queries + D5 filter]
+    P --> R[research.ts<br/>OpenAlex + Tavily, D5b corroborate]
     R --> OF[(ontology_facts<br/>person, D3 tier caps)]
     SO[(ontology_facts<br/>self, persona subsystem)] --> IX[intersect.ts<br/>D6 scoring]
     OF --> IX
