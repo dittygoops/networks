@@ -30,6 +30,7 @@ const MIN_CONFIDENCE = 0.5; // facts below this never enter scoring (D6a)
 const MIN_STRENGTH = 0.3; // intersections below this are discarded (D6)
 const STRONG_HOOK = 0.5;
 const MAX_INTERSECTIONS = 20;
+const MAX_PER_SELF_FACT = 2; // a single self-fact should not spawn many near-duplicate hooks (D6)
 const TIER_RANK: Record<string, number> = { A: 0, B: 1, C: 2 };
 
 interface RawIntersection {
@@ -51,7 +52,7 @@ export async function computeIntersections(
   if (person.length === 0) return { ranked: [], noStrongHook: true };
 
   const raw = await callModel(deps.llm, self, person);
-  const ranked = mapIntersections(raw, self, person);
+  const ranked = dedupe(mapIntersections(raw, self, person));
 
   saveIntersections(db, personId, ranked.map((x) => ({
     selfFactId: x.selfFactId,
@@ -104,4 +105,23 @@ function mapIntersections(raw: RawIntersection[], self: StoredFact[], person: St
     });
   }
   return out.sort((a, b) => b.strength - a.strength).slice(0, MAX_INTERSECTIONS);
+}
+
+// Cleans up near-duplicate hooks from a strength-descending list (D6): collapse exact
+// rationale repeats, cap how many hooks one self-fact can spawn, then re-apply the
+// global strength floor and top-20 cut. Input stays sorted, so keeping the first hit
+// per group keeps the strongest.
+function dedupe(ranked: Intersection[]): Intersection[] {
+  const seenRationale = new Set<string>();
+  const perSelfCount = new Map<number, number>();
+  const kept: Intersection[] = [];
+  for (const x of ranked) {
+    if (seenRationale.has(x.rationale)) continue;
+    const count = perSelfCount.get(x.selfFactId) ?? 0;
+    if (count >= MAX_PER_SELF_FACT) continue;
+    seenRationale.add(x.rationale);
+    perSelfCount.set(x.selfFactId, count + 1);
+    kept.push(x);
+  }
+  return kept.filter((x) => x.strength >= MIN_STRENGTH).slice(0, MAX_INTERSECTIONS);
 }
