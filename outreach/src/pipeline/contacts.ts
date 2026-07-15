@@ -26,18 +26,29 @@ const SOURCE_CONFIDENCE: Record<EmailSource, number> = {
   github_commit: 0.55,
 };
 
-export function scoreCandidate(candidate: EmailCandidate, personName: string): number {
+// D1 age decay: a paper email reflects the author's institution at publication
+// time. Decay 0.15 per full year beyond the first, floored at 0.5.
+export function decayPaperConfidence(base: number, ageMonths: number): number {
+  const steps = Math.max(0, Math.floor(ageMonths / 12) - 1);
+  return Math.max(0.5, base - 0.15 * steps);
+}
+
+export function scoreCandidate(candidate: EmailCandidate, personName: string, paperAgeMonths = 0): number {
   const [localPart = '', domain = ''] = candidate.email.split('@');
   if (domain.endsWith('noreply.github.com')) return 0;
   if (!nameMatches(localPart, personName)) return 0;
-  if (candidate.source === 'pdf' && candidate.correspondingMarker) return 0.95;
-  return SOURCE_CONFIDENCE[candidate.source];
+  const base = candidate.source === 'pdf' && candidate.correspondingMarker ? 0.95 : SOURCE_CONFIDENCE[candidate.source];
+  return candidate.source === 'pdf' ? decayPaperConfidence(base, paperAgeMonths) : base;
 }
 
-export function selectEmail(candidates: EmailCandidate[], personName: string): SelectedEmail | null {
+export function selectEmail(
+  candidates: EmailCandidate[],
+  personName: string,
+  paperAgeMonths = 0,
+): SelectedEmail | null {
   let best: SelectedEmail | null = null;
   for (const candidate of candidates) {
-    const confidence = scoreCandidate(candidate, personName);
+    const confidence = scoreCandidate(candidate, personName, paperAgeMonths);
     if (confidence < CONFIDENCE_THRESHOLD) continue;
     const isEdu = candidate.email.split('@')[1]?.endsWith('.edu') ?? false;
     const bestIsEdu = best?.email.split('@')[1]?.endsWith('.edu') ?? false;
@@ -84,10 +95,20 @@ export interface SearchClient {
   search(query: string): Promise<WebPage[]>;
 }
 
-export type WebPageClass = 'homepage' | 'directory' | 'github_profile';
+export type WebPageClass = 'homepage' | 'directory' | 'github_profile' | 'aggregator';
+
+// D1b: profile aggregators masquerade as homepages (name in URL/title) but
+// never expose a usable email; treat them as a distinct, deprioritized class.
+const AGGREGATOR_HOSTS = [
+  'rocketreach.co', 'researchgate.net', 'academia.edu', 'scholar.google.com',
+  'dl.acm.org', 'kitcaster.com', 'semanticscholar.org', 'dblp.org', 'orcid.org',
+  'linkedin.com', 'applykite.com',
+];
 
 export function classifyWebPage(page: WebPage, personName: string): WebPageClass {
-  if (new URL(page.url).hostname.endsWith('github.com')) return 'github_profile';
+  const hostname = new URL(page.url).hostname.replace(/^www\./, '');
+  if (hostname.endsWith('github.com')) return 'github_profile';
+  if (AGGREGATOR_HOSTS.some((h) => hostname === h || hostname.endsWith('.' + h))) return 'aggregator';
   const haystack = lettersOnly(page.url + ' ' + page.title);
   const tokens = personName.trim().split(/\s+/).map(lettersOnly).filter(Boolean);
   const first = tokens[0] ?? '';
@@ -106,7 +127,9 @@ const deobfuscate = (content: string): string =>
 export function extractWebEmailCandidates(pages: WebPage[], personName: string): EmailCandidate[] {
   const byEmail = new Map<string, EmailCandidate>();
   for (const page of pages) {
-    const source = classifyWebPage(page, personName);
+    const cls = classifyWebPage(page, personName);
+    if (cls === 'aggregator') continue; // never a usable email source
+    const source: EmailSource = cls;
     for (const match of deobfuscate(page.content).matchAll(EMAIL_RE)) {
       const email = match[0].toLowerCase();
       if (email.startsWith('{')) continue; // brace groups are a paper-text thing
@@ -118,8 +141,13 @@ export function extractWebEmailCandidates(pages: WebPage[], personName: string):
   return [...byEmail.values()];
 }
 
+export interface PageFetcher {
+  fetch(urls: string[]): Promise<WebPage[]>;
+}
+
 export interface ContactDeps {
   search: SearchClient;
+  fetcher: PageFetcher;
 }
 
 export interface TargetPerson {
@@ -127,28 +155,48 @@ export interface TargetPerson {
   affiliation?: string | null;
 }
 
-// Tiered extraction: paper text first; web search only if the paper yields
-// nothing send-eligible. Returns null below the 0.7 threshold (D1); the caller
-// owns the needs_manual_lookup transition (D10).
+export interface ExtractOptions {
+  paperAgeMonths?: number;
+}
+
+const FRESH_PAPER_MONTHS = 12;
+const MAX_FETCH_PAGES = 3;
+
+// D1a/D1b: paper text first, but web is consulted unless the paper is fresh and
+// already confident. Web tier fetches full page content for the top
+// non-aggregator results (search snippets rarely contain emails). All
+// candidates are reconciled by decayed D1 score; null below 0.7 (caller owns
+// the needs_manual_lookup transition, D10).
 export async function extractContact(
   deps: ContactDeps,
   person: TargetPerson,
   paperText: string | null,
+  options: ExtractOptions = {},
 ): Promise<SelectedEmail | null> {
-  if (paperText) {
-    const tier1 = selectEmail(extractPaperEmailCandidates(paperText), person.name);
-    if (tier1) return tier1;
-  }
+  const paperAgeMonths = options.paperAgeMonths ?? 0;
+  const paperCandidates = paperText ? extractPaperEmailCandidates(paperText) : [];
+
+  const paperPick = selectEmail(paperCandidates, person.name, paperAgeMonths);
+  if (paperPick && paperAgeMonths < FRESH_PAPER_MONTHS) return paperPick;
+
+  const webCandidates = await extractWebContacts(deps, person);
+  return selectEmail([...paperCandidates, ...webCandidates], person.name, paperAgeMonths);
+}
+
+async function extractWebContacts(deps: ContactDeps, person: TargetPerson): Promise<EmailCandidate[]> {
   const affiliation = person.affiliation ?? '';
-  const queries = [
-    `"${person.name}" ${affiliation} email`.trim(),
-    `"${person.name}" github`,
-  ];
-  const pages: WebPage[] = [];
+  const queries = [`"${person.name}" ${affiliation} email`.trim(), `"${person.name}" github`];
+  const seen = new Set<string>();
+  const ranked: WebPage[] = [];
   for (const query of queries) {
-    pages.push(...(await deps.search.search(query)));
+    for (const page of await deps.search.search(query)) {
+      if (seen.has(page.url) || classifyWebPage(page, person.name) === 'aggregator') continue;
+      seen.add(page.url);
+      ranked.push(page);
+    }
   }
-  return selectEmail(extractWebEmailCandidates(pages, person.name), person.name);
+  const pages = await deps.fetcher.fetch(ranked.slice(0, MAX_FETCH_PAGES).map((p) => p.url));
+  return extractWebEmailCandidates(pages, person.name);
 }
 
 const lettersOnly = (s: string): string => s.toLowerCase().replace(/[^a-z]/g, '');

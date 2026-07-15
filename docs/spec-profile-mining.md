@@ -41,6 +41,23 @@ Confidence is assigned from this table, not by the LLM. Threshold: **≥ 0.7 sen
 
 If multiple emails qualify, highest confidence wins; ties broken by preferring `.edu` domains.
 
+**Paper-email age decay.** A paper email reflects the author's institution *at publication time*, which goes stale as people move (a 2023 paper's `.fr` address may now bounce). The paper-PDF confidences above apply only when the paper is < 12 months old. Older papers decay the PDF confidence by 0.15 per full year beyond the first, floored at 0.5:
+`confidence = base - 0.15 * max(0, floor(ageMonths / 12) - 1)`, floor 0.5.
+So a corresponding-author email (base 0.95) is 0.95 at < 24 months, 0.80 at 2 to 3 years, 0.65 at 3 to 4 years. This does not discard the paper email; it lets a fresh web-sourced email outrank a stale one.
+
+### D1a. Extraction orchestration and reconciliation
+Tier 1 (PDF) no longer unconditionally short-circuits.
+- If the paper is < 12 months old AND tier 1 yields an email at confidence ≥ 0.7, return it without web search (fast path, no staleness risk).
+- Otherwise always run the web tier (tier 2/3) as well, then reconcile: pick the highest-confidence candidate across *both* sources using the (decayed) D1 scores; `.edu` tie-break as before.
+- When a web email and a paper email disagree and both are ≥ 0.7, both are recorded; the winner is used and the review page shows the alternate ("paper listed X; current web sources list Y"). Freshness beats the paper on ties.
+- Current affiliation discovered by Step B (person research) is fed back as the affiliation hint for the web queries, so the search targets where the person *is now*, not where the paper says they were.
+
+### D1b. Web page fetch (tier 2/3 is fetch-based, not snippet-based)
+Search returns ranked result pages; emails rarely appear in the search *snippet*. So:
+- Classify results (D-classify below); rank personal/lab homepages and official directory pages above aggregators. Aggregator hosts (`rocketreach.co`, `researchgate.net`, `academia.edu`, `scholar.google.com`, `dl.acm.org`, `kitcaster.com`, and similar) are never treated as homepages and are deprioritized.
+- Fetch full page content (Tavily `extract`) for up to the top 3 non-aggregator candidate pages, then scan that content for emails (with `[at]`/`[dot]` deobfuscation).
+- Budget: at most 3 extract calls per person on top of the search queries. If none of the top 3 pages yields a name-matching email, tier 2/3 returns nothing (→ manual queue), exactly as before.
+
 ### D2. Name-match rule
 An email local part matches a person if, after lowercasing and stripping digits/punctuation, it contains (a) the full last name, or (b) the full first name, or (c) an initials pattern (first initial + last name, or first name + last initial). Example: for "Aditya Gupta", `agupta`, `aditya.g`, `gupta3` match; `avsim.lab` does not.
 
