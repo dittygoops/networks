@@ -195,8 +195,13 @@ async function extractWebContacts(deps: ContactDeps, person: TargetPerson): Prom
       ranked.push(page);
     }
   }
-  const pages = await deps.fetcher.fetch(ranked.slice(0, MAX_FETCH_PAGES).map((p) => p.url));
-  return extractWebEmailCandidates(pages, person.name);
+  // Scan both the search snippets and the fetched full page content: some
+  // staff pages carry the email in the snippet but obfuscate it out of the
+  // rendered body (and vice versa). Fetched content inherits its page's class
+  // via URL, so classification is stable across both.
+  const topUrls = ranked.slice(0, MAX_FETCH_PAGES).map((p) => p.url);
+  const fetched = await deps.fetcher.fetch(topUrls);
+  return extractWebEmailCandidates([...ranked, ...fetched], person.name);
 }
 
 const lettersOnly = (s: string): string => s.toLowerCase().replace(/[^a-z]/g, '');
