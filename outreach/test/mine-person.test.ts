@@ -142,6 +142,18 @@ describe('minePerson (D4/D5b/D6a)', () => {
     expect(facts.some((f) => f.sourceUrl === staffPage)).toBe(true);
   });
 
+  test('splits a recipient hobby list into individual facts (shared with persona)', async () => {
+    const page = 'https://www.cg.tuwien.ac.at/staff/BernhardKerbl';
+    const { client } = makeLLM(() =>
+      JSON.stringify([{ facet: 'interest', key: 'hobby', value: 'chess, hiking', confidence: 0.7, proposedTier: 'B' }]),
+    );
+    const deps = makeDeps({ llm: client, searchResults: [{ url: page, title: 'Bernhard Kerbl', content: '' }], fetched: { [page]: 'bio' } });
+    const { facts } = await minePerson(deps, resolution, raw);
+    const hobbies = facts.filter((f) => f.key === 'hobby');
+    expect(hobbies.map((f) => f.value).sort()).toEqual(['chess', 'hiking']);
+    expect(hobbies.every((f) => f.tier === 'B')).toBe(true);
+  });
+
   test('retries once on JSON parse failure then skips the page without crashing', async () => {
     const talk = 'https://www.cg.tuwien.ac.at/talks/kerbl';
     const { client, calls } = makeLLM(() => 'not json at all {');

@@ -398,14 +398,33 @@ export async function minePerson(
     // Tavily/LLM failure: keep the OpenAlex facts, skip personal facets.
   }
 
+  const finalFacts = splitHobbyFacts(facts);
+
   let profileSummary = '';
   try {
-    profileSummary = (await deps.llm.complete(SUMMARY_SYSTEM, buildSummaryUser(name, facts))).trim();
+    profileSummary = (await deps.llm.complete(SUMMARY_SYSTEM, buildSummaryUser(name, finalFacts))).trim();
   } catch {
     // Summary is best-effort; an LLM failure must not lose the mined facts.
   }
 
-  return { facts, profileSummary };
+  return { facts: finalFacts, profileSummary };
+}
+
+// Split a hobby fact whose value is a list ("chess, hiking") into one fact per
+// item, so an overlap matches a specific hobby rather than the whole list.
+// Shared by the recipient pipeline (here) and the persona subsystem.
+export function splitHobbyFacts(facts: OntologyFact[]): OntologyFact[] {
+  const out: OntologyFact[] = [];
+  for (const f of facts) {
+    if (f.facet === 'interest' && f.key === 'hobby' && /[,;]|\band\b/i.test(f.value)) {
+      for (const part of f.value.split(/[,;]|\band\b/i).map((s) => s.trim()).filter(Boolean)) {
+        out.push({ ...f, value: part });
+      }
+    } else {
+      out.push(f);
+    }
+  }
+  return out;
 }
 
 const MAX_FACTS_PER_PAGE = 25; // bound attacker/LLM-controlled fact volume per page
