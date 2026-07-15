@@ -85,6 +85,61 @@ export function buildSelfExtractUser(sourceLabel: string, text: string): string 
   return [`Document: ${sourceLabel}`, '', text.slice(0, 6000)].join('\n');
 }
 
+export interface DraftPromptInput {
+  recipient: { name: string; affiliation?: string | null; profileSummary?: string; paperTitle?: string };
+  hooks: { selfValue: string; personValue: string; selfDetail?: string; personDetail?: string; tier: 'A' | 'B' | 'C' }[];
+  intent: string;
+  senderName: string;
+  senderFacts?: string[];
+}
+
+// DR3: hard style rules for the outreach draft. Casual but polite, hook-first,
+// ruthlessly concise, grounded only in given facts, no send.
+export const DRAFT_SYSTEM = [
+  'You write a short cold outreach email from a student (Aditya) to a researcher.',
+  'Return ONLY JSON: { "subject": string, "body": string }. No prose, no code fences.',
+  '',
+  'STRUCTURE (in this order, no greeting filler before the hook):',
+  '1. Hook: open on the specific shared thing (the top hook), stated concretely.',
+  '2. One line who-you-are + ONE concrete thing Aditya has done that is relevant.',
+  '3. ONE clear, low-friction ask for direction/guidance in the recipient\'s area.',
+  '4. Brief sign-off.',
+  '',
+  'STYLE (non-negotiable):',
+  '- Casual but polite. Contractions are fine. No corporate stiffness.',
+  '- Ruthlessly concise: body UNDER 120 words, aim 80 to 110. Cut adjectives and filler.',
+  '- Address "Hi <FirstName>,". Sign "Best,\\nAditya".',
+  '- BANNED: "I hope this email finds you well", "I am reaching out", "I would love to pick',
+  '  your brain", "I have been following your work", empty superlatives, flattery.',
+  '- No em dashes.',
+  '',
+  'TRUTH: use at least one specific recipient fact AND one specific Aditya fact from the input.',
+  'Never invent shared history, prior contact, meetings, or papers not given. If facts are thin,',
+  'say less rather than inventing.',
+  '',
+  'Subject: short, specific, lowercase-casual, no "Re:".',
+].join('\n');
+
+export function buildDraftUser(input: DraftPromptInput): string {
+  const r = input.recipient;
+  const hooks = input.hooks.map((h, i) =>
+    `  ${i + 1}. shared: ${h.selfValue === h.personValue ? h.selfValue : `${h.selfValue} / ${h.personValue}`}` +
+    (h.personDetail ? `\n     them: ${h.personDetail}` : '') +
+    (h.selfDetail ? `\n     me: ${h.selfDetail}` : ''),
+  );
+  return [
+    `Recipient: ${r.name}${r.affiliation ? ` (${r.affiliation})` : ''}`,
+    r.paperTitle ? `Their paper: ${r.paperTitle}` : '',
+    r.profileSummary ? `About them: ${r.profileSummary}` : '',
+    '',
+    'Top shared hooks (lead with #1):',
+    ...hooks,
+    '',
+    `Aditya's intent: ${input.intent}`,
+    input.senderFacts?.length ? `Aditya's relevant work:\n${input.senderFacts.map((f) => `  - ${f}`).join('\n')}` : '',
+  ].filter(Boolean).join('\n');
+}
+
 export const INTERSECT_SYSTEM = [
   'You find genuine overlaps between MY facts and ANOTHER person\'s facts, to seed',
   'a warm outreach email. Return ONLY a JSON array (no prose, no code fences).',

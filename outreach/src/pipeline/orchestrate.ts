@@ -28,6 +28,8 @@ export interface OrchestrateDeps {
 export interface OrchestrateResult {
   arxivId: string;
   target: string;
+  paperTitle: string;
+  profileSummary?: string;
   resolved: boolean;
   email: SelectedEmail | null;
   personId: number | null;
@@ -92,12 +94,14 @@ export async function processPaper(deps: OrchestrateDeps, arxivId: string): Prom
   let factCount = 0;
   let hooks: Intersection[] = [];
   let noStrongHook = true;
+  let profileSummary: string | undefined;
 
   if (resolution && raw) {
     resolution.author.homepageUrls = await fetchIdentityAnchors(raw, { fetchFn }).catch(() => []);
     const mineResult = await minePerson({ search: deps.search, fetcher: deps.fetcher, llm: deps.llm }, resolution, raw);
     personId = persistPerson(deps.db, resolution, raw, mineResult);
     factCount = mineResult.facts.length;
+    profileSummary = mineResult.profileSummary;
     if (email) {
       upsertPerson(deps.db, {
         name: target.name,
@@ -125,5 +129,17 @@ export async function processPaper(deps: OrchestrateDeps, arxivId: string): Prom
     notes.push('persisted contact only (identity unconfirmed, no ontology)');
   }
 
-  return { arxivId: paper.arxivId, target: target.name, resolved: !!resolution, email, personId, factCount, hooks, noStrongHook, notes };
+  return {
+    arxivId: paper.arxivId,
+    target: target.name,
+    paperTitle: paper.title,
+    profileSummary,
+    resolved: !!resolution,
+    email,
+    personId,
+    factCount,
+    hooks,
+    noStrongHook,
+    notes,
+  };
 }

@@ -12,14 +12,16 @@ const DEFAULT_MODEL = 'deepseek/deepseek-chat';
 export interface OpenRouterOptions {
   apiKey?: string;
   model?: string;
+  temperature?: number;
   fetchFn?: typeof fetch;
 }
 
-// OpenRouter cheap-tier client. Temperature 0 for determinism (D4). Reads
-// OPENROUTER_API_KEY and MODEL_CHEAP from env when not passed explicitly.
+// OpenRouter client. Temperature 0 by default for determinism (D4); drafts pass a
+// little warmth. Reads OPENROUTER_API_KEY and MODEL_CHEAP from env when not given.
 export function createOpenRouterClient(opts: OpenRouterOptions = {}): LLMClient {
   const apiKey = opts.apiKey ?? process.env.OPENROUTER_API_KEY ?? '';
   const model = opts.model ?? process.env.MODEL_CHEAP ?? DEFAULT_MODEL;
+  const temperature = opts.temperature ?? 0;
   const doFetch = opts.fetchFn ?? fetch;
 
   return {
@@ -33,7 +35,7 @@ export function createOpenRouterClient(opts: OpenRouterOptions = {}): LLMClient 
         },
         body: JSON.stringify({
           model,
-          temperature: 0,
+          temperature,
           messages: [
             { role: 'system', content: system },
             { role: 'user', content: user },

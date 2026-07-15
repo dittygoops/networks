@@ -3,8 +3,9 @@
 //   npx tsx --env-file=.env src/cli.ts add <arxiv-id>
 import { basename } from 'node:path';
 import { readFileSync } from 'node:fs';
-import { openDb, saveSelfFacts, replaceSelfFacts, factRows } from './db/db.js';
+import { openDb, saveSelfFacts, replaceSelfFacts, factRows, getPerson } from './db/db.js';
 import { processPaper } from './pipeline/orchestrate.js';
+import { generateDraft } from './pipeline/draft.js';
 import { buildSelfOntology } from './pipeline/persona.js';
 import { extractPdfText } from './pipeline/pdf.js';
 import { createTavilyClient } from './search/tavily.js';
@@ -116,6 +117,38 @@ async function main(): Promise<void> {
     console.log(`         them: ${h.personValue}`);
   }
   if (r.notes.length) console.log(`notes:    ${r.notes.join('; ')}`);
+
+  // DR6: draft the email if the person resolved and we have at least one hook.
+  if (r.resolved && r.hooks.length > 0 && r.personId != null) {
+    const self = factRows(db, null);
+    const intent = self.find((f) => f.facet === 'interest' && f.key === 'writing')?.value
+      ?? 'connect and get direction on future olfaction / smell research';
+    const senderFacts = self
+      .filter((f) => f.tier === 'A' && f.facet === 'academic')
+      .slice(0, 5)
+      .map((f) => (f.detail ? `${f.value}: ${f.detail}` : f.value));
+    const affiliation = getPerson(db, r.personId)?.affiliation ?? undefined;
+
+    // Prefer a frontier model for drafts (DR1), but fall back to the working
+    // cheap model when MODEL_FRONTIER is unset or the account lacks credits.
+    const draftLlm = createOpenRouterClient({
+      model: process.env.MODEL_FRONTIER ?? process.env.MODEL_CHEAP ?? 'deepseek/deepseek-chat',
+      temperature: 0.4,
+    });
+    const draft = await generateDraft(draftLlm, {
+      recipient: { name: r.target, affiliation, profileSummary: r.profileSummary, paperTitle: r.paperTitle },
+      hooks: r.hooks.slice(0, 3),
+      intent,
+      senderName: 'Aditya Gupta',
+      senderFacts,
+    });
+
+    console.log(`\n--- DRAFT (review only, not sent) ---`);
+    console.log(`Subject: ${draft.subject}`);
+    console.log(`\n${draft.body}`);
+    console.log(`\n(${draft.wordCount} words${draft.grounded ? '' : ', CHECK: may be ungrounded'})`);
+    if (draft.notes.length) console.log(`draft notes: ${draft.notes.join('; ')}`);
+  }
 }
 
 main().catch((e) => {
