@@ -25,7 +25,9 @@ function deps(config: {
   };
 }
 
-const KERBL = { name: 'Bernhard Kerbl' }; // NO affiliation supplied
+const KERBL = { name: 'Bernhard Kerbl' }; // NO current affiliation supplied
+// Paper area terms are always available (D5a); the CURRENT affiliation is not.
+const CTX = { paperContext: { affiliationHint: 'INRIA' } };
 
 describe('automated affiliation-discovery second pass (D1c)', () => {
   test('finds current email via a domain-scoped second query', async () => {
@@ -42,7 +44,7 @@ describe('automated affiliation-discovery second pass (D1c)', () => {
       },
       fetched: { [homepage]: 'contact form only, no address' },
     });
-    const result = await extractContact(d, KERBL, null);
+    const result = await extractContact(d, KERBL, null, CTX);
     expect(result?.email).toBe('bernhard.kerbl@tuwien.ac.at');
     expect(searchLog.some((q) => q.includes('tuwien.ac.at'))).toBe(true);
   });
@@ -54,7 +56,7 @@ describe('automated affiliation-discovery second pass (D1c)', () => {
       searchLog,
       byQuery: () => [{ url: homepage, title: 'Kordel France', content: 'kordel@utdallas.edu' }],
     });
-    const result = await extractContact(d, { name: 'Kordel France' }, null);
+    const result = await extractContact(d, { name: 'Kordel France' }, null, CTX);
     expect(result?.email).toBe('kordel@utdallas.edu');
     // only the two pass-1 queries, no domain-scoped pass-2 query
     expect(searchLog.every((q) => !q.includes('utdallas.edu'))).toBe(true);
@@ -65,7 +67,7 @@ describe('automated affiliation-discovery second pass (D1c)', () => {
       byQuery: () => [{ url: 'https://cs.example.edu/people', title: 'Directory', content: 'info@example.edu' }],
       fetched: { 'https://cs.example.edu/people': 'no personal email here' },
     });
-    const result = await extractContact(d, KERBL, null);
+    const result = await extractContact(d, KERBL, null, CTX);
     expect(result).toBeNull();
   });
 });

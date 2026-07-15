@@ -1,5 +1,5 @@
-// Live smoke test for the full contact pipeline (paper age + web fetch).
-// Usage: npx tsx --env-file=.env scripts/smoke-contact.ts "Name" "Affiliation" [paperText] [ageMonths]
+// Live smoke test for the full contact pipeline.
+// Usage: npx tsx --env-file=.env scripts/smoke-contact.ts "Name" "Affiliation" [areaTerms] [paperText] [ageMonths]
 import { extractContact } from '../src/pipeline/contacts.js';
 import { createTavilyClient } from '../src/search/tavily.js';
 
@@ -8,14 +8,15 @@ if (!apiKey) throw new Error('TAVILY_API_KEY missing (run with --env-file=.env)'
 
 const name = process.argv[2] ?? 'Jonathan Barron';
 const affiliation = process.argv[3] ?? 'Google';
-const paperText = process.argv[4] ?? null;
-const paperAgeMonths = process.argv[5] ? Number(process.argv[5]) : 0;
+const areaTerms = (process.argv[4] ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+const paperText = process.argv[5] ?? null;
+const paperAgeMonths = process.argv[6] ? Number(process.argv[6]) : 0;
 
 const client = createTavilyClient(apiKey);
 const result = await extractContact(
   { search: client, fetcher: client },
-  { name, affiliation },
+  { name },
   paperText,
-  { paperAgeMonths },
+  { paperAgeMonths, paperContext: { affiliationHint: affiliation, areaTerms } },
 );
-console.log(JSON.stringify({ name, affiliation, paperAgeMonths, result }, null, 2));
+console.log(JSON.stringify({ name, affiliation, areaTerms, paperAgeMonths, result }, null, 2));

@@ -97,13 +97,18 @@ The extractor proposes a tier; code clamps it to the cap. A Tier-C source can ne
 
 Fact extraction batches all accepted pages into at most 3 cheap-tier LLM calls; one more call produces the short profile summary. Total per person: ≤ 6 searches, ≤ 4 LLM calls.
 
-### D5. Identity corroboration signals
-A page contributes facts only if at least one holds:
-- Affiliation on the page matches the paper's affiliation hint.
-- A co-author's name from the paper appears on the page.
-- The paper title or arXiv ID appears on the page.
-- The page's research area overlaps the paper's primary arXiv category (LLM judgment, but only as a last resort when 1 to 3 fail).
-- The page is directly linked from an already-accepted page (e.g. Scholar profile links the homepage).
+### D5. Identity corroboration (split: retrieval-time now, semantic in Step B)
+Common names are the core risk: a plain `"Jonathan Barron"` search returns a lawyer, a med student, and an honors undergrad before the researcher, whose homepage is not even in the top 8. Two empirical facts drive the split:
+1. Paper affiliation in the *query* fixes retrieval: `"Jonathan Barron" Google` surfaces the right person and email. The paper always carries an affiliation, so this context is always available.
+2. Co-author / paper-title corroboration is **not** present in search snippets (a name-only search yields no co-author full names; only short-token false positives like "Ng"). Reliable co-author/title corroboration therefore requires *fetching and reading* Scholar/DBLP pages, i.e. the Step B research layer.
+
+**D5a — retrieval-time disambiguation (contact extraction, deterministic, now).**
+- Contact extraction takes a `PaperContext` (`affiliationHint`, `coauthors`, `title`, `arxivId`, `areaTerms`). Intake always supplies `affiliationHint` (every paper lists the author's affiliation).
+- Pass-1 queries are enriched with **`affiliationHint` only**. This was validated empirically: affiliation disambiguates common names (`"Jonathan Barron" Google` finds the researcher, not the lawyer) *and* still surfaces a mover's current homepage (`"Bernhard Kerbl" INRIA` still returns his current `cg.tuwien.ac.at` page). **Area terms are deliberately NOT put in the query**: topic keywords like "gaussian splatting" over-anchor to the paper and push the mover's *current* page out of the results, breaking D1c domain discovery. `areaTerms`/`coauthors`/`title`/`arxivId` are carried on `PaperContext` but reserved for D5b.
+- The two-pass domain discovery (D1c) handles movers: the affiliation-enriched (or, when affiliation is absent, plain-name) pass-1 search surfaces the current homepage, whose domain then drives pass 2.
+- **Conservative guard**: if no `affiliationHint` is available, web-sourced emails are not send-eligible (they route to the manual queue), because without an affiliation a common name cannot be safely disambiguated. In the real pipeline this rarely fires (intake always provides affiliation); it exists so a context-free call can never confidently pick a homonym.
+
+**D5b — semantic identity corroboration (Step B, deferred).** Before trusting a person's footprint, confirm it belongs to the paper's author by reading Scholar/DBLP/homepage content for: a co-author's **full** name (last name ≥ 4 chars, to avoid the "Ng" trap), the paper title, or the arXiv ID; falling back to LLM research-area overlap with the paper's primary category. This needs fetched page content and the cheap-tier LLM, so it lives in `research.ts`, not snippet-based contact extraction. A page contributes ontology facts only if it passes this check.
 
 ### D6. Intersection scoring rubric
 Cheap-tier LLM scores each candidate pair 0 to 1 with this rubric in the prompt:

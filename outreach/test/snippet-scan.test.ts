@@ -21,7 +21,9 @@ describe('snippet + fetched content scanning', () => {
         },
       },
     };
-    const result = await extractContact(deps, { name: 'Bernhard Kerbl' }, null);
+    const result = await extractContact(deps, { name: 'Bernhard Kerbl' }, null, {
+      paperContext: { affiliationHint: 'INRIA' },
+    });
     expect(result?.email).toBe('bernhard.kerbl@tuwien.ac.at');
   });
 });
