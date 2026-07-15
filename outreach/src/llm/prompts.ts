@@ -52,6 +52,30 @@ export function buildSummaryUser(
   return [`Person: ${personName}`, '', 'Known facts:', ...lines].join('\n');
 }
 
+export const SELF_EXTRACT_SYSTEM = [
+  'You extract facts ABOUT ADITYA (the author) from one of his own documents.',
+  'Return ONLY a JSON array (no prose, no code fences). Each element:',
+  '{ "facet": "academic"|"trajectory"|"interest", "key": string, "value": string,',
+  '  "confidence": number, "proposedTier": "A"|"B"|"C" }.',
+  '',
+  'Extract only facts about ADITYA himself:',
+  '- what he built or did (academic: method, dataset, project, key_paper),',
+  '- what he studies or is moving toward (academic: research_area),',
+  '- his background and trajectory (trajectory: role, institution, location),',
+  '- his stated interests and side work (interest: hobby, side_project, oss_project).',
+  'These documents are often topic notes. Do NOT extract encyclopedia facts about the',
+  'topic itself (e.g. "NeRF represents scenes as radiance fields"). Only facts that',
+  'describe Aditya. If the document says nothing about him, return [].',
+  '',
+  'value is a short first-person-free phrase (e.g. "built a Gaussian splat of a banana").',
+  'proposedTier: A for professional/research work, B for personal-but-shareable, C for',
+  'sensitive. If unsure, omit confidence (a default is applied).',
+].join('\n');
+
+export function buildSelfExtractUser(sourceLabel: string, text: string): string {
+  return [`Document: ${sourceLabel}`, '', text.slice(0, 6000)].join('\n');
+}
+
 export const INTERSECT_SYSTEM = [
   'You find genuine overlaps between MY facts and ANOTHER person\'s facts, to seed',
   'a warm outreach email. Return ONLY a JSON array (no prose, no code fences).',

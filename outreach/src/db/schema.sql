@@ -30,8 +30,10 @@ CREATE INDEX IF NOT EXISTS idx_facts_person ON ontology_facts(person_id);
 CREATE TABLE IF NOT EXISTS intersections (
   id INTEGER PRIMARY KEY,
   person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
-  self_fact_id INTEGER REFERENCES ontology_facts(id),
-  person_fact_id INTEGER REFERENCES ontology_facts(id),
+  -- Intersections are derived: replacing a fact (e.g. a persona rebuild swapping
+  -- the self ontology) invalidates any intersection built on it, so cascade.
+  self_fact_id INTEGER REFERENCES ontology_facts(id) ON DELETE CASCADE,
+  person_fact_id INTEGER REFERENCES ontology_facts(id) ON DELETE CASCADE,
   strength REAL,
   tier TEXT CHECK(tier IN ('A','B','C')),
   rationale TEXT

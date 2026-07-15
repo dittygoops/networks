@@ -137,6 +137,17 @@ export function saveSelfFacts(db: DB, facts: OntologyFact[]): void {
   tx(facts);
 }
 
+// P1: a persona build is authoritative, so replace the whole self ontology
+// atomically (NULL person_id can't use the accumulate upsert, and rebuilds
+// should never duplicate).
+export function replaceSelfFacts(db: DB, facts: OntologyFact[]): void {
+  const tx = db.transaction((rows: OntologyFact[]) => {
+    db.prepare('DELETE FROM ontology_facts WHERE person_id IS NULL').run();
+    saveSelfFacts(db, rows);
+  });
+  tx(facts);
+}
+
 export interface IntersectionRow {
   selfFactId: number;
   personFactId: number;
