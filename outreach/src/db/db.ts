@@ -89,6 +89,7 @@ export function saveFacts(db: DB, personId: number, facts: OntologyFact[]): void
 }
 
 interface FactRow {
+  id: number;
   facet: OntologyFact['facet'];
   key: string;
   value: string;
@@ -97,16 +98,63 @@ interface FactRow {
   usability_tier: OntologyFact['tier'];
 }
 
+const rowToFact = (r: FactRow): OntologyFact => ({
+  facet: r.facet,
+  key: r.key,
+  value: r.value,
+  sourceUrl: r.source_url,
+  confidence: r.confidence,
+  tier: r.usability_tier,
+});
+
 export function getFacts(db: DB, personId: number): OntologyFact[] {
-  const rows = db.prepare(
-    'SELECT facet, key, value, source_url, confidence, usability_tier FROM ontology_facts WHERE person_id = ?',
-  ).all(personId) as FactRow[];
-  return rows.map((r) => ({
-    facet: r.facet,
-    key: r.key,
-    value: r.value,
-    sourceUrl: r.source_url,
-    confidence: r.confidence,
-    tier: r.usability_tier,
-  }));
+  return factRows(db, personId).map(({ id: _id, ...fact }) => fact);
+}
+
+export type StoredFact = OntologyFact & { id: number };
+
+// Fact rows including their ids (needed to link intersections). personId = null
+// selects the self ontology (person_id IS NULL).
+export function factRows(db: DB, personId: number | null): StoredFact[] {
+  const where = personId === null ? 'person_id IS NULL' : 'person_id = ?';
+  const stmt = db.prepare(
+    `SELECT id, facet, key, value, source_url, confidence, usability_tier FROM ontology_facts WHERE ${where}`,
+  );
+  const rows = (personId === null ? stmt.all() : stmt.all(personId)) as FactRow[];
+  return rows.map((r) => ({ id: r.id, ...rowToFact(r) }));
+}
+
+// Insert self-ontology facts (person_id NULL). Written by the persona subsystem;
+// exposed here for the D9 dev seed and tests until that subsystem exists.
+export function saveSelfFacts(db: DB, facts: OntologyFact[]): void {
+  const ins = db.prepare(
+    `INSERT INTO ontology_facts (person_id, facet, key, value, source_url, confidence, usability_tier)
+     VALUES (NULL, ?, ?, ?, ?, ?, ?)`,
+  );
+  const tx = db.transaction((rows: OntologyFact[]) => {
+    for (const f of rows) ins.run(f.facet, f.key, f.value, f.sourceUrl, f.confidence, f.tier);
+  });
+  tx(facts);
+}
+
+export interface IntersectionRow {
+  selfFactId: number;
+  personFactId: number;
+  strength: number;
+  tier: OntologyFact['tier'];
+  rationale: string;
+}
+
+// Intersections are derived: replace a person's set on each recompute (D6).
+export function saveIntersections(db: DB, personId: number, rows: IntersectionRow[]): void {
+  const del = db.prepare('DELETE FROM intersections WHERE person_id = ?');
+  const ins = db.prepare(
+    `INSERT INTO intersections (person_id, self_fact_id, person_fact_id, strength, tier, rationale)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  );
+  const tx = db.transaction((items: IntersectionRow[]) => {
+    del.run(personId);
+    for (const r of items) ins.run(personId, r.selfFactId, r.personFactId, r.strength, r.tier, r.rationale);
+  });
+  tx(rows);
 }

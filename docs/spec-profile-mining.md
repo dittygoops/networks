@@ -123,7 +123,7 @@ Every `ontology_facts` row: `{ facet, key, value, source_url, confidence 0-1, us
 - `key` is drawn from the D-vocabulary constant (below the schema). Facts below confidence 0.5 are excluded from intersections (D6) and from hooks.
 
 ### D6. Intersection generation (bounded LLM, not pairwise)
-Do **not** score all self×person pairs (O(n·m) calls). A single cheap-tier LLM call receives the full self-fact list and the full person-fact list (both pre-filtered to confidence ≥ 0.5) and returns candidate intersections as JSON `{ selfKey, personKey, strength, rationale }`. A second chunked call runs only if either list > 40 facts. Code maps keys back to fact ids, sets `tier = min(self_fact.tier, person_fact.tier)`, drops strength < 0.3, keeps the top 20 by strength.
+Do **not** score all self×person pairs (O(n·m) calls). A single cheap-tier LLM call receives the full self-fact list and the full person-fact list (both pre-filtered to confidence ≥ 0.5), each fact prefixed with a **stable index** (`s0, s1, ...` for self, `p0, p1, ...` for person, since `key` is not unique), and returns candidate intersections as JSON `{ self: "s2", person: "p5", strength, rationale }`. A second chunked call runs only if either list > 40 facts. Code maps indices back to fact ids, sets `tier = min(self_fact.tier, person_fact.tier)`, drops strength < 0.3 or any index out of range, keeps the top 20 by strength. Intersections are derived data, so the store **replaces** a person's intersections on each recompute (unlike facts, which accumulate).
 
 Strength rubric (in the prompt):
 - 0.9 to 1.0: same specific research problem, method, or artifact (e.g. both worked with nuScenes evaluation, both built 3DGS pipelines).
