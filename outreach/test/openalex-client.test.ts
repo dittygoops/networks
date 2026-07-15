@@ -61,7 +61,7 @@ describe('fetchIdentityAnchors', () => {
     };
     const fakeFetch = (async (url: URL | string) => {
       const id = String(url).split('/').pop()!;
-      return { json: async () => ({ homepage_url: byId[id] }) } as Response;
+      return { ok: true, status: 200, json: async () => ({ homepage_url: byId[id] }) } as unknown as Response;
     }) as typeof fetch;
 
     const anchors = await fetchIdentityAnchors(authorWithInst, { fetchFn: fakeFetch });

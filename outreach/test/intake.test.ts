@@ -31,7 +31,7 @@ function moverFetchFn(): FetchFn {
   return (async (input: Parameters<FetchFn>[0]) => {
     const url = String(input instanceof URL ? input : typeof input === "string" ? input : input.url);
     const body = url.includes('/authors') ? { results: [author] } : { results: works };
-    return { json: async () => body } as Response;
+    return { ok: true, status: 200, json: async () => body } as unknown as Response;
   }) as FetchFn;
 }
 
@@ -47,7 +47,7 @@ function unresolvedFetchFn(): FetchFn {
   return (async (input: Parameters<FetchFn>[0]) => {
     const url = String(input instanceof URL ? input : typeof input === "string" ? input : input.url);
     const body = url.includes('/authors') ? { results: [author] } : { results: [] };
-    return { json: async () => body } as Response;
+    return { ok: true, status: 200, json: async () => body } as unknown as Response;
   }) as FetchFn;
 }
 

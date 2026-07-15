@@ -36,12 +36,19 @@ export async function resolveAndExtractContact(
   const { fetchFn, search, fetcher } = deps;
   const contactDeps: ContactDeps = { search, fetcher };
 
+  // OpenAlex is an enrichment, not a dependency: if it fails (rate limit,
+  // outage, bad JSON) we degrade to the paper affiliation rather than aborting
+  // extraction. The fresh-paper fast path needs no affiliation at all.
   let resolvedAffiliation: string | undefined;
-  const fetched = await fetchAuthorCandidates(person.name, { fetchFn });
-  const resolution = resolveAuthor(fetched.map((f) => f.candidate), person.name, paperContext);
-  if (resolution) {
-    const raw = fetched.find((f) => f.candidate.id === resolution.author.id)?.raw;
-    if (raw) resolvedAffiliation = currentAffiliation(raw) ?? undefined;
+  try {
+    const fetched = await fetchAuthorCandidates(person.name, { fetchFn });
+    const resolution = resolveAuthor(fetched.map((f) => f.candidate), person.name, paperContext);
+    if (resolution) {
+      const raw = fetched.find((f) => f.candidate.id === resolution.author.id)?.raw;
+      if (raw) resolvedAffiliation = currentAffiliation(raw) ?? undefined;
+    }
+  } catch {
+    resolvedAffiliation = undefined; // fall back to the paper affiliation
   }
 
   return extractContact(contactDeps, person, options.paperText ?? null, {
