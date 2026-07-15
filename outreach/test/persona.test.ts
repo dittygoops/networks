@@ -61,6 +61,14 @@ describe('factsFromDocument (P2)', () => {
     expect(facts).toEqual([]);
   });
 
+  test('captures the entity value and the detail context separately', async () => {
+    const facts = await factsFromDocument(
+      fakeLLM(JSON.stringify([{ facet: 'academic', key: 'dataset', value: 'nuScenes', detail: 'measured recall against ground truth', proposedTier: 'A' }])),
+      'eval', 'eval',
+    );
+    expect(facts[0]).toMatchObject({ value: 'nuScenes', detail: 'measured recall against ground truth' });
+  });
+
   test('a self interest fact is tier B even when the model proposes C (resume hobbies are shareable)', async () => {
     const facts = await factsFromDocument(fakeLLM(JSON.stringify([
       { facet: 'interest', key: 'hobby', value: 'chess', proposedTier: 'C' },

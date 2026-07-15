@@ -26,12 +26,15 @@ export interface OpenAlexCandidate {
   homepageUrls?: string[]; // OpenAlex-listed homepage/host URLs (identity anchors)
 }
 
-// D6a fact schema. facet is one of the three ontology facets; tier is the D3
-// usability tier after clamping; confidence is 0..1.
+// D6a fact schema. `value` is a crisp, canonical ENTITY (e.g. "nuScenes",
+// "3D Gaussian Splatting", "chess") that intersections match on; `detail` is the
+// specific supporting context (e.g. "used the mini split to measure recall") that
+// the draft can cite. tier is the D3 usability tier; confidence is 0..1.
 export interface OntologyFact {
   facet: 'academic' | 'trajectory' | 'interest';
   key: string;
   value: string;
+  detail?: string;
   sourceUrl: string;
   confidence: number;
   tier: 'A' | 'B' | 'C';
@@ -43,7 +46,7 @@ export interface OntologyFact {
 // the D11 dedup identity, so consistent keys are what make dedup real. Unknown
 // keys still pass through (snake-cased) rather than being dropped.
 export const FACT_VOCABULARY: Record<OntologyFact['facet'], readonly string[]> = {
-  academic: ['research_area', 'method', 'dataset', 'key_paper', 'venue', 'advisor', 'lab', 'collaborator', 'project'],
+  academic: ['research_area', 'method', 'dataset', 'tool', 'key_paper', 'venue', 'advisor', 'lab', 'collaborator', 'project'],
   trajectory: ['institution', 'company', 'role', 'location'],
   interest: ['hobby', 'side_project', 'oss_project', 'community', 'writing'],
 };
@@ -314,6 +317,7 @@ interface RawFact {
   facet?: string;
   key?: string;
   value?: string;
+  detail?: string;
   confidence?: number;
   proposedTier?: string;
 }
@@ -480,6 +484,7 @@ async function minePersonalFacts(
         facet: rf.facet,
         key: normalizeKey(rf.facet, String(rf.key).slice(0, MAX_VALUE_LEN)),
         value: String(rf.value).slice(0, MAX_VALUE_LEN),
+        detail: rf.detail ? String(rf.detail).slice(0, 400) : undefined,
         sourceUrl: page.url,
         confidence,
         tier: clampTier(rf.proposedTier ?? 'C', cap),

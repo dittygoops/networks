@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS ontology_facts (
   id INTEGER PRIMARY KEY,
   person_id INTEGER REFERENCES people(id) ON DELETE CASCADE,   -- NULL = self (persona subsystem)
   facet TEXT CHECK(facet IN ('academic','trajectory','interest')),
-  key TEXT, value TEXT, source_url TEXT,
+  key TEXT, value TEXT, detail TEXT, source_url TEXT,
   confidence REAL,
   usability_tier TEXT CHECK(usability_tier IN ('A','B','C')),
   retrieved_at TEXT DEFAULT (datetime('now')),

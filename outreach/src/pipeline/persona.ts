@@ -24,6 +24,7 @@ interface RawFact {
   facet?: string;
   key?: string;
   value?: string;
+  detail?: string;
   confidence?: number;
   proposedTier?: string;
 }
@@ -58,6 +59,7 @@ export async function factsFromDocument(llm: LLMClient, docText: string, sourceL
       facet: rf.facet,
       key: normalizeKey(rf.facet, String(rf.key)),
       value: String(rf.value).trim(),
+      detail: rf.detail ? String(rf.detail).trim() : undefined,
       sourceUrl: `${SELF_SOURCE}:${sourceLabel}`,
       confidence,
       tier: SELF_FACET_TIER[rf.facet],
