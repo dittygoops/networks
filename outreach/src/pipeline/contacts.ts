@@ -74,6 +74,83 @@ export function extractPaperEmailCandidates(text: string): EmailCandidate[] {
   return [...byEmail.values()];
 }
 
+export interface WebPage {
+  url: string;
+  title: string;
+  content: string;
+}
+
+export interface SearchClient {
+  search(query: string): Promise<WebPage[]>;
+}
+
+export type WebPageClass = 'homepage' | 'directory' | 'github_profile';
+
+export function classifyWebPage(page: WebPage, personName: string): WebPageClass {
+  if (new URL(page.url).hostname.endsWith('github.com')) return 'github_profile';
+  const haystack = lettersOnly(page.url + ' ' + page.title);
+  const tokens = personName.trim().split(/\s+/).map(lettersOnly).filter(Boolean);
+  const first = tokens[0] ?? '';
+  const last = tokens[tokens.length - 1] ?? '';
+  const namePatterns = [first + last, last, first[0] + last].filter((p) => p.length > 2);
+  return namePatterns.some((p) => haystack.includes(p)) ? 'homepage' : 'directory';
+}
+
+// "agupta [at] asu [dot] edu" → "agupta@asu.edu" (bracketed forms only; bare
+// " at " is too ambiguous to rewrite).
+const deobfuscate = (content: string): string =>
+  content
+    .replace(/\s*[[(]\s*at\s*[)\]]\s*/gi, '@')
+    .replace(/\s*[[(]\s*dot\s*[)\]]\s*/gi, '.');
+
+export function extractWebEmailCandidates(pages: WebPage[], personName: string): EmailCandidate[] {
+  const byEmail = new Map<string, EmailCandidate>();
+  for (const page of pages) {
+    const source = classifyWebPage(page, personName);
+    for (const match of deobfuscate(page.content).matchAll(EMAIL_RE)) {
+      const email = match[0].toLowerCase();
+      if (email.startsWith('{')) continue; // brace groups are a paper-text thing
+      const existing = byEmail.get(email);
+      if (existing && SOURCE_CONFIDENCE[existing.source] >= SOURCE_CONFIDENCE[source]) continue;
+      byEmail.set(email, { email, source, correspondingMarker: false });
+    }
+  }
+  return [...byEmail.values()];
+}
+
+export interface ContactDeps {
+  search: SearchClient;
+}
+
+export interface TargetPerson {
+  name: string;
+  affiliation?: string | null;
+}
+
+// Tiered extraction: paper text first; web search only if the paper yields
+// nothing send-eligible. Returns null below the 0.7 threshold (D1); the caller
+// owns the needs_manual_lookup transition (D10).
+export async function extractContact(
+  deps: ContactDeps,
+  person: TargetPerson,
+  paperText: string | null,
+): Promise<SelectedEmail | null> {
+  if (paperText) {
+    const tier1 = selectEmail(extractPaperEmailCandidates(paperText), person.name);
+    if (tier1) return tier1;
+  }
+  const affiliation = person.affiliation ?? '';
+  const queries = [
+    `"${person.name}" ${affiliation} email`.trim(),
+    `"${person.name}" github`,
+  ];
+  const pages: WebPage[] = [];
+  for (const query of queries) {
+    pages.push(...(await deps.search.search(query)));
+  }
+  return selectEmail(extractWebEmailCandidates(pages, person.name), person.name);
+}
+
 const lettersOnly = (s: string): string => s.toLowerCase().replace(/[^a-z]/g, '');
 
 // D2: after lowercasing and stripping digits/punctuation, the local part must
