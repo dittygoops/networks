@@ -1,5 +1,6 @@
 // Contact extraction: tiered email discovery for a target person.
 // Spec: docs/spec-profile-mining.md (D1 confidence table, D2 name-match rule).
+import { parse } from 'tldts';
 
 export type EmailSource = 'pdf' | 'homepage' | 'directory' | 'github_profile' | 'github_commit';
 
@@ -141,6 +142,33 @@ export function extractWebEmailCandidates(pages: WebPage[], personName: string):
   return [...byEmail.values()];
 }
 
+// Generic hosting/personal domains that don't identify an institution.
+const GENERIC_HOSTS = [
+  'gmail.com', 'outlook.com', 'hotmail.com', 'yahoo.com', 'icloud.com',
+  'github.io', 'sites.google.com', 'googleusercontent.com', 'wordpress.com',
+  'medium.com', 'substack.com', 'notion.site', 'wixsite.com',
+];
+
+const hostMatches = (hostname: string, hosts: string[]): boolean =>
+  hosts.some((h) => hostname === h || hostname.endsWith('.' + h));
+
+// D-domain: reduce found homepage/directory pages to unique registrable
+// institution domains, excluding aggregators and generic hosts. Top 2 by order.
+// Exclusion is by full hostname (sites.google.com is generic, but a bare
+// google.com is a real institution and stays).
+export function collectInstitutionDomains(pages: WebPage[], personName: string): string[] {
+  const domains: string[] = [];
+  for (const page of pages) {
+    const cls = classifyWebPage(page, personName);
+    if (cls !== 'homepage' && cls !== 'directory') continue;
+    const { hostname, domain } = parse(page.url);
+    if (!hostname || !domain) continue;
+    if (hostMatches(hostname, GENERIC_HOSTS) || hostMatches(hostname, AGGREGATOR_HOSTS)) continue;
+    if (!domains.includes(domain)) domains.push(domain);
+  }
+  return domains.slice(0, 2);
+}
+
 export interface PageFetcher {
   fetch(urls: string[]): Promise<WebPage[]>;
 }
@@ -183,9 +211,32 @@ export async function extractContact(
   return selectEmail([...paperCandidates, ...webCandidates], person.name, paperAgeMonths);
 }
 
+// D1c: two passes. Pass 1 is a plain name (+ paper affiliation) search. If it
+// yields no confident email, pass 2 derives the current institution domain from
+// pass-1's homepages and re-queries, so a mover's current email is found with
+// no human-supplied affiliation.
 async function extractWebContacts(deps: ContactDeps, person: TargetPerson): Promise<EmailCandidate[]> {
   const affiliation = person.affiliation ?? '';
-  const queries = [`"${person.name}" ${affiliation} email`.trim(), `"${person.name}" github`];
+  const pass1 = await runWebPass(deps, person, [
+    `"${person.name}" ${affiliation} email`.trim(),
+    `"${person.name}" github`,
+  ]);
+
+  const hasConfident = pass1.candidates.some((c) => scoreCandidate(c, person.name) >= CONFIDENCE_THRESHOLD);
+  if (hasConfident) return pass1.candidates;
+
+  const domains = collectInstitutionDomains(pass1.ranked, person.name);
+  if (domains.length === 0) return pass1.candidates;
+
+  const pass2 = await runWebPass(deps, person, domains.map((d) => `"${person.name}" ${d}`));
+  return [...pass1.candidates, ...pass2.candidates];
+}
+
+async function runWebPass(
+  deps: ContactDeps,
+  person: TargetPerson,
+  queries: string[],
+): Promise<{ candidates: EmailCandidate[]; ranked: WebPage[] }> {
   const seen = new Set<string>();
   const ranked: WebPage[] = [];
   for (const query of queries) {
@@ -195,13 +246,11 @@ async function extractWebContacts(deps: ContactDeps, person: TargetPerson): Prom
       ranked.push(page);
     }
   }
-  // Scan both the search snippets and the fetched full page content: some
-  // staff pages carry the email in the snippet but obfuscate it out of the
-  // rendered body (and vice versa). Fetched content inherits its page's class
-  // via URL, so classification is stable across both.
-  const topUrls = ranked.slice(0, MAX_FETCH_PAGES).map((p) => p.url);
-  const fetched = await deps.fetcher.fetch(topUrls);
-  return extractWebEmailCandidates([...ranked, ...fetched], person.name);
+  // Scan both the search snippets and the fetched full page content: some staff
+  // pages carry the email in the snippet but obfuscate it out of the rendered
+  // body (and vice versa). Fetched content inherits its page's class via URL.
+  const fetched = await deps.fetcher.fetch(ranked.slice(0, MAX_FETCH_PAGES).map((p) => p.url));
+  return { candidates: extractWebEmailCandidates([...ranked, ...fetched], person.name), ranked };
 }
 
 const lettersOnly = (s: string): string => s.toLowerCase().replace(/[^a-z]/g, '');
