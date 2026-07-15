@@ -153,9 +153,11 @@ Owned tables (shared `db/schema.sql`):
 ```sql
 CREATE TABLE people (
   id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+  openalex_id TEXT UNIQUE,                                -- stable dedup key (D11); NULL until resolved
   email TEXT, email_confidence REAL, email_source TEXT,   -- 'pdf'|'homepage'|'github'|'manual'
   affiliation TEXT, role TEXT,                            -- 'first_author'|'pi'|...
   scholar_url TEXT, homepage_url TEXT, github_url TEXT,
+  profile_summary TEXT,                                   -- from minePerson (D11)
   created_at TEXT DEFAULT (datetime('now')), updated_at TEXT
 );
 
@@ -177,6 +179,14 @@ CREATE TABLE intersections (
 ```
 
 `ontology_facts.key` is freeform but drawn from a recommended vocabulary per facet (kept as a constant in code): academic → `research_area`, `method`, `dataset`, `key_paper`, `venue`, `advisor`, `lab`; trajectory → `institution`, `company`, `role`, `location`; interest → `hobby`, `side_project`, `oss_project`, `community`, `writing`.
+
+### D11. Persistence
+- **Stack**: `better-sqlite3`, one file `outreach/data/outreach.db` (gitignored). `db/schema.sql` holds the tables; `db/db.ts` opens the connection and runs the schema idempotently (`CREATE TABLE IF NOT EXISTS`) on first open. Foreign keys on; WAL mode.
+- **Person upsert (dedup)**: keyed by `openalex_id` when the author is resolved (the common path), else inserted by name. `upsertPerson(fields)` returns the row id; an existing `openalex_id` updates the row (name/affiliation/urls/email/profile_summary) rather than duplicating. This is what makes "mine once, reuse" real.
+- **Fact write strategy**: a re-mine produces a fresh, complete fact set, so `saveFacts(personId, facts)` **replaces** that person's facts atomically (delete existing for `person_id` + insert new) inside a transaction. This sidesteps per-fact merge on the happy path; the D7 staleness re-verification and D8 cross-source conflict rules operate *within* a mine (in `research.ts`), not at the storage layer.
+- **Self-ontology** (`person_id IS NULL`) is written by the persona subsystem; the store supports it but this subsystem never writes self facts. The interim `dev:seed-self` command (D9) loads a fixture for testing until then.
+- **In-memory → row mapping**: `OntologyFact { facet, key, value, sourceUrl, confidence, tier }` maps to `ontology_facts { facet, key, value, source_url, confidence, usability_tier }`; `retrieved_at` defaults to now.
+- The store is a thin data layer: it does not call OpenAlex/Tavily/LLM. `minePerson` stays pure (returns facts); a separate `persistPerson(db, resolution, raw, mineResult)` wires mining output into the store, keeping persistence and mining independently testable.
 
 ## Interfaces
 
