@@ -33,8 +33,7 @@ export async function resolveAndExtractContact(
   paperContext: PaperContext,
   options: IntakeOptions = {},
 ): Promise<SelectedEmail | null> {
-  const { fetchFn, search, fetcher } = deps;
-  const contactDeps: ContactDeps = { search, fetcher };
+  const { fetchFn } = deps;
 
   // OpenAlex is an enrichment, not a dependency: if it fails (rate limit,
   // outage, bad JSON) we degrade to the paper affiliation rather than aborting
@@ -51,7 +50,7 @@ export async function resolveAndExtractContact(
     resolvedAffiliation = undefined; // fall back to the paper affiliation
   }
 
-  return extractContact(contactDeps, person, options.paperText ?? null, {
+  return extractContact(deps, person, options.paperText ?? null, {
     paperAgeMonths: options.paperAgeMonths,
     paperContext,
     // Precedence handled inside extractContact: currentAffiliation wins when set,

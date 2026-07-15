@@ -33,7 +33,7 @@ resolution.author.homepageUrls = await fetchIdentityAnchors(raw);
 const tavily = createTavilyClient(tavilyKey);
 const deps: MineDeps = { search: tavily, fetcher: tavily, llm: createOpenRouterClient() };
 
-const { facts, profileSummary } = await minePerson(deps, resolution, raw, ctx);
+const { facts, profileSummary } = await minePerson(deps, resolution, raw);
 
 console.log(`RESOLVED: ${resolution.author.displayName} (signals: ${resolution.signals.join(', ')})`);
 console.log(`facts: ${facts.length}`);

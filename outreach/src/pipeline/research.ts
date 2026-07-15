@@ -3,6 +3,7 @@
 import { parse } from 'tldts';
 import {
   classifyWebPage,
+  hostMatches,
   type PageFetcher,
   type PaperContext,
   type SearchClient,
@@ -21,7 +22,7 @@ export interface OpenAlexCandidate {
   coauthors: string[]; // full names across the candidate's recent works
   workTitles: string[];
   externalIds: string[]; // arXiv ids / DOIs across works
-  venues?: string[]; // work venues (optional: client.ts may not populate yet)
+  venues?: string[]; // work venues
   homepageUrls?: string[]; // OpenAlex-listed homepage/host URLs (identity anchors)
 }
 
@@ -36,13 +37,6 @@ export interface OntologyFact {
   tier: 'A' | 'B' | 'C';
 }
 
-// D-vocabulary (Data Model note): recommended keys per facet. Kept as a
-// constant for reference; keys are freeform but should be drawn from here.
-export const FACT_VOCABULARY = {
-  academic: ['research_area', 'method', 'dataset', 'key_paper', 'venue', 'advisor', 'lab', 'collaborator'],
-  trajectory: ['institution', 'company', 'role', 'location'],
-  interest: ['hobby', 'side_project', 'oss_project', 'community', 'writing'],
-} as const;
 
 const OPENALEX_URL = (id: string): string => `https://openalex.org/${id}`;
 
@@ -200,13 +194,13 @@ export interface MineDeps {
   llm: LLMClient;
 }
 
-// D3 source class (deterministic, never LLM). Extends classifyWebPage with the
-// path/host refinements the spec calls out (blog under a homepage, social host).
-type SourceClass = 'openalex' | 'homepage' | 'directory' | 'github_profile' | 'blog' | 'social' | 'aggregator';
+// D3 source class for a fetched web page (OpenAlex facts get tier A directly in
+// factsFromOpenAlex and never flow through here). Refines classifyWebPage with
+// the path/host distinctions the spec calls out (blog under a homepage, social).
+type SourceClass = 'homepage' | 'directory' | 'github_profile' | 'blog' | 'social' | 'aggregator';
 
 // D3 tier caps: a source class can never yield a fact above its cap.
 const TIER_CAP: Record<SourceClass, 'A' | 'B' | 'C'> = {
-  openalex: 'A',
   homepage: 'A',
   directory: 'A',
   github_profile: 'A',
@@ -236,8 +230,7 @@ const hostname = (url: string): string => {
 
 // Refine classifyWebPage into a D3 source class using URL path and host.
 function pageSourceClass(page: WebPage, personName: string): SourceClass {
-  const host = hostname(page.url);
-  if (SOCIAL_HOSTS.some((h) => host === h || host.endsWith('.' + h))) return 'social';
+  if (hostMatches(hostname(page.url), SOCIAL_HOSTS)) return 'social';
   const base = classifyWebPage(page, personName); // homepage | directory | github_profile | aggregator
   if (base === 'homepage') {
     const path = (() => {
@@ -268,7 +261,9 @@ interface RawFact {
   proposedTier?: string;
 }
 
-const VALID_FACETS = new Set(['academic', 'trajectory', 'interest']);
+const VALID_FACETS = new Set<OntologyFact['facet']>(['academic', 'trajectory', 'interest']);
+
+const isFacet = (v: unknown): v is OntologyFact['facet'] => VALID_FACETS.has(v as OntologyFact['facet']);
 
 function parseFacts(text: string): RawFact[] | null {
   // Tolerate a stray code fence around the JSON array.
@@ -332,9 +327,7 @@ export async function minePerson(
   deps: MineDeps,
   resolution: AuthorResolution,
   raw: OpenAlexAuthorRaw,
-  paperContext: PaperContext,
 ): Promise<{ facts: OntologyFact[]; profileSummary: string }> {
-  void paperContext; // reserved (D5a context already applied at resolution time)
   const author = resolution.author;
   const name = author.displayName;
 
@@ -405,10 +398,10 @@ async function minePersonalFacts(
     const rawFacts = await extractFactsFromPage(deps.llm, name, page);
     if (!rawFacts) continue; // parse failed twice: skip this page
     for (const rf of rawFacts.slice(0, MAX_FACTS_PER_PAGE)) {
-      if (!rf.facet || !VALID_FACETS.has(rf.facet) || !rf.key || !rf.value) continue;
+      if (!isFacet(rf.facet) || !rf.key || !rf.value) continue;
       const confidence = Number.isFinite(rf.confidence) ? Math.max(0, Math.min(1, rf.confidence as number)) : 0.5;
       facts.push({
-        facet: rf.facet as OntologyFact['facet'],
+        facet: rf.facet,
         key: String(rf.key).slice(0, MAX_VALUE_LEN),
         value: String(rf.value).slice(0, MAX_VALUE_LEN),
         sourceUrl: page.url,

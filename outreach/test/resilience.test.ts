@@ -2,7 +2,6 @@ import { describe, expect, test } from 'vitest';
 import { resolveAndExtractContact } from '../src/pipeline/intake.js';
 import { minePerson, type AuthorResolution, type MineDeps, type OpenAlexCandidate } from '../src/pipeline/research.js';
 import type { OpenAlexAuthorRaw } from '../src/openalex/client.js';
-import type { PaperContext } from '../src/pipeline/contacts.js';
 
 // External-call resilience: a failing OpenAlex or LLM call must degrade, never
 // crash the pipeline (D10 "return a result or null, never crash").
@@ -52,7 +51,6 @@ describe('minePerson resilience', () => {
     coauthors: [], workTitles: [], externalIds: [], homepageUrls: ['https://mit.edu'],
   };
   const resolution: AuthorResolution = { author: candidate, signals: ['concept'] };
-  const ctx: PaperContext = { affiliationHint: 'MIT' };
 
   test('returns OpenAlex facts even when the LLM throws on every call', async () => {
     const page = 'https://www.mit.edu/~jsmith';
@@ -61,7 +59,7 @@ describe('minePerson resilience', () => {
       fetcher: { async fetch(urls) { return urls.map((url) => ({ url, title: '', content: 'bio' })); } },
       llm: { async complete() { throw new Error('LLM 502'); } },
     };
-    const { facts, profileSummary } = await minePerson(deps, resolution, raw, ctx);
+    const { facts, profileSummary } = await minePerson(deps, resolution, raw);
     expect(facts.some((f) => f.facet === 'trajectory' && f.value === 'MIT')).toBe(true);
     expect(typeof profileSummary).toBe('string'); // did not crash
   });
@@ -72,7 +70,7 @@ describe('minePerson resilience', () => {
       fetcher: { async fetch() { return []; } },
       llm: { async complete() { return 'A profile.'; } },
     };
-    const { facts } = await minePerson(deps, resolution, raw, ctx);
+    const { facts } = await minePerson(deps, resolution, raw);
     expect(facts.some((f) => f.value === 'MIT')).toBe(true);
   });
 });

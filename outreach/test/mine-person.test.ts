@@ -8,7 +8,7 @@ import {
 import type { OpenAlexAuthorRaw } from '../src/openalex/client.js';
 import type { LLMClient } from '../src/llm/client.js';
 import { EXTRACT_SYSTEM } from '../src/llm/prompts.js';
-import type { PageFetcher, PaperContext, SearchClient, WebPage } from '../src/pipeline/contacts.js';
+import type { PageFetcher, SearchClient, WebPage } from '../src/pipeline/contacts.js';
 
 const raw: OpenAlexAuthorRaw = {
   id: 'https://openalex.org/A5001',
@@ -28,7 +28,6 @@ const candidate: OpenAlexCandidate = {
 };
 
 const resolution: AuthorResolution = { author: candidate, signals: ['coauthor'] };
-const ctx: PaperContext = { affiliationHint: 'TU Wien' };
 
 // Fake LLM that branches on the system prompt (extract vs summary) and records
 // how many times extraction ran (to assert retry / gating behavior).
@@ -73,7 +72,7 @@ describe('minePerson (D4/D5b/D6a)', () => {
     const { client } = makeLLM(() => '[]');
     const deps = makeDeps({ llm: client, searchResults: [], fetched: {}, searchLog });
 
-    const { facts, profileSummary } = await minePerson(deps, resolution, raw, ctx);
+    const { facts, profileSummary } = await minePerson(deps, resolution, raw);
 
     expect(searchLog).toHaveLength(3);
     expect(facts.some((f) => f.facet === 'trajectory' && f.key === 'institution' && f.value === 'TU Wien')).toBe(true);
@@ -93,7 +92,7 @@ describe('minePerson (D4/D5b/D6a)', () => {
       fetched: { [blog]: 'I love writing about Gaussian splatting.' },
     });
 
-    const { facts } = await minePerson(deps, resolution, raw, ctx);
+    const { facts } = await minePerson(deps, resolution, raw);
 
     const mined = facts.find((f) => f.sourceUrl === blog && f.key === 'writing');
     expect(calls.extract).toHaveLength(1);
@@ -113,7 +112,7 @@ describe('minePerson (D4/D5b/D6a)', () => {
       fetched: { [homonym]: 'Bernhard Kerbl, attorney at law.' },
     });
 
-    const { facts } = await minePerson(deps, resolution, raw, ctx);
+    const { facts } = await minePerson(deps, resolution, raw);
 
     expect(calls.extract).toHaveLength(0); // gated out, never sent to the LLM
     expect(facts.some((f) => f.sourceUrl === homonym)).toBe(false);
@@ -137,7 +136,7 @@ describe('minePerson (D4/D5b/D6a)', () => {
       fetched: { [staffPage]: 'Bernhard Kerbl, TU Wien.' },
     });
 
-    const { facts } = await minePerson(deps, anchoredByMarketingDomain, raw, ctx);
+    const { facts } = await minePerson(deps, anchoredByMarketingDomain, raw);
 
     expect(calls.extract).toHaveLength(1); // not gated out
     expect(facts.some((f) => f.sourceUrl === staffPage)).toBe(true);
@@ -152,7 +151,7 @@ describe('minePerson (D4/D5b/D6a)', () => {
       fetched: { [talk]: 'A talk by Bernhard Kerbl.' },
     });
 
-    const { facts, profileSummary } = await minePerson(deps, resolution, raw, ctx);
+    const { facts, profileSummary } = await minePerson(deps, resolution, raw);
 
     expect(calls.extract).toHaveLength(2); // original + one retry
     expect(facts.some((f) => f.sourceUrl === talk)).toBe(false);
