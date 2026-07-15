@@ -246,9 +246,13 @@ function parseFacts(text: string): RawFact[] | null {
 async function extractFactsFromPage(llm: LLMClient, personName: string, page: WebPage): Promise<RawFact[] | null> {
   const user = buildExtractUser(personName, page);
   for (let attempt = 0; attempt < 2; attempt++) {
-    const raw = await llm.complete(EXTRACT_SYSTEM, user);
-    const facts = parseFacts(raw);
-    if (facts) return facts;
+    try {
+      const facts = parseFacts(await llm.complete(EXTRACT_SYSTEM, user));
+      if (facts) return facts;
+    } catch {
+      // LLM call itself threw (network/5xx/non-JSON body): count as a failed
+      // attempt and retry once, then skip the page.
+    }
   }
   return null;
 }
@@ -293,9 +297,40 @@ export async function minePerson(
   void paperContext; // reserved (D5a context already applied at resolution time)
   const author = resolution.author;
   const name = author.displayName;
-  const affiliation = currentAffiliation(raw) ?? '';
 
-  // D4 personal pass: exactly three searches using the current affiliation.
+  // OpenAlex facts are computed first and unconditionally, so a failure in the
+  // web/LLM personal pass still yields a useful ontology.
+  const facts: OntologyFact[] = factsFromOpenAlex(author, raw);
+
+  try {
+    await minePersonalFacts(deps, author, raw, facts);
+  } catch {
+    // Tavily/LLM failure: keep the OpenAlex facts, skip personal facets.
+  }
+
+  let profileSummary = '';
+  try {
+    profileSummary = (await deps.llm.complete(SUMMARY_SYSTEM, buildSummaryUser(name, facts))).trim();
+  } catch {
+    // Summary is best-effort; an LLM failure must not lose the mined facts.
+  }
+
+  return { facts, profileSummary };
+}
+
+const MAX_FACTS_PER_PAGE = 25; // bound attacker/LLM-controlled fact volume per page
+const MAX_VALUE_LEN = 300; // truncate over-long fact values
+
+// D4/D5b/D6a: the domain-gated, tier-clamped personal-facet pass. Appends to
+// `facts`. Throws only on a hard external failure (caller degrades).
+async function minePersonalFacts(
+  deps: MineDeps,
+  author: OpenAlexCandidate,
+  raw: OpenAlexAuthorRaw,
+  facts: OntologyFact[],
+): Promise<void> {
+  const name = author.displayName;
+  const affiliation = currentAffiliation(raw) ?? '';
   const queries = [
     `"${name}" ${affiliation} homepage`.replace(/\s+/g, ' ').trim(),
     `"${name}" blog OR talk`,
@@ -306,15 +341,12 @@ export async function minePerson(
   const ranked: WebPage[] = [];
   for (const query of queries) {
     for (const page of await deps.search.search(query)) {
-      if (seen.has(page.url)) continue;
-      if (classifyWebPage(page, name) === 'aggregator') continue; // D1b: aggregators contribute nothing
+      if (seen.has(page.url) || safeClassify(page, name) === 'aggregator') continue;
       seen.add(page.url);
       ranked.push(page);
     }
   }
 
-  // Fetch full content for the top non-aggregator pages (budget <= 3), carrying
-  // the ranked title through so classification keeps its signal.
   const rankedByUrl = new Map(ranked.map((p) => [p.url, p]));
   const fetched = await deps.fetcher.fetch(ranked.slice(0, D4_MAX_FETCH).map((p) => p.url));
   const pages: WebPage[] = fetched.map((f) => ({
@@ -324,8 +356,6 @@ export async function minePerson(
   }));
 
   const gate = buildDomainGate(author);
-  const facts: OntologyFact[] = factsFromOpenAlex(author, raw);
-
   let extractCalls = 0;
   for (const page of pages) {
     if (!gate(page)) continue; // D5b: off-domain (homonym) pages are dropped
@@ -334,22 +364,26 @@ export async function minePerson(
     const cap = TIER_CAP[pageSourceClass(page, name)];
     const rawFacts = await extractFactsFromPage(deps.llm, name, page);
     if (!rawFacts) continue; // parse failed twice: skip this page
-    for (const rf of rawFacts) {
+    for (const rf of rawFacts.slice(0, MAX_FACTS_PER_PAGE)) {
       if (!rf.facet || !VALID_FACETS.has(rf.facet) || !rf.key || !rf.value) continue;
-      const confidence = typeof rf.confidence === 'number' ? Math.max(0, Math.min(1, rf.confidence)) : 0.5;
+      const confidence = Number.isFinite(rf.confidence) ? Math.max(0, Math.min(1, rf.confidence as number)) : 0.5;
       facts.push({
         facet: rf.facet as OntologyFact['facet'],
-        key: rf.key,
-        value: rf.value,
+        key: String(rf.key).slice(0, MAX_VALUE_LEN),
+        value: String(rf.value).slice(0, MAX_VALUE_LEN),
         sourceUrl: page.url,
         confidence,
         tier: clampTier(rf.proposedTier ?? 'C', cap),
       });
     }
   }
+}
 
-  // One more cheap call for the profile summary (D4: <= 4 LLM calls total).
-  const profileSummary = (await deps.llm.complete(SUMMARY_SYSTEM, buildSummaryUser(name, facts))).trim();
-
-  return { facts, profileSummary };
+// classifyWebPage does `new URL()`; a malformed result URL must not crash the run.
+function safeClassify(page: WebPage, name: string): ReturnType<typeof classifyWebPage> | 'aggregator' {
+  try {
+    return classifyWebPage(page, name);
+  } catch {
+    return 'aggregator'; // treat unparseable URLs as non-contributing
+  }
 }

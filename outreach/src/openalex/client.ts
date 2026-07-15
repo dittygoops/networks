@@ -6,6 +6,22 @@ const BASE = 'https://api.openalex.org';
 // Polite pool: OpenAlex asks for a contact in the User-Agent (D3a).
 const UA = 'outreach-research (mailto:apgupta3@asu.edu)';
 
+export type FetchFn = typeof fetch;
+
+// Fetch JSON with an HTTP-status and parse guard, so a 429/500 or an HTML error
+// page surfaces as a clear Error instead of an opaque SyntaxError. Callers on
+// the hot path catch this and degrade (intake falls back to the paper
+// affiliation; minePerson still returns OpenAlex facts).
+async function getJson<T>(doFetch: FetchFn, url: URL | string): Promise<T> {
+  const res = await doFetch(url, { headers: { 'User-Agent': UA } });
+  if (!res.ok) throw new Error(`OpenAlex HTTP ${res.status} for ${String(url)}`);
+  try {
+    return (await res.json()) as T;
+  } catch {
+    throw new Error(`OpenAlex returned a non-JSON body for ${String(url)}`);
+  }
+}
+
 export interface OpenAlexAuthorRaw {
   id: string;
   display_name: string;
@@ -68,24 +84,27 @@ export async function fetchIdentityAnchors(
   opts: { fetchFn?: FetchFn; maxInstitutions?: number } = {},
 ): Promise<string[]> {
   const doFetch = opts.fetchFn ?? fetch;
-  const headers = { 'User-Agent': UA };
   const ids: string[] = [];
   for (const aff of author.affiliations ?? []) {
-    const id = aff.institution.id ? bareId(aff.institution.id) : null;
+    const id = aff.institution?.id ? bareId(aff.institution.id) : null;
     if (id && !ids.includes(id)) ids.push(id);
   }
   const anchors: string[] = [];
   for (const id of ids.slice(0, opts.maxInstitutions ?? 4)) {
-    const inst = (await (await doFetch(`${BASE}/institutions/${id}`, { headers })).json()) as { homepage_url?: string };
-    if (inst.homepage_url) anchors.push(inst.homepage_url);
+    try {
+      const inst = await getJson<{ homepage_url?: string }>(doFetch, `${BASE}/institutions/${id}`);
+      if (inst.homepage_url) anchors.push(inst.homepage_url);
+    } catch {
+      // One institution lookup failing must not lose the other anchors.
+    }
   }
   return anchors;
 }
 
-export type FetchFn = typeof fetch;
-
 // Fetch name-matching author candidates with their recent works, ready for
-// resolveAuthor. Injectable fetch so the pipeline is testable offline.
+// resolveAuthor. Injectable fetch so the pipeline is testable offline. The
+// top-level authors search throws on failure (the caller degrades); a single
+// per-author works failure just yields that author with no works.
 export async function fetchAuthorCandidates(
   name: string,
   opts: { fetchFn?: FetchFn; perAuthorWorks?: number; maxCandidates?: number } = {},
@@ -93,20 +112,24 @@ export async function fetchAuthorCandidates(
   const doFetch = opts.fetchFn ?? fetch;
   const maxCandidates = opts.maxCandidates ?? 5;
   const perWorks = opts.perAuthorWorks ?? 15;
-  const headers = { 'User-Agent': UA };
 
   const search = new URL(`${BASE}/authors`);
   search.searchParams.set('search', name);
   search.searchParams.set('per_page', String(maxCandidates));
-  const authors = (await (await doFetch(search, { headers })).json()) as { results?: OpenAlexAuthorRaw[] };
+  const authors = await getJson<{ results?: OpenAlexAuthorRaw[] }>(doFetch, search);
 
   const out: { raw: OpenAlexAuthorRaw; candidate: OpenAlexCandidate }[] = [];
   for (const author of authors.results ?? []) {
     const worksUrl = new URL(`${BASE}/works`);
     worksUrl.searchParams.set('filter', `author.id:${bareId(author.id)}`);
     worksUrl.searchParams.set('per_page', String(perWorks));
-    const works = (await (await doFetch(worksUrl, { headers })).json()) as { results?: OpenAlexWorkRaw[] };
-    out.push({ raw: author, candidate: normalizeAuthor(author, works.results ?? []) });
+    let works: OpenAlexWorkRaw[] = [];
+    try {
+      works = (await getJson<{ results?: OpenAlexWorkRaw[] }>(doFetch, worksUrl)).results ?? [];
+    } catch {
+      // Works lookup failed for this candidate: keep the author with no works.
+    }
+    out.push({ raw: author, candidate: normalizeAuthor(author, works) });
   }
   return out;
 }
