@@ -38,7 +38,55 @@ export interface OntologyFact {
 }
 
 
+// D-vocabulary: the recommended fact key set per facet, kept in one place so the
+// spec, the extraction prompt, and the code agree. `key` and `value` are part of
+// the D11 dedup identity, so consistent keys are what make dedup real. Unknown
+// keys still pass through (snake-cased) rather than being dropped.
+export const FACT_VOCABULARY: Record<OntologyFact['facet'], readonly string[]> = {
+  academic: ['research_area', 'method', 'dataset', 'key_paper', 'venue', 'advisor', 'lab', 'collaborator', 'project'],
+  trajectory: ['institution', 'company', 'role', 'location'],
+  interest: ['hobby', 'side_project', 'oss_project', 'community', 'writing'],
+};
+
+// Common non-canonical spellings the LLM emits, mapped to the canonical key.
+// Applied after snake-casing, so entries are the snake_case form of the variant.
+const KEY_VARIANTS: Record<string, string> = {
+  methods: 'method',
+  projects: 'project',
+  research_areas: 'research_area',
+  research_interest: 'research_area',
+  research_interests: 'research_area',
+  datasets: 'dataset',
+  venues: 'venue',
+  advisors: 'advisor',
+  labs: 'lab',
+  collaborators: 'collaborator',
+  hobbies: 'hobby',
+  institutions: 'institution',
+  companies: 'company',
+  roles: 'role',
+  locations: 'location',
+};
+
+const snakeCase = (s: string): string =>
+  s.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+
+// D6a: canonicalize a fact key to the D-vocabulary form. Lowercases and
+// snake_cases, then maps known variants (e.g. `methods` -> `method`) to their
+// canonical key. Unknown keys pass through snake-cased (never dropped).
+export function normalizeKey(_facet: OntologyFact['facet'], key: string): string {
+  const snake = snakeCase(key);
+  return KEY_VARIANTS[snake] ?? snake;
+}
+
 const OPENALEX_URL = (id: string): string => `https://openalex.org/${id}`;
+
+// Canonical form of a concept value for dedup: lowercased, parenthetical
+// qualifiers stripped ("Rendering (computer graphics)" -> "rendering"), and
+// whitespace collapsed. Used only as a dedup key; the first-seen display value
+// is what gets stored.
+const canonicalConcept = (value: string): string =>
+  value.toLowerCase().replace(/\([^)]*\)/g, ' ').replace(/\s+/g, ' ').trim();
 
 // D6a: deterministic academic/trajectory facts from OpenAlex. Source class is
 // `openalex` so every fact caps at tier A. No LLM involved.
@@ -55,7 +103,16 @@ export function factsFromOpenAlex(candidate: OpenAlexCandidate, raw: OpenAlexAut
   for (const aff of candidate.affiliations) {
     if (aff !== current) push('trajectory', 'institution', aff, 0.8);
   }
-  for (const concept of candidate.concepts) push('academic', 'research_area', concept, 0.85);
+  // Dedup near-identical concepts (case + parenthetical qualifiers) so the three
+  // "graphics" variants do not create redundant research_area facts. First-seen
+  // display value wins; later synonyms are skipped.
+  const seenAreas = new Set<string>();
+  for (const concept of candidate.concepts) {
+    const canon = canonicalConcept(concept);
+    if (!canon || seenAreas.has(canon)) continue;
+    seenAreas.add(canon);
+    push('academic', 'research_area', concept, 0.85);
+  }
   for (const venue of candidate.venues ?? []) push('academic', 'venue', venue, 0.8);
   for (const coauthor of candidate.coauthors) push('academic', 'collaborator', coauthor, 0.7);
 
@@ -402,7 +459,7 @@ async function minePersonalFacts(
       const confidence = Number.isFinite(rf.confidence) ? Math.max(0, Math.min(1, rf.confidence as number)) : 0.5;
       facts.push({
         facet: rf.facet,
-        key: String(rf.key).slice(0, MAX_VALUE_LEN),
+        key: normalizeKey(rf.facet, String(rf.key).slice(0, MAX_VALUE_LEN)),
         value: String(rf.value).slice(0, MAX_VALUE_LEN),
         sourceUrl: page.url,
         confidence,
