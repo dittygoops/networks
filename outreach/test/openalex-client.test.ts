@@ -77,4 +77,23 @@ describe('currentAffiliation', () => {
   test('returns null when there are no affiliations', () => {
     expect(currentAffiliation({ ...rawAuthor, affiliations: [] })).toBeNull();
   });
+
+  test('does not crash on malformed affiliation entries (missing years / null institution)', () => {
+    const malformed = {
+      ...rawAuthor,
+      affiliations: [
+        { institution: null, years: [2025] },
+        { institution: { display_name: 'TU Wien' } }, // no years
+      ],
+    } as unknown as OpenAlexAuthorRaw;
+    expect(() => currentAffiliation(malformed)).not.toThrow();
+    expect(currentAffiliation(malformed)).toBe('TU Wien');
+  });
+});
+
+describe('normalizeAuthor resilience', () => {
+  test('does not crash on a work missing authorships', () => {
+    const badWorks = [{ title: 'X' }, { authorships: undefined }] as unknown as Parameters<typeof normalizeAuthor>[1];
+    expect(() => normalizeAuthor(rawAuthor, badWorks)).not.toThrow();
+  });
 });

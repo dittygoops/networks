@@ -95,15 +95,18 @@ export function resolveAuthor(
   targetName: string,
   ctx: PaperContext,
 ): AuthorResolution | null {
-  const paperCoauthorLastNames = (ctx.coauthors ?? [])
-    .map((n) => tokens(n).at(-1) ?? '')
-    .filter((ln) => ln.length >= 4); // avoid the "Ng" trap
+  // Paper co-authors reduced to {firstInitial, lastName}, dropping last names
+  // under 4 chars (the "Ng" trap).
+  const paperCoauthors = (ctx.coauthors ?? [])
+    .map((n) => tokens(n))
+    .filter((t) => t.length >= 2 && (t.at(-1) ?? '').length >= 4)
+    .map((t) => ({ initial: t[0]![0]!, last: t.at(-1)! }));
 
   let best: { author: OpenAlexCandidate; signals: string[]; score: number } | null = null;
 
   for (const author of candidates) {
     if (!personNameMatches(author.displayName, targetName)) continue;
-    const signals = corroborationSignals(author, ctx, paperCoauthorLastNames);
+    const signals = corroborationSignals(author, ctx, paperCoauthors);
     const strong = signals.filter((s) => s === 'coauthor' || s === 'title' || s === 'arxiv').length;
     const weak = signals.filter((s) => s === 'concept' || s === 'affiliation').length;
     if (strong < 1 && weak < 2) continue;
@@ -114,11 +117,25 @@ export function resolveAuthor(
   return best ? { author: best.author, signals: best.signals } : null;
 }
 
-function corroborationSignals(author: OpenAlexCandidate, ctx: PaperContext, coauthorLastNames: string[]): string[] {
+interface PaperCoauthor {
+  initial: string;
+  last: string;
+}
+
+function corroborationSignals(author: OpenAlexCandidate, ctx: PaperContext, paperCoauthors: PaperCoauthor[]): string[] {
   const signals: string[] = [];
 
-  const authorCoauthorTokens = new Set(author.coauthors.flatMap(tokens));
-  if (coauthorLastNames.some((ln) => authorCoauthorTokens.has(ln))) signals.push('coauthor');
+  // A co-author matches only when its LAST token equals a paper co-author's
+  // surname AND its first initial matches, so common surnames (Wang, Chen) or a
+  // surname appearing as someone's first name do not spuriously corroborate.
+  const authorCoauthors = author.coauthors.map(tokens).filter((t) => t.length >= 2);
+  if (
+    paperCoauthors.some((pc) =>
+      authorCoauthors.some((t) => t.at(-1) === pc.last && t[0]![0] === pc.initial),
+    )
+  ) {
+    signals.push('coauthor');
+  }
 
   if (ctx.arxivId) {
     const wanted = ctx.arxivId.toLowerCase().replace(/^arxiv:/, '');
@@ -126,9 +143,15 @@ function corroborationSignals(author: OpenAlexCandidate, ctx: PaperContext, coau
   }
 
   if (ctx.title) {
-    const wanted = ctx.title.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
-    if (wanted && author.workTitles.some((t) => normalize(t).includes(wanted) || wanted.includes(normalize(t)))) {
-      signals.push('title');
+    const wanted = normalize(ctx.title);
+    // Require a substantial normalized title on both sides to avoid an
+    // empty/near-empty work title matching everything.
+    if (wanted.length >= 8) {
+      const match = author.workTitles.some((t) => {
+        const nt = normalize(t);
+        return nt.length >= 8 && (nt.includes(wanted) || wanted.includes(nt));
+      });
+      if (match) signals.push('title');
     }
   }
 
@@ -137,18 +160,35 @@ function corroborationSignals(author: OpenAlexCandidate, ctx: PaperContext, coau
     signals.push('concept');
   }
 
-  if (ctx.affiliationHint) {
-    const hint = ctx.affiliationHint.toLowerCase();
-    const hintTokens = tokens(ctx.affiliationHint);
-    if (author.affiliations.some((aff) => hintTokens.some((h) => h.length >= 4 && aff.toLowerCase().includes(h)) || aff.toLowerCase().includes(hint))) {
-      signals.push('affiliation');
-    }
+  if (ctx.affiliationHint && affiliationMatches(ctx.affiliationHint, author.affiliations)) {
+    signals.push('affiliation');
   }
 
   return signals;
 }
 
 const normalize = (s: string): string => s.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+
+const STOPWORDS = new Set(['of', 'the', 'and', 'for', 'at', 'de', 'du', 'la', 'le']);
+
+// Acronym of the significant words in an institution name: "Massachusetts
+// Institute of Technology" -> "mit".
+const acronym = (s: string): string =>
+  tokens(s).filter((t) => !STOPWORDS.has(t)).map((t) => t[0]).join('');
+
+// Affiliation match handles both full names and short acronyms (MIT, NYU, CMU),
+// which the plain substring test misses.
+function affiliationMatches(hint: string, affiliations: string[]): boolean {
+  const hintLc = hint.toLowerCase();
+  const hintTokens = tokens(hint).filter((t) => !STOPWORDS.has(t));
+  const hintAcronym = hintTokens.length > 1 ? hintTokens.map((t) => t[0]).join('') : hintLc.replace(/[^a-z]/g, '');
+  return affiliations.some((aff) => {
+    const affLc = aff.toLowerCase();
+    if (affLc.includes(hintLc)) return true;
+    if (hintTokens.some((h) => h.length >= 4 && affLc.includes(h))) return true;
+    return hintAcronym.length >= 2 && acronym(aff) === hintAcronym;
+  });
+}
 
 // ---------------------------------------------------------------------------
 // D4 personal-facet mining: Tavily pages -> cheap LLM -> clamped ontology facts.
