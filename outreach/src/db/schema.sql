@@ -19,7 +19,10 @@ CREATE TABLE IF NOT EXISTS ontology_facts (
   key TEXT, value TEXT, source_url TEXT,
   confidence REAL,
   usability_tier TEXT CHECK(usability_tier IN ('A','B','C')),
-  retrieved_at TEXT DEFAULT (datetime('now'))
+  retrieved_at TEXT DEFAULT (datetime('now')),
+  -- Accumulate strategy (D11): the same fact re-seen upserts (refreshes
+  -- retrieved_at) rather than inserting a duplicate.
+  UNIQUE(person_id, facet, key, value)
 );
 
 CREATE INDEX IF NOT EXISTS idx_facts_person ON ontology_facts(person_id);
