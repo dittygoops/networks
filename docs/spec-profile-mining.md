@@ -50,7 +50,18 @@ Tier 1 (PDF) no longer unconditionally short-circuits.
 - If the paper is < 12 months old AND tier 1 yields an email at confidence ≥ 0.7, return it without web search (fast path, no staleness risk).
 - Otherwise always run the web tier (tier 2/3) as well, then reconcile: pick the highest-confidence candidate across *both* sources using the (decayed) D1 scores; `.edu` tie-break as before.
 - When a web email and a paper email disagree and both are ≥ 0.7, both are recorded; the winner is used and the review page shows the alternate ("paper listed X; current web sources list Y"). Freshness beats the paper on ties.
-- Current affiliation discovered by Step B (person research) is fed back as the affiliation hint for the web queries, so the search targets where the person *is now*, not where the paper says they were.
+- Current affiliation is discovered automatically inside contact extraction (D1c), not supplied by a human or a separate step, so the search targets where the person *is now*, not where the paper says they were.
+
+### D1c. Automated affiliation-discovery second pass
+The web tier runs in up to two passes so a mover's *current* email is found with zero human input. Empirically, the person's current homepage surfaces on a plain name search even when the paper's affiliation is stale; the homepage's own domain then names the current institution, and a domain-scoped re-query surfaces the current email.
+- **Pass 1** (D1b): queries `"<name>" <paperAffiliation?> email` and `"<name>" github`. Fetch + scan top-3 non-aggregator pages plus snippets. `paperAffiliation` is whatever the paper gave (may be empty or stale); it is a hint, never required.
+- **Trigger**: run Pass 2 only if Pass 1 yields no candidate at confidence ≥ 0.7. (A confident Pass-1 hit means we already have the current email.)
+- **Domain derivation** (D-domain): from each non-aggregator homepage/directory result in Pass 1, compute the *registrable domain* (public-suffix aware: `cg.tuwien.ac.at` → `tuwien.ac.at`, `di.ku.dk` → `ku.dk`). Collect unique registrable domains, drop aggregator and generic-host domains (gmail.com, github.io, etc.), keep the **top 2** by Pass-1 rank.
+- **Pass 2**: for each kept domain, query `"<name>" <domain>`. Fetch + scan top non-aggregator results (shared fetch budget, see below).
+- **Reconciliation**: all candidates from the paper, Pass 1, and Pass 2 go through `selectEmail` with age decay (D1a). Multiple current affiliations need no "which is current" logic: name-match + confidence pick the winner, alternates are recorded.
+- **Termination & budget**: exactly one Pass 2, no recursion. Hard caps per person: ≤ 4 searches (2 + 2) and ≤ 2 fetch batches of ≤ 3 pages each (≤ 6 extract calls), within the PRD's ≤ 6-search / cost budget.
+
+**D-domain (registrable-domain rule).** Use a public-suffix list (bundled, offline) to reduce a hostname to registrable domain + suffix. Hosts on the aggregator list (D1b) and generic personal/hosting domains (`gmail.com`, `outlook.com`, `github.io`, `googleusercontent.com`, and similar) are excluded from the current-institution domain set: they are not institutional signals.
 
 ### D1b. Web page fetch (tier 2/3 is fetch-based, not snippet-based)
 Search returns ranked result pages; emails rarely appear in the search *snippet*. So:
