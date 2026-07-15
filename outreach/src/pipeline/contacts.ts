@@ -183,8 +183,18 @@ export interface TargetPerson {
   affiliation?: string | null;
 }
 
+// D5a: context intake always has, used to disambiguate common names.
+export interface PaperContext {
+  affiliationHint?: string | null;
+  areaTerms?: string[];
+  coauthors?: string[]; // reserved for D5b (Step B) corroboration
+  title?: string | null;
+  arxivId?: string | null;
+}
+
 export interface ExtractOptions {
   paperAgeMonths?: number;
+  paperContext?: PaperContext;
 }
 
 const FRESH_PAPER_MONTHS = 12;
@@ -207,7 +217,12 @@ export async function extractContact(
   const paperPick = selectEmail(paperCandidates, person.name, paperAgeMonths);
   if (paperPick && paperAgeMonths < FRESH_PAPER_MONTHS) return paperPick;
 
-  const webCandidates = await extractWebContacts(deps, person);
+  const affiliation = options.paperContext?.affiliationHint ?? person.affiliation ?? '';
+
+  // D5a guard: affiliation is the disambiguator. Without it, a common name
+  // can't be safely resolved from the web, so web emails route to manual.
+  const webCandidates = affiliation.length > 0 ? await extractWebContacts(deps, person, affiliation) : [];
+
   return selectEmail([...paperCandidates, ...webCandidates], person.name, paperAgeMonths);
 }
 
@@ -215,10 +230,13 @@ export async function extractContact(
 // yields no confident email, pass 2 derives the current institution domain from
 // pass-1's homepages and re-queries, so a mover's current email is found with
 // no human-supplied affiliation.
-async function extractWebContacts(deps: ContactDeps, person: TargetPerson): Promise<EmailCandidate[]> {
-  const affiliation = person.affiliation ?? '';
+async function extractWebContacts(
+  deps: ContactDeps,
+  person: TargetPerson,
+  affiliation: string,
+): Promise<EmailCandidate[]> {
   const pass1 = await runWebPass(deps, person, [
-    `"${person.name}" ${affiliation} email`.trim(),
+    `"${person.name}" ${affiliation} email`.replace(/\s+/g, ' ').trim(),
     `"${person.name}" github`,
   ]);
 
