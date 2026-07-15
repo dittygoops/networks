@@ -149,7 +149,8 @@ const GENERIC_HOSTS = [
   'medium.com', 'substack.com', 'notion.site', 'wixsite.com',
 ];
 
-const hostMatches = (hostname: string, hosts: string[]): boolean =>
+// True if hostname equals or is a subdomain of any host in the list.
+export const hostMatches = (hostname: string, hosts: string[]): boolean =>
   hosts.some((h) => hostname === h || hostname.endsWith('.' + h));
 
 // D-domain: reduce found homepage/directory pages to unique registrable
