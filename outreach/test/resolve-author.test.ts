@@ -81,6 +81,44 @@ describe('resolveAuthor corroboration (D5b)', () => {
     expect(resolveAuthor([], 'Jonathan Barron', NERF)).toBeNull();
   });
 
+  test('co-author match requires the same surname AND first initial (common-surname guard)', () => {
+    // Paper co-author "Ravi Ramamoorthi". A homonym whose only overlap is a
+    // different-first-initial "X. Ramamoorthi" should NOT strong-match, and a
+    // co-author whose FIRST name merely equals a paper surname must not match.
+    const wrongInitial = cand({ id: 'A_bad', displayName: 'Jonathan Barron', coauthors: ['Sanjay Ramamoorthi'] });
+    expect(resolveAuthor([wrongInitial], 'Jonathan Barron', NERF)).toBeNull();
+
+    const rightInitial = cand({ id: 'A_ok', displayName: 'Jonathan Barron', coauthors: ['Ravi Ramamoorthi'] });
+    expect(resolveAuthor([rightInitial], 'Jonathan Barron', NERF)?.author.id).toBe('A_ok');
+  });
+
+  test('a paper surname matching a candidate co-author FIRST name does not corroborate', () => {
+    // Paper co-author "Matthew Tancik"; a candidate co-author literally named
+    // "Tancik Somebody" (Tancik as first name) must not count.
+    const c = cand({ id: 'A1', displayName: 'Jonathan Barron', coauthors: ['Tancik Nobody'] });
+    expect(resolveAuthor([c], 'Jonathan Barron', NERF)).toBeNull();
+  });
+
+  test('short acronym affiliation (MIT) still fires the weak affiliation signal', () => {
+    const ctx: PaperContext = { affiliationHint: 'MIT', areaTerms: ['computer vision'] };
+    const c = cand({
+      id: 'A1',
+      displayName: 'Jane Smith',
+      concepts: ['Computer Vision'],
+      affiliations: ['Massachusetts Institute of Technology'],
+    });
+    const result = resolveAuthor([c], 'Jane Smith', ctx);
+    expect(result?.author.id).toBe('A1');
+    expect(result?.signals).toEqual(expect.arrayContaining(['concept', 'affiliation']));
+  });
+
+  test('an empty-normalizing work title does not produce a spurious title match', () => {
+    const ctx: PaperContext = { title: 'A Real Paper Title', areaTerms: ['x'] };
+    // Work title normalizes to empty (punctuation only); must not match.
+    const c = cand({ id: 'A1', displayName: 'Jane Smith', workTitles: ['???', '...'] });
+    expect(resolveAuthor([c], 'Jane Smith', ctx)).toBeNull();
+  });
+
   test('picks the strongest candidate when several name-match', () => {
     const candidates = [
       cand({ id: 'weak', displayName: 'Jonathan Barron', concepts: ['Computer Vision'], affiliations: ['Google'] }),

@@ -41,8 +41,11 @@ const bareId = (id: string): string => id.split('/').pop() ?? id;
 export function currentAffiliation(author: OpenAlexAuthorRaw): string | null {
   let best: { name: string; year: number } | null = null;
   for (const aff of author.affiliations ?? []) {
-    const maxYear = Math.max(...(aff.years.length ? aff.years : [0]));
-    if (!best || maxYear > best.year) best = { name: aff.institution.display_name, year: maxYear };
+    const name = aff?.institution?.display_name;
+    if (!name) continue; // tolerate malformed external records (null institution)
+    const years = aff.years?.length ? aff.years : [0];
+    const maxYear = Math.max(...years);
+    if (!best || maxYear > best.year) best = { name, year: maxYear };
   }
   return best?.name ?? null;
 }
@@ -61,15 +64,17 @@ export function normalizeAuthor(author: OpenAlexAuthorRaw, works: OpenAlexWorkRa
       const v = work.ids?.[key];
       if (v) externalIds.push(v);
     }
-    for (const a of work.authorships) {
-      if (bareId(a.author.id) !== id) coauthors.add(a.author.display_name);
+    for (const a of work.authorships ?? []) {
+      if (a?.author?.id && bareId(a.author.id) !== id && a.author.display_name) {
+        coauthors.add(a.author.display_name);
+      }
     }
   }
   return {
     id,
     displayName: author.display_name,
     concepts: (author.x_concepts ?? []).map((c) => c.display_name),
-    affiliations: (author.affiliations ?? []).map((a) => a.institution.display_name),
+    affiliations: (author.affiliations ?? []).flatMap((a) => (a?.institution?.display_name ? [a.institution.display_name] : [])),
     coauthors: [...coauthors],
     workTitles,
     externalIds,
