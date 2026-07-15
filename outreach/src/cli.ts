@@ -6,9 +6,19 @@ import { readFileSync } from 'node:fs';
 import { openDb, saveSelfFacts, replaceSelfFacts, factRows } from './db/db.js';
 import { processPaper } from './pipeline/orchestrate.js';
 import { buildSelfOntology } from './pipeline/persona.js';
+import { extractPdfText } from './pipeline/pdf.js';
 import { createTavilyClient } from './search/tavily.js';
 import { createOpenRouterClient } from './llm/client.js';
 import type { OntologyFact } from './pipeline/research.js';
+
+// Read a source document as text (PDF via unpdf, otherwise UTF-8).
+async function readDocument(path: string): Promise<{ label: string; text: string }> {
+  const label = basename(path).replace(/\.[^.]+$/, '');
+  if (path.toLowerCase().endsWith('.pdf')) {
+    return { label, text: await extractPdfText(new Uint8Array(readFileSync(path))) };
+  }
+  return { label, text: readFileSync(path, 'utf8') };
+}
 
 const DB_PATH = process.env.OUTREACH_DB ?? 'data/outreach.db';
 
@@ -38,21 +48,44 @@ async function runPersona(args: string[]): Promise<void> {
     console.error('usage: cli.ts persona <doc-path...> [--answers <file.json>]');
     process.exit(1);
   }
-  const documents = docPaths.map((p) => ({ label: basename(p).replace(/\.[^.]+$/, ''), text: readFileSync(p, 'utf8') }));
+  const documents = await Promise.all(docPaths.map(readDocument));
 
   const facts = await buildSelfOntology({ llm: createOpenRouterClient() }, { documents, answers });
   const db = openDb(DB_PATH);
   replaceSelfFacts(db, facts);
 
   console.log(`\nbuilt self-ontology: ${facts.length} facts from ${documents.length} docs + interview`);
-  const byTier = facts.reduce((a: Record<string, number>, f) => ((a[f.tier] = (a[f.tier] ?? 0) + 1), a), {});
-  console.log('by tier:', JSON.stringify(byTier));
-  for (const f of facts) console.log(`  [${f.tier}] ${f.facet}/${f.key} = ${f.value}`);
+  showSelfFacts(db);
+}
+
+// Review surface: print every stored self-fact with its source and tier, grouped
+// by facet, so each fact is traceable to where it came from before it is used.
+function showSelfFacts(db: ReturnType<typeof openDb>): void {
+  const rows = db.prepare(
+    `SELECT facet, key, value, confidence, usability_tier AS tier, source_url
+       FROM ontology_facts WHERE person_id IS NULL ORDER BY facet, usability_tier`,
+  ).all() as { facet: string; key: string; value: string; confidence: number; tier: string; source_url: string }[];
+  if (rows.length === 0) {
+    console.log('no self-ontology yet. Build it: cli.ts persona <doc-path...> [--answers <file.json>]');
+    return;
+  }
+  const byTier = rows.reduce((a: Record<string, number>, r) => ((a[r.tier] = (a[r.tier] ?? 0) + 1), a), {});
+  console.log(`self-ontology: ${rows.length} facts  ${JSON.stringify(byTier)}`);
+  let facet = '';
+  for (const r of rows) {
+    if (r.facet !== facet) { facet = r.facet; console.log(`\n${facet}:`); }
+    const src = r.source_url.replace(/^self:/, '');
+    console.log(`  [${r.tier}] ${r.key} = ${r.value}  (conf ${r.confidence}, source: ${src})`);
+  }
 }
 
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
   if (command === 'persona') return runPersona(rest);
+  if (command === 'self') {
+    showSelfFacts(openDb(DB_PATH));
+    return;
+  }
 
   const arg = rest[0];
   if (command !== 'add' || !arg) {
