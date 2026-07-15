@@ -1,0 +1,11 @@
+[
+  { "facet": "academic", "key": "method", "value": "3D Gaussian Splatting (built a Gaussian splat of a banana from phone video)", "sourceUrl": "self", "confidence": 0.9, "tier": "A" },
+  { "facet": "academic", "key": "dataset", "value": "nuScenes (built an obstacle-detection evaluation pipeline on it)", "sourceUrl": "self", "confidence": 0.9, "tier": "A" },
+  { "facet": "academic", "key": "research_area", "value": "Autonomous vehicle perception and simulation", "sourceUrl": "self", "confidence": 0.9, "tier": "A" },
+  { "facet": "academic", "key": "research_area", "value": "Neural rendering and novel view synthesis", "sourceUrl": "self", "confidence": 0.85, "tier": "A" },
+  { "facet": "academic", "key": "research_area", "value": "Digital olfaction and olfactory field reconstruction", "sourceUrl": "self", "confidence": 0.85, "tier": "A" },
+  { "facet": "trajectory", "key": "institution", "value": "Arizona State University", "sourceUrl": "self", "confidence": 0.95, "tier": "A" },
+  { "facet": "trajectory", "key": "role", "value": "Transitioning into AV/simulation research from a software engineering background", "sourceUrl": "self", "confidence": 0.9, "tier": "A" },
+  { "facet": "interest", "key": "oss_project", "value": "Builds tooling and pipelines for 3D reconstruction", "sourceUrl": "self", "confidence": 0.7, "tier": "B" },
+  { "facet": "interest", "key": "community", "value": "Interested in collision meshes and simulation from Gaussian splats", "sourceUrl": "self", "confidence": 0.7, "tier": "B" }
+]
