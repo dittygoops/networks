@@ -49,17 +49,34 @@ describe('saveFacts / getFacts (D11 replace strategy)', () => {
     expect(inst?.sourceUrl).toBe('https://openalex.org/A1');
   });
 
-  test('re-saving replaces the person prior facts atomically (no stale rows)', () => {
+  test('re-saving accumulates: keeps old facts, adds new ones, dedupes exact repeats', () => {
     const db = openDb(':memory:');
     const pid = upsertPerson(db, { name: 'Bernhard Kerbl', openalexId: 'A1' });
-    saveFacts(db, pid, [fact({ value: 'Old area' }), fact({ value: 'Another old' })]);
-    saveFacts(db, pid, [fact({ value: 'Fresh area' })]);
-    const facts = getFacts(db, pid);
-    expect(facts).toHaveLength(1);
-    expect(facts[0]?.value).toBe('Fresh area');
+    saveFacts(db, pid, [fact({ value: 'Area A' }), fact({ value: 'Area B' })]);
+    saveFacts(db, pid, [fact({ value: 'Area B' }), fact({ value: 'Area C' })]); // B repeats, C is new
+    const values = getFacts(db, pid).map((f) => f.value).sort();
+    expect(values).toEqual(['Area A', 'Area B', 'Area C']); // union, no duplicate B
   });
 
-  test('replacing one person facts leaves another person facts intact', () => {
+  test('an exact-duplicate fact does not create a second row', () => {
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'X', openalexId: 'A1' });
+    saveFacts(db, pid, [fact()]);
+    saveFacts(db, pid, [fact()]);
+    expect(getFacts(db, pid)).toHaveLength(1);
+  });
+
+  test('re-sighting a fact refreshes its retrieved_at (D7 staleness signal)', () => {
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'X', openalexId: 'A1' });
+    saveFacts(db, pid, [fact()]);
+    db.prepare("UPDATE ontology_facts SET retrieved_at = '2000-01-01' WHERE person_id = ?").run(pid);
+    saveFacts(db, pid, [fact()]); // seen again
+    const row = db.prepare('SELECT retrieved_at FROM ontology_facts WHERE person_id = ?').get(pid) as { retrieved_at: string };
+    expect(row.retrieved_at).not.toBe('2000-01-01');
+  });
+
+  test('saving facts for one person leaves another person facts intact', () => {
     const db = openDb(':memory:');
     const a = upsertPerson(db, { name: 'Person A', openalexId: 'A1' });
     const b = upsertPerson(db, { name: 'Person B', openalexId: 'A2' });

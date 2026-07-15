@@ -69,17 +69,21 @@ export function getPerson(db: DB, id: number): PersonRow | undefined {
     | undefined;
 }
 
-// D11 replace strategy: a re-mine yields a complete fresh fact set, so swap the
-// person's facts atomically.
+// D11 accumulate strategy: facts persist across mines. A fact re-seen refreshes
+// its retrieved_at and metadata (D7 staleness signal); a new fact is inserted;
+// facts not in this batch are kept.
 export function saveFacts(db: DB, personId: number, facts: OntologyFact[]): void {
-  const del = db.prepare('DELETE FROM ontology_facts WHERE person_id = ?');
-  const ins = db.prepare(
+  const upsert = db.prepare(
     `INSERT INTO ontology_facts (person_id, facet, key, value, source_url, confidence, usability_tier)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(person_id, facet, key, value) DO UPDATE SET
+       source_url = excluded.source_url,
+       confidence = excluded.confidence,
+       usability_tier = excluded.usability_tier,
+       retrieved_at = datetime('now')`,
   );
   const tx = db.transaction((rows: OntologyFact[]) => {
-    del.run(personId);
-    for (const f of rows) ins.run(personId, f.facet, f.key, f.value, f.sourceUrl, f.confidence, f.tier);
+    for (const f of rows) upsert.run(personId, f.facet, f.key, f.value, f.sourceUrl, f.confidence, f.tier);
   });
   tx(facts);
 }

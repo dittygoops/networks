@@ -38,7 +38,7 @@ describe('persistPerson (D11)', () => {
     expect(getFacts(db, id)).toHaveLength(1);
   });
 
-  test('re-persisting the same author dedupes the person and replaces facts', () => {
+  test('re-persisting the same author dedupes the person and accumulates facts', () => {
     const db = openDb(':memory:');
     persistPerson(db, resolution, raw, { facts, profileSummary: 'v1' });
     const id2 = persistPerson(db, resolution, raw, {
@@ -47,6 +47,6 @@ describe('persistPerson (D11)', () => {
     });
     expect(db.prepare('SELECT COUNT(*) AS n FROM people').get()).toEqual({ n: 1 });
     expect(getPerson(db, id2)?.profile_summary).toBe('v2');
-    expect(getFacts(db, id2)).toHaveLength(2);
+    expect(getFacts(db, id2)).toHaveLength(2); // original (deduped) + the new institution fact
   });
 });
