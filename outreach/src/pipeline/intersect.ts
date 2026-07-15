@@ -17,6 +17,8 @@ export interface Intersection {
   personFactId: number;
   selfValue: string;
   personValue: string;
+  selfDetail?: string;
+  personDetail?: string;
   strength: number;
   tier: OntologyFact['tier'];
   rationale: string;
@@ -51,8 +53,11 @@ export async function computeIntersections(
   const person = factRows(db, personId).filter((f) => f.confidence >= MIN_CONFIDENCE);
   if (person.length === 0) return { ranked: [], noStrongHook: true };
 
+  // Deterministic entity matches (nuScenes == nuScenes) are reliable strong
+  // hooks; the LLM pass adds conceptual overlaps between different entities.
   const raw = await callModel(deps.llm, self, person);
-  const ranked = dedupe(mapIntersections(raw, self, person));
+  const merged = mergeByPair([...entityMatches(self, person), ...mapIntersections(raw, self, person)]);
+  const ranked = dedupe(merged);
 
   saveIntersections(db, personId, ranked.map((x) => ({
     selfFactId: x.selfFactId,
@@ -99,12 +104,58 @@ function mapIntersections(raw: RawIntersection[], self: StoredFact[], person: St
       personFactId: p.id,
       selfValue: s.value,
       personValue: p.value,
+      selfDetail: s.detail,
+      personDetail: p.detail,
       strength,
       tier: minTier(s.tier, p.tier),
       rationale: String(r.rationale ?? ''),
     });
   }
   return out.sort((a, b) => b.strength - a.strength).slice(0, MAX_INTERSECTIONS);
+}
+
+const normEntity = (s: string): string => s.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+
+// Deterministic entity overlap: same normalized value (0.95), or one clearly
+// contains the other (0.85), e.g. "gaussian splatting" in "3d gaussian splatting".
+// This is the reliable core of intersection scoring, independent of the LLM.
+function entityMatches(self: StoredFact[], person: StoredFact[]): Intersection[] {
+  const out: Intersection[] = [];
+  for (const s of self) {
+    const ns = normEntity(s.value);
+    if (ns.length < 3) continue;
+    for (const p of person) {
+      const np = normEntity(p.value);
+      if (np.length < 3) continue;
+      let strength = 0;
+      if (ns === np) strength = 0.95;
+      else if (Math.min(ns.length, np.length) >= 5 && (ns.includes(np) || np.includes(ns))) strength = 0.85;
+      if (!strength) continue;
+      out.push({
+        selfFactId: s.id,
+        personFactId: p.id,
+        selfValue: s.value,
+        personValue: p.value,
+        selfDetail: s.detail,
+        personDetail: p.detail,
+        strength,
+        tier: minTier(s.tier, p.tier),
+        rationale: `both: ${p.value}`,
+      });
+    }
+  }
+  return out;
+}
+
+// Keep the strongest hook per (selfFactId, personFactId) pair across sources.
+function mergeByPair(hooks: Intersection[]): Intersection[] {
+  const best = new Map<string, Intersection>();
+  for (const h of hooks) {
+    const k = `${h.selfFactId}|${h.personFactId}`;
+    const cur = best.get(k);
+    if (!cur || h.strength > cur.strength) best.set(k, h);
+  }
+  return [...best.values()].sort((a, b) => b.strength - a.strength).slice(0, MAX_INTERSECTIONS);
 }
 
 // Cleans up near-duplicate hooks from a strength-descending list (D6): collapse exact

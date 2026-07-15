@@ -11,14 +11,16 @@ const fact = (p: Partial<OntologyFact>): OntologyFact => ({
 // A fake LLM that returns a fixed intersections JSON, ignoring the prompt.
 const fakeLLM = (json: string): LLMClient => ({ async complete() { return json; } });
 
+// Distinct, non-overlapping entities, so these seeds exercise ONLY the LLM
+// mapping/dedupe logic; the deterministic entity match is tested separately.
 function seed(db: ReturnType<typeof openDb>) {
   saveSelfFacts(db, [
-    fact({ key: 'method', value: '3D Gaussian Splatting' }), // s0
-    fact({ key: 'research_area', value: 'nuScenes evaluation', tier: 'B' }), // s1
+    fact({ key: 'method', value: 'Alpha' }), // s0
+    fact({ key: 'research_area', value: 'Beta', tier: 'B' }), // s1
   ]);
   const pid = upsertPerson(db, { name: 'Bernhard Kerbl', openalexId: 'A1' });
   saveFacts(db, pid, [
-    fact({ key: 'method', value: '3D Gaussian Splatting' }), // p0
+    fact({ key: 'method', value: 'Gamma' }), // p0
     fact({ key: 'interest', facet: 'interest', value: 'hiking', tier: 'C', confidence: 0.6 }), // p1
   ]);
   return pid;
@@ -45,6 +47,28 @@ describe('computeIntersections (D6)', () => {
     expect(noStrongHook).toBe(false);
     // persisted
     expect(db.prepare('SELECT COUNT(*) AS n FROM intersections WHERE person_id = ?').get(pid)).toEqual({ n: 1 });
+  });
+
+  test('exact entity match produces a strong hook even when the LLM returns nothing', async () => {
+    const db = openDb(':memory:');
+    saveSelfFacts(db, [fact({ key: 'method', value: '3D Gaussian Splatting' })]);
+    const pid = upsertPerson(db, { name: 'Bernhard Kerbl', openalexId: 'A1' });
+    saveFacts(db, pid, [fact({ key: 'method', value: '3D Gaussian Splatting' })]);
+    const { ranked, noStrongHook } = await computeIntersections(db, { llm: fakeLLM('[]') }, pid);
+    const exact = ranked.find((x) => x.personValue === '3D Gaussian Splatting');
+    expect(exact?.strength).toBeGreaterThanOrEqual(0.9);
+    expect(noStrongHook).toBe(false);
+  });
+
+  test('carries detail through so the draft can cite specifics', async () => {
+    const db = openDb(':memory:');
+    saveSelfFacts(db, [fact({ key: 'dataset', value: 'nuScenes', detail: 'measured recall' })]);
+    const pid = upsertPerson(db, { name: 'P', openalexId: 'A3' });
+    saveFacts(db, pid, [fact({ key: 'dataset', value: 'nuScenes', detail: 'trained a detector on it' })]);
+    const { ranked } = await computeIntersections(db, { llm: fakeLLM('[]') }, pid);
+    const hit = ranked.find((x) => x.personValue === 'nuScenes');
+    expect(hit?.selfDetail).toBe('measured recall');
+    expect(hit?.personDetail).toBe('trained a detector on it');
   });
 
   test('noStrongHook is true when nothing scores >= 0.5', async () => {
@@ -76,17 +100,19 @@ describe('computeIntersections (D6)', () => {
 
 // Seed one self fact against several person facts so a single self-fact can spawn
 // many near-duplicate hooks (the noise D6 dedupe removes).
+// Distinct entities (no deterministic matches) so these tests exercise only the
+// LLM-driven dedupe/cap logic.
 function seedFanout(db: ReturnType<typeof openDb>) {
   saveSelfFacts(db, [
-    fact({ key: 'research_area', value: 'neural rendering' }), // s0
-    fact({ key: 'method', value: '3D Gaussian Splatting' }), // s1
+    fact({ key: 'research_area', value: 'SelfAreaOne' }), // s0
+    fact({ key: 'method', value: 'SelfMethodTwo' }), // s1
   ]);
   const pid = upsertPerson(db, { name: 'Bernhard Kerbl', openalexId: 'A2' });
   saveFacts(db, pid, [
-    fact({ key: 'research_area', value: 'neural rendering' }), // p0
-    fact({ key: 'research_area', value: 'novel view synthesis' }), // p1
-    fact({ key: 'research_area', value: 'radiance fields' }), // p2
-    fact({ key: 'method', value: '3D Gaussian Splatting' }), // p3
+    fact({ key: 'research_area', value: 'PersonAlpha' }), // p0
+    fact({ key: 'research_area', value: 'PersonBravo' }), // p1
+    fact({ key: 'research_area', value: 'PersonCharlie' }), // p2
+    fact({ key: 'method', value: 'PersonDelta' }), // p3
   ]);
   return pid;
 }

@@ -123,7 +123,11 @@ Every `ontology_facts` row: `{ facet, key, value, source_url, confidence 0-1, us
 - `key` is drawn from the D-vocabulary constant (below the schema). Facts below confidence 0.5 are excluded from intersections (D6) and from hooks.
 
 ### D6. Intersection generation (bounded LLM, not pairwise)
-Do **not** score all self×person pairs (O(n·m) calls). A single cheap-tier LLM call receives the full self-fact list and the full person-fact list (both pre-filtered to confidence ≥ 0.5), each fact prefixed with a **stable index** (`s0, s1, ...` for self, `p0, p1, ...` for person, since `key` is not unique), and returns candidate intersections as JSON `{ self: "s2", person: "p5", strength, rationale }`. A second chunked call runs only if either list > 40 facts. Code maps indices back to fact ids, sets `tier = min(self_fact.tier, person_fact.tier)`, drops strength < 0.3 or any index out of range, keeps the top 20 by strength. Intersections are derived data, so the store **replaces** a person's intersections on each recompute (unlike facts, which accumulate).
+Facts are entity-centric (`value` is a canonical entity like "nuScenes", with the sentence in `detail`), so intersections combine two passes:
+1. **Deterministic entity match** (reliable core): normalize each `value` (lowercase, strip punctuation) and match self×person facts on equality (strength 0.95) or clear containment where the shorter side is ≥ 5 chars (0.85), e.g. "gaussian splatting" inside "3d gaussian splatting". These fire independent of the LLM, so "nuScenes == nuScenes" is always a strong hook.
+2. **LLM conceptual pass** (for overlaps between *different* entities in the same field): one cheap-tier call receives both fact lists, each prefixed with a **stable index** (`s0.., p0..`, since `key` is not unique), returning `{ self: "s2", person: "p5", strength, rationale }`. A second chunked call runs only if either list > 40 facts.
+
+Both sources are merged, keeping the strongest hook per (self, person) pair; code sets `tier = min(self_fact.tier, person_fact.tier)`, drops strength < 0.3 or out-of-range indices, dedupes (exact-rationale, ≤ 2 per self-fact), keeps the top 20. Each hook carries the `detail` of both sides so the draft can cite specifics. Intersections are derived data, so the store **replaces** a person's intersections on each recompute (unlike facts, which accumulate).
 
 Strength rubric (in the prompt):
 - 0.9 to 1.0: same specific research problem, method, or artifact (e.g. both worked with nuScenes evaluation, both built 3DGS pipelines).
