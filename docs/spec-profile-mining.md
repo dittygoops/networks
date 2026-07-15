@@ -118,7 +118,7 @@ Common names are the core risk: a plain `"Jonathan Barron"` search returns a law
 
 ### D6a. Fact schema, confidence, and extraction
 Every `ontology_facts` row: `{ facet, key, value, source_url, confidence 0-1, usability_tier }`.
-- **OpenAlex facts (no LLM, deterministic confidence)**: current affiliation 0.9, prior affiliations 0.8, research concepts 0.85, venues 0.8, co-authors→advisor/lab inference 0.7. Facet `academic` or `trajectory`; tier A (source class `openalex`).
+- **OpenAlex facts (no LLM, deterministic confidence)**: current affiliation 0.9, prior affiliations 0.8, research concepts 0.85 (deduped by `canonicalConcept`, which strips parenthetical qualifiers and case so near-synonyms collapse), venues 0.8, co-authors → `collaborator` 0.7. Facet `academic` or `trajectory`; tier A (source class `openalex`).
 - **Tavily free-text facts (cheap LLM)**: the extractor returns a JSON array of `{ facet, key, value, confidence, proposedTier }`; code clamps `proposedTier` to the page's D3 source-class cap. Confidence rubric in the prompt: 0.8 explicit first-person statement on the person's own page; 0.6 stated on a corroborated third-party page; < 0.5 inferred/uncertain (stored but excluded from intersections). Temperature 0, JSON mode; on parse failure retry once, then skip that page (never crash the run).
 - `key` is drawn from the D-vocabulary constant (below the schema). Facts below confidence 0.5 are excluded from intersections (D6) and from hooks.
 
@@ -178,7 +178,7 @@ CREATE TABLE intersections (
 );
 ```
 
-`ontology_facts.key` is freeform but drawn from a recommended vocabulary per facet (kept as a constant in code): academic → `research_area`, `method`, `dataset`, `key_paper`, `venue`, `advisor`, `lab`; trajectory → `institution`, `company`, `role`, `location`; interest → `hobby`, `side_project`, `oss_project`, `community`, `writing`.
+`ontology_facts.key` is freeform but drawn from a recommended vocabulary per facet, kept as the `FACT_VOCABULARY` constant in `research.ts` and enforced via `normalizeKey(facet, key)`: academic → `research_area`, `method`, `dataset`, `key_paper`, `venue`, `advisor`, `lab`, `collaborator`, `project`; trajectory → `institution`, `company`, `role`, `location`; interest → `hobby`, `side_project`, `oss_project`, `community`, `writing`. `collaborator` is what the OpenAlex co-author facts use, and `project` is the canonical academic key for a named piece of work (the LLM otherwise emits it off-list). `normalizeKey` lowercases and snake_cases the key and maps common variants (`methods` → `method`, `projects` → `project`, `research area` → `research_area`) to the canonical key; unknown keys pass through snake-cased rather than being dropped, so the vocabulary guides without silently discarding facts.
 
 ### D11. Persistence
 - **Stack**: `better-sqlite3`, one file `outreach/data/outreach.db` (gitignored). `db/schema.sql` holds the tables; `db/db.ts` opens the connection and runs the schema idempotently (`CREATE TABLE IF NOT EXISTS`) on first open. Foreign keys on; WAL mode.
