@@ -10,12 +10,13 @@ export interface OpenAlexAuthorRaw {
   id: string;
   display_name: string;
   x_concepts?: { display_name: string }[];
-  affiliations?: { institution: { display_name: string }; years: number[] }[];
+  affiliations?: { institution: { display_name: string; id?: string }; years: number[] }[];
 }
 
 export interface OpenAlexWorkRaw {
   title?: string | null;
   ids?: { doi?: string; [k: string]: string | undefined };
+  primary_location?: { source?: { display_name?: string } | null } | null;
   authorships: { author: { id: string; display_name: string } }[];
 }
 
@@ -33,10 +34,13 @@ export function currentAffiliation(author: OpenAlexAuthorRaw): string | null {
 export function normalizeAuthor(author: OpenAlexAuthorRaw, works: OpenAlexWorkRaw[]): OpenAlexCandidate {
   const id = bareId(author.id);
   const coauthors = new Set<string>();
+  const venues = new Set<string>();
   const workTitles: string[] = [];
   const externalIds: string[] = [];
   for (const work of works) {
     if (work.title) workTitles.push(work.title);
+    const venue = work.primary_location?.source?.display_name;
+    if (venue) venues.add(venue);
     for (const key of ['doi', 'arxiv', 'pmid']) {
       const v = work.ids?.[key];
       if (v) externalIds.push(v);
@@ -53,7 +57,29 @@ export function normalizeAuthor(author: OpenAlexAuthorRaw, works: OpenAlexWorkRa
     coauthors: [...coauthors],
     workTitles,
     externalIds,
+    venues: [...venues],
   };
+}
+
+// D5b domain-gate anchors: fetch homepage URLs for the author's institutions,
+// so a page's domain can be matched against where the person actually works.
+export async function fetchIdentityAnchors(
+  author: OpenAlexAuthorRaw,
+  opts: { fetchFn?: FetchFn; maxInstitutions?: number } = {},
+): Promise<string[]> {
+  const doFetch = opts.fetchFn ?? fetch;
+  const headers = { 'User-Agent': UA };
+  const ids: string[] = [];
+  for (const aff of author.affiliations ?? []) {
+    const id = aff.institution.id ? bareId(aff.institution.id) : null;
+    if (id && !ids.includes(id)) ids.push(id);
+  }
+  const anchors: string[] = [];
+  for (const id of ids.slice(0, opts.maxInstitutions ?? 4)) {
+    const inst = (await (await doFetch(`${BASE}/institutions/${id}`, { headers })).json()) as { homepage_url?: string };
+    if (inst.homepage_url) anchors.push(inst.homepage_url);
+  }
+  return anchors;
 }
 
 export type FetchFn = typeof fetch;

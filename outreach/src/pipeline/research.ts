@@ -186,14 +186,6 @@ const SOCIAL_HOSTS = [
 const D4_MAX_FETCH = 3; // budget: <= 3 fetches
 const D4_MAX_EXTRACT_PAGES = 3; // budget: <= 3 extraction LLM calls (+1 summary => <= 4)
 
-const registrableDomain = (url: string): string | null => {
-  try {
-    return parse(url).domain ?? null;
-  } catch {
-    return null;
-  }
-};
-
 const hostname = (url: string): string => {
   try {
     return (parse(url).hostname ?? '').replace(/^www\./, '');
@@ -265,16 +257,29 @@ async function extractFactsFromPage(llm: LLMClient, personName: string, page: We
 // matches a known identity anchor (the resolved author's homepage / affiliation
 // domains from OpenAlex). This is what stops a same-named homonym's page.
 function buildDomainGate(author: OpenAlexCandidate): (page: WebPage) => boolean {
+  // Match on the institution LABEL (registrable domain minus public suffix), not
+  // the full registrable domain: an institution's marketing domain (tuwien.at)
+  // and its academic domain (tuwien.ac.at) share the label "tuwien" but differ
+  // as registrable domains. Homonyms at other institutions have a different
+  // label and are still rejected.
   const allowed = new Set<string>();
   for (const url of author.homepageUrls ?? []) {
-    const d = registrableDomain(url);
-    if (d) allowed.add(d);
+    const label = domainLabel(url);
+    if (label) allowed.add(label);
   }
   return (page: WebPage) => {
-    const d = registrableDomain(page.url);
-    return d != null && allowed.has(d);
+    const label = domainLabel(page.url);
+    return label != null && allowed.has(label);
   };
 }
+
+const domainLabel = (url: string): string | null => {
+  try {
+    return parse(url).domainWithoutSuffix || null;
+  } catch {
+    return null;
+  }
+};
 
 // D4: mine personal-facet facts for a resolved author. Combines the deterministic
 // OpenAlex facts with LLM-extracted, domain-gated, tier-clamped personal facts,

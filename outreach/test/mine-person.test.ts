@@ -119,6 +119,30 @@ describe('minePerson (D4/D5b/D6a)', () => {
     expect(facts.some((f) => f.sourceUrl === homonym)).toBe(false);
   });
 
+  test('allows a page on the institution academic domain when the anchor is its marketing domain', async () => {
+    // Live case: TU Wien's OpenAlex homepage is tuwien.at, but Kerbl's real
+    // staff page is on cg.tuwien.ac.at. Same institution, different registrable
+    // domain; the gate must match on the institution label, not the full domain.
+    const anchoredByMarketingDomain: AuthorResolution = {
+      author: { ...candidate, homepageUrls: ['https://www.tuwien.at'] },
+      signals: ['coauthor'],
+    };
+    const staffPage = 'https://www.cg.tuwien.ac.at/staff/BernhardKerbl';
+    const { client, calls } = makeLLM(() =>
+      JSON.stringify([{ facet: 'interest', key: 'community', value: 'Vienna graphics group', confidence: 0.7, proposedTier: 'B' }]),
+    );
+    const deps = makeDeps({
+      llm: client,
+      searchResults: [{ url: staffPage, title: 'Bernhard Kerbl', content: '' }],
+      fetched: { [staffPage]: 'Bernhard Kerbl, TU Wien.' },
+    });
+
+    const { facts } = await minePerson(deps, anchoredByMarketingDomain, raw, ctx);
+
+    expect(calls.extract).toHaveLength(1); // not gated out
+    expect(facts.some((f) => f.sourceUrl === staffPage)).toBe(true);
+  });
+
   test('retries once on JSON parse failure then skips the page without crashing', async () => {
     const talk = 'https://www.cg.tuwien.ac.at/talks/kerbl';
     const { client, calls } = makeLLM(() => 'not json at all {');

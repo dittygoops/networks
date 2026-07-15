@@ -2,7 +2,7 @@
 // Requires OPENROUTER_API_KEY (and optionally MODEL_CHEAP) and a Tavily key
 // (TAVILY_API_KEY) in the environment. Run by the repo owner:
 //   OPENROUTER_API_KEY=... TAVILY_API_KEY=... npx tsx scripts/smoke-mine.ts "Bernhard Kerbl"
-import { fetchAuthorCandidates } from '../src/openalex/client.js';
+import { fetchAuthorCandidates, fetchIdentityAnchors } from '../src/openalex/client.js';
 import { minePerson, resolveAuthor, type MineDeps } from '../src/pipeline/research.js';
 import { createOpenRouterClient } from '../src/llm/client.js';
 import { createTavilyClient } from '../src/search/tavily.js';
@@ -28,6 +28,8 @@ if (!resolution) {
 }
 
 const raw = fetched.find((f) => f.candidate.id === resolution.author.id)!.raw;
+// Populate domain-gate anchors from the resolved author's institutions.
+resolution.author.homepageUrls = await fetchIdentityAnchors(raw);
 const tavily = createTavilyClient(tavilyKey);
 const deps: MineDeps = { search: tavily, fetcher: tavily, llm: createOpenRouterClient() };
 

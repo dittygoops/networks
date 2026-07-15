@@ -1,5 +1,10 @@
 import { describe, expect, test } from 'vitest';
-import { normalizeAuthor, currentAffiliation, type OpenAlexAuthorRaw } from '../src/openalex/client.js';
+import {
+  normalizeAuthor,
+  currentAffiliation,
+  fetchIdentityAnchors,
+  type OpenAlexAuthorRaw,
+} from '../src/openalex/client.js';
 
 // The client normalizes raw OpenAlex JSON into OpenAlexCandidate and derives
 // the CURRENT affiliation from time-stamped affiliations (most recent year).
@@ -18,6 +23,7 @@ const rawWorks = [
   {
     title: 'Fast Explicit 3D Reconstructions',
     ids: { doi: 'https://doi.org/10.1/x' },
+    primary_location: { source: { display_name: 'ACM Transactions on Graphics' } },
     authorships: [
       { author: { id: 'A5031044431', display_name: 'Bernhard Kerbl' } },
       { author: { id: 'A_franke', display_name: 'Linus Franke' } },
@@ -36,6 +42,30 @@ describe('normalizeAuthor', () => {
     expect(c.coauthors).not.toContain('Bernhard Kerbl'); // the author themselves is excluded
     expect(c.workTitles).toContain('Fast Explicit 3D Reconstructions');
     expect(c.externalIds).toContain('https://doi.org/10.1/x');
+    expect(c.venues).toContain('ACM Transactions on Graphics');
+  });
+});
+
+describe('fetchIdentityAnchors', () => {
+  test('returns institution homepage URLs (domain-gate anchors)', async () => {
+    const authorWithInst: OpenAlexAuthorRaw = {
+      ...rawAuthor,
+      affiliations: [
+        { institution: { display_name: 'TU Wien', id: 'https://openalex.org/I_tuwien' }, years: [2025] },
+        { institution: { display_name: 'INRIA', id: 'https://openalex.org/I_inria' }, years: [2023] },
+      ],
+    };
+    const byId: Record<string, string> = {
+      I_tuwien: 'https://www.tuwien.at',
+      I_inria: 'https://inria.fr',
+    };
+    const fakeFetch = (async (url: URL | string) => {
+      const id = String(url).split('/').pop()!;
+      return { json: async () => ({ homepage_url: byId[id] }) } as Response;
+    }) as typeof fetch;
+
+    const anchors = await fetchIdentityAnchors(authorWithInst, { fetchFn: fakeFetch });
+    expect(anchors).toEqual(expect.arrayContaining(['https://www.tuwien.at', 'https://inria.fr']));
   });
 });
 
