@@ -19,6 +19,7 @@ export interface Intersection {
   personValue: string;
   selfDetail?: string;
   personDetail?: string;
+  selfStance?: OntologyFact['stance']; // honesty: did Aditya do it, or is he exploring it?
   strength: number;
   tier: OntologyFact['tier'];
   rationale: string;
@@ -106,6 +107,7 @@ function mapIntersections(raw: RawIntersection[], self: StoredFact[], person: St
       personValue: p.value,
       selfDetail: s.detail,
       personDetail: p.detail,
+      selfStance: s.stance,
       strength,
       tier: minTier(s.tier, p.tier),
       rationale: String(r.rationale ?? ''),
@@ -138,6 +140,7 @@ function entityMatches(self: StoredFact[], person: StoredFact[]): Intersection[]
         personValue: p.value,
         selfDetail: s.detail,
         personDetail: p.detail,
+        selfStance: s.stance,
         strength,
         tier: minTier(s.tier, p.tier),
         rationale: `both: ${p.value}`,

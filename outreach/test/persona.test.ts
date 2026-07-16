@@ -61,6 +61,20 @@ describe('factsFromDocument (P2)', () => {
     expect(facts).toEqual([]);
   });
 
+  test('marks each fact done or exploring, defaulting to exploring (honesty)', async () => {
+    const facts = await factsFromDocument(
+      fakeLLM(JSON.stringify([
+        { facet: 'academic', key: 'method', value: 'X', stance: 'done' },
+        { facet: 'academic', key: 'method', value: 'Y', stance: 'exploring' },
+        { facet: 'academic', key: 'method', value: 'Z' },
+      ])),
+      'doc', 'doc',
+    );
+    expect(facts.find((f) => f.value === 'X')?.stance).toBe('done');
+    expect(facts.find((f) => f.value === 'Y')?.stance).toBe('exploring');
+    expect(facts.find((f) => f.value === 'Z')?.stance).toBe('exploring'); // unmarked -> exploring
+  });
+
   test('captures the entity value and the detail context separately', async () => {
     const facts = await factsFromDocument(
       fakeLLM(JSON.stringify([{ facet: 'academic', key: 'dataset', value: 'nuScenes', detail: 'measured recall against ground truth', proposedTier: 'A' }])),

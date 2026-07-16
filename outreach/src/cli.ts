@@ -124,9 +124,9 @@ async function main(): Promise<void> {
     const intent = self.find((f) => f.facet === 'interest' && f.key === 'writing')?.value
       ?? 'connect and get direction on future olfaction / smell research';
     const senderFacts = self
-      .filter((f) => f.tier === 'A' && f.facet === 'academic')
-      .slice(0, 5)
-      .map((f) => (f.detail ? `${f.value}: ${f.detail}` : f.value));
+      .filter((f) => f.facet === 'academic')
+      .slice(0, 8)
+      .map((f) => ({ text: f.detail ? `${f.value}: ${f.detail}` : f.value, stance: f.stance }));
     const affiliation = getPerson(db, r.personId)?.affiliation ?? undefined;
 
     // Prefer a frontier model for drafts (DR1), but fall back to the working

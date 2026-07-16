@@ -74,17 +74,18 @@ export function getPerson(db: DB, id: number): PersonRow | undefined {
 // facts not in this batch are kept.
 export function saveFacts(db: DB, personId: number, facts: OntologyFact[]): void {
   const upsert = db.prepare(
-    `INSERT INTO ontology_facts (person_id, facet, key, value, detail, source_url, confidence, usability_tier)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO ontology_facts (person_id, facet, key, value, detail, source_url, stance, confidence, usability_tier)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(person_id, facet, key, value) DO UPDATE SET
        detail = excluded.detail,
+       stance = excluded.stance,
        source_url = excluded.source_url,
        confidence = excluded.confidence,
        usability_tier = excluded.usability_tier,
        retrieved_at = datetime('now')`,
   );
   const tx = db.transaction((rows: OntologyFact[]) => {
-    for (const f of rows) upsert.run(personId, f.facet, f.key, f.value, f.detail ?? null, f.sourceUrl, f.confidence, f.tier);
+    for (const f of rows) upsert.run(personId, f.facet, f.key, f.value, f.detail ?? null, f.sourceUrl, f.stance ?? null, f.confidence, f.tier);
   });
   tx(facts);
 }
@@ -95,6 +96,7 @@ interface FactRow {
   key: string;
   value: string;
   detail: string | null;
+  stance: string | null;
   source_url: string;
   confidence: number;
   usability_tier: OntologyFact['tier'];
@@ -105,6 +107,7 @@ const rowToFact = (r: FactRow): OntologyFact => ({
   key: r.key,
   value: r.value,
   detail: r.detail ?? undefined,
+  stance: (r.stance as OntologyFact['stance']) ?? undefined,
   sourceUrl: r.source_url,
   confidence: r.confidence,
   tier: r.usability_tier,
@@ -121,7 +124,7 @@ export type StoredFact = OntologyFact & { id: number };
 export function factRows(db: DB, personId: number | null): StoredFact[] {
   const where = personId === null ? 'person_id IS NULL' : 'person_id = ?';
   const stmt = db.prepare(
-    `SELECT id, facet, key, value, detail, source_url, confidence, usability_tier FROM ontology_facts WHERE ${where}`,
+    `SELECT id, facet, key, value, detail, stance, source_url, confidence, usability_tier FROM ontology_facts WHERE ${where}`,
   );
   const rows = (personId === null ? stmt.all() : stmt.all(personId)) as FactRow[];
   return rows.map((r) => ({ id: r.id, ...rowToFact(r) }));
@@ -131,11 +134,11 @@ export function factRows(db: DB, personId: number | null): StoredFact[] {
 // exposed here for the D9 dev seed and tests until that subsystem exists.
 export function saveSelfFacts(db: DB, facts: OntologyFact[]): void {
   const ins = db.prepare(
-    `INSERT INTO ontology_facts (person_id, facet, key, value, detail, source_url, confidence, usability_tier)
-     VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO ontology_facts (person_id, facet, key, value, detail, source_url, stance, confidence, usability_tier)
+     VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const tx = db.transaction((rows: OntologyFact[]) => {
-    for (const f of rows) ins.run(f.facet, f.key, f.value, f.detail ?? null, f.sourceUrl, f.confidence, f.tier);
+    for (const f of rows) ins.run(f.facet, f.key, f.value, f.detail ?? null, f.sourceUrl, f.stance ?? null, f.confidence, f.tier);
   });
   tx(facts);
 }

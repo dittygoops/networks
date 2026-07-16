@@ -25,6 +25,7 @@ interface RawFact {
   key?: string;
   value?: string;
   detail?: string;
+  stance?: string;
   confidence?: number;
   proposedTier?: string;
 }
@@ -60,6 +61,9 @@ export async function factsFromDocument(llm: LLMClient, docText: string, sourceL
       key: normalizeKey(rf.facet, String(rf.key)),
       value: String(rf.value).trim(),
       detail: rf.detail ? String(rf.detail).trim() : undefined,
+      // Default to 'exploring' when unmarked: safer to understate than to claim
+      // completed work Aditya has not done.
+      stance: rf.stance === 'done' ? 'done' : 'exploring',
       sourceUrl: `${SELF_SOURCE}:${sourceLabel}`,
       confidence,
       tier: SELF_FACET_TIER[rf.facet],
@@ -92,7 +96,7 @@ export function interviewFacts(answers: Record<string, string>): OntologyFact[] 
   for (const q of INTERVIEW_QUESTIONS) {
     const value = (answers[q.id] ?? '').trim();
     if (!value) continue;
-    facts.push({ facet: q.facet, key: q.key, value, sourceUrl: `${SELF_SOURCE}:interview`, confidence: INTERVIEW_CONFIDENCE, tier: q.tier });
+    facts.push({ facet: q.facet, key: q.key, value, stance: 'done', sourceUrl: `${SELF_SOURCE}:interview`, confidence: INTERVIEW_CONFIDENCE, tier: q.tier });
   }
   return facts;
 }
