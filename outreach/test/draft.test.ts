@@ -5,10 +5,10 @@ import type { LLMClient } from '../src/llm/client.js';
 
 const input: DraftInput = {
   recipient: { name: 'Bernhard Kerbl', affiliation: 'TU Wien', paperTitle: '3D Gaussian Splatting' },
-  hooks: [{ selfValue: '3D Gaussian Splatting', personValue: '3D Gaussian Splatting', selfDetail: 'built a banana splat', personDetail: 'invented 3DGS', tier: 'A' }],
+  hooks: [{ selfValue: '3D Gaussian Splatting', personValue: '3D Gaussian Splatting', selfDetail: 'built a banana splat', personDetail: 'invented 3DGS', selfStance: 'done', tier: 'A' }],
   intent: 'get direction on future olfaction work',
   senderName: 'Aditya Gupta',
-  senderFacts: ['built a Gaussian splat of a banana'],
+  senderFacts: [{ text: 'built a Gaussian splat of a banana', stance: 'done' }],
 };
 
 const llm = (reply: string): LLMClient => ({ async complete(system) { return system === DRAFT_SYSTEM ? reply : ''; } });

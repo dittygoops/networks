@@ -35,6 +35,11 @@ export interface OntologyFact {
   key: string;
   value: string;
   detail?: string;
+  // Honesty marker: 'done' = actually built/ran/shipped; 'exploring' = a research
+  // direction, gap, or proposal being considered but NOT yet done. The draft must
+  // never claim an 'exploring' fact as completed work. Undefined = treat as done
+  // (recipient/OpenAlex facts are published work).
+  stance?: 'done' | 'exploring';
   sourceUrl: string;
   confidence: number;
   tier: 'A' | 'B' | 'C';

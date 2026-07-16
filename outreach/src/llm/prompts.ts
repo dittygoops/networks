@@ -68,12 +68,20 @@ export const SELF_EXTRACT_SYSTEM = [
   'You extract facts ABOUT ADITYA (the author) from one of his own documents.',
   'Return ONLY a JSON array (no prose, no code fences). Each element:',
   '{ "facet": "academic"|"trajectory"|"interest", "key": string, "value": string,',
-  '  "detail": string, "confidence": number, "proposedTier": "A"|"B"|"C" }.',
+  '  "detail": string, "stance": "done"|"exploring", "confidence": number, "proposedTier": "A"|"B"|"C" }.',
   '',
   'Extract only facts about ADITYA himself (what he built, studies, or is; his',
   'background; his interests). These documents are often topic notes. Do NOT extract',
   'encyclopedia facts about the topic (e.g. "NeRF represents scenes as radiance',
   'fields"). If the document says nothing about him, return [].',
+  '',
+  'STANCE is a strict honesty marker, judge it carefully:',
+  '- "done": he ACTUALLY built, implemented, ran, shipped, or measured it (completed work).',
+  '- "exploring": a research direction, gap, idea, or proposal he is considering but has',
+  '  NOT built yet. Documents titled "Research Gap", "Research Proposal", "Research Path",',
+  '  or that use words like "propose", "would", "planned", "idea", "gap" are exploring.',
+  'When unsure, use "exploring". Never mark something "done" that he only proposed or',
+  'thought about. This decides whether the email can claim he did the work.',
   '',
   ENTITY_RULES,
   '',
@@ -87,10 +95,10 @@ export function buildSelfExtractUser(sourceLabel: string, text: string): string 
 
 export interface DraftPromptInput {
   recipient: { name: string; affiliation?: string | null; profileSummary?: string; paperTitle?: string };
-  hooks: { selfValue: string; personValue: string; selfDetail?: string; personDetail?: string; tier: 'A' | 'B' | 'C' }[];
+  hooks: { selfValue: string; personValue: string; selfDetail?: string; personDetail?: string; selfStance?: 'done' | 'exploring'; tier: 'A' | 'B' | 'C' }[];
   intent: string;
   senderName: string;
-  senderFacts?: string[];
+  senderFacts?: { text: string; stance?: 'done' | 'exploring' }[];
 }
 
 // DR3: hard style rules for the outreach draft. Casual but polite, hook-first,
@@ -113,9 +121,16 @@ export const DRAFT_SYSTEM = [
   '  your brain", "I have been following your work", empty superlatives, flattery.',
   '- No em dashes.',
   '',
-  'TRUTH: use at least one specific recipient fact AND one specific Aditya fact from the input.',
-  'Never invent shared history, prior contact, meetings, or papers not given. If facts are thin,',
-  'say less rather than inventing.',
+  'TRUTH (critical): use at least one specific recipient fact AND one specific Aditya fact.',
+  'Never invent shared history, prior contact, meetings, or papers not given.',
+  'HONESTY BY STANCE, this is the most important rule:',
+  '- Facts marked [done] are things Aditya actually built or ran. You MAY say he built/did them.',
+  '- Facts marked [exploring] are directions/gaps he is only thinking about. You must NOT claim',
+  '  he built, worked on, or did them. Phrase them honestly: "I have been digging into X",',
+  '  "I have been thinking about the gap in Y", "I am hoping to explore Z". This is usually the',
+  '  RIGHT framing for the ask, since he is writing to get direction on exactly that.',
+  'Lead the credibility line with a [done] fact when one is relevant; frame [exploring] facts as',
+  'the thing he wants guidance on. If you would have to overstate to make it impressive, understate.',
   '',
   'Subject: short, specific, lowercase-casual, no "Re:".',
 ].join('\n');
@@ -125,18 +140,19 @@ export function buildDraftUser(input: DraftPromptInput): string {
   const hooks = input.hooks.map((h, i) =>
     `  ${i + 1}. shared: ${h.selfValue === h.personValue ? h.selfValue : `${h.selfValue} / ${h.personValue}`}` +
     (h.personDetail ? `\n     them: ${h.personDetail}` : '') +
-    (h.selfDetail ? `\n     me: ${h.selfDetail}` : ''),
+    (h.selfDetail ? `\n     me [${h.selfStance ?? 'exploring'}]: ${h.selfDetail}` : `\n     me [${h.selfStance ?? 'exploring'}]`),
   );
+  const facts = (input.senderFacts ?? []).map((f) => `  - [${f.stance ?? 'done'}] ${f.text}`);
   return [
     `Recipient: ${r.name}${r.affiliation ? ` (${r.affiliation})` : ''}`,
     r.paperTitle ? `Their paper: ${r.paperTitle}` : '',
     r.profileSummary ? `About them: ${r.profileSummary}` : '',
     '',
-    'Top shared hooks (lead with #1):',
+    'Top shared hooks (lead with #1). Each "me" fact is tagged [done] or [exploring]:',
     ...hooks,
     '',
     `Aditya's intent: ${input.intent}`,
-    input.senderFacts?.length ? `Aditya's relevant work:\n${input.senderFacts.map((f) => `  - ${f}`).join('\n')}` : '',
+    facts.length ? `Aditya's relevant facts ([done] = did it, [exploring] = only considering):\n${facts.join('\n')}` : '',
   ].filter(Boolean).join('\n');
 }
 

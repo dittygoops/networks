@@ -56,7 +56,7 @@ export async function generateDraft(llm: LLMClient, input: DraftInput): Promise<
     shares(bs, input.recipient.paperTitle ?? '');
   const senderGrounded =
     input.hooks.some((h) => shares(bs, h.selfValue) || shares(bs, h.selfDetail ?? '')) ||
-    (input.senderFacts ?? []).some((f) => shares(bs, f));
+    (input.senderFacts ?? []).some((f) => shares(bs, f.text));
   const grounded = recipientGrounded && senderGrounded;
   if (!grounded) notes.push('draft may be ungrounded (missing a specific recipient or sender reference)');
 
