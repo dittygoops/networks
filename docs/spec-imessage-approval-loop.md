@@ -74,11 +74,10 @@ free tier.
   this system has one conversation (Aditya's), so the dedicated-number tiers buy nothing.
 - **Same maker as `imessage-kit`** (photon-hq), the library the master spec already
   trusted for the native path.
-- **Honest unknown, gated by the Step 1 spike**: whether messages sent while the stream is
-  disconnected (Mac asleep) are queued server-side and replayed on reconnect. LoopMessage's
-  3-hour webhook retry schedule [5] covered this; Photon's equivalent is undocumented. The
-  spike tests it explicitly (text while disconnected, reconnect, observe). If replay does
-  not exist and matters in practice, see the fallback below.
+- **Replay after disconnect: verified working** (Step 1 spike, Jul 17). A message sent
+  while the listener was dead was queued server-side and delivered 8 seconds after
+  reconnect, so the Mac-asleep window closes without any fallback machinery. Details in
+  Open Question 2 (resolved).
 - **LoopMessage is the fallback** (previously the primary in this spec's first draft): its
   webhook path is fully verified from public docs (shared-secret Authorization header, 30
   retries over roughly 3 hours [5]), $20/mo shared sender in production [4]. The complete
@@ -342,10 +341,15 @@ provider accepts it. Poll interval 3s against the 10s latency budget leaves marg
 outbox attempt. Polling (rather than an in-process call) keeps the CLI and daemon decoupled:
 `add` works whether or not the daemon is up, and pings fire when it is.
 
+**Shared-line prefix**: the Photon line is shared with a sibling project (daily-prompts),
+so every outbound text this system sends (pings, acks, failure reports, digests, help)
+begins with `TEXT_PREFIX = '[N] '` (config), making origin obvious at a glance. The prefix
+is applied in one place, the outbox enqueue, so no template can forget it.
+
 Ping template (`src/approval/ping.ts`):
 
 ```
-d7 · Jane Doe (MIT)
+[N] d7 · Jane Doe (MIT)
 "Attention Is Not All You Need" (short title)
 gist: your rss-gap framing vs my crawler results
 send d7 | skip d7 | edit d7: <how>
@@ -387,6 +391,13 @@ Rules (case-insensitive, whitespace-tolerant):
 | `edit d7 shorter` (no colon) | help (colon is the instruction delimiter, per PRD A3) |
 | `list` | list |
 | anything else | help |
+
+**Shared-line etiquette**: because the line also carries daily-prompts traffic, the help
+reply fires only for messages that look like attempted commands for this system (first
+token is `send`/`skip`/`edit`/`list`/`help` or a `d<digits>` id, in any case). Anything
+else is logged `command_ignored` and gets no reply, so texts meant for the sibling project
+never trigger our help text. The PRD's "unrecognized replies get help" (A3) is narrowed
+accordingly: unrecognized command-shaped replies get help.
 
 `src/approval/actions.ts` executes commands. Resolution of `shortId: null`: exactly one
 pending draft applies to it; zero pending replies "nothing pending"; more than one replies
@@ -583,14 +594,13 @@ design, preserved from this spec's first draft:
 - **Texts**: `PingFields` type guard (AL6) keeps ontology facts and rationale out of every
   outbound text by construction.
 - **Keys**: `.env` holds `OPENROUTER_API_KEY`, `TAVILY_API_KEY`, `CHANNEL_PROVIDER=photon`,
-  and the Photon credentials produced by the device-code OAuth flow [8] (exact variable
-  names recorded by the Step 1 spike; the flow writes runtime credentials to a local file,
-  which must live in the project `.env`/`data/` with the same permissions, not a
-  world-readable home path), plus `APPROVER_PHONE`, `SENDER_EMAIL`. Fallback-only:
+  `SPECTRUM_PROJECT_ID`, `SPECTRUM_PROJECT_SECRET` (dashboard-issued; verified by the
+  Step 1 spike), plus `APPROVER_PHONE`, `SENDER_EMAIL`. Fallback-only:
   `LOOPMESSAGE_AUTH_KEY`, `LOOPMESSAGE_SECRET_KEY`, `CHANNEL_WEBHOOK_SECRET`. Build step 1
   sets `chmod 600 .env`; `outreach doctor`-style check in `/health` warns if permissions
   are wider.
-- **Config** (`src/config.ts`): `REVIEW_PORT=7777`, `PING_POLL_MS=3000`, outbox backoff
+- **Config** (`src/config.ts`): `TEXT_PREFIX='[N] '` (shared-line origin marker, applied at
+  outbox enqueue), `REVIEW_PORT=7777`, `PING_POLL_MS=3000`, outbox backoff
   schedule (also the stream reconnect schedule), `RETRY_WINDOW_H=3`, digest hour.
   (`WEBHOOK_PORT=7788` exists but is used only if the AL11 fallback fires.)
 - Message content transits Photon's servers: accepted PRD tradeoff, restated here so
@@ -699,15 +709,22 @@ Each step ends with a ✅ human-verifiable checkpoint; do not proceed until it p
 
 ## Open Questions
 
-1. **Photon SDK specifics** (unverified until Step 1): the gRPC transport, device-code
-   OAuth, and shared-pool behavior come from a third-party integration writeup [8], not
-   first-party API docs. The Step 1 spike re-verifies all of it against the real service
-   and records the exact call shapes before `photon.ts` is written.
-2. **Replay after disconnect** (the decision-relevant unknown): whether Photon queues and
-   redelivers messages sent while the stream is down. The spike answers it empirically.
-   Queued: dedup makes replay safe and the Mac-asleep window closes. Not queued: v1 leans
-   on the on-start/on-reconnect pending notice (AL11), and if commands get lost in
-   practice, fall back to LoopMessage, whose 3-hour webhook retries are documented [5].
+1. **Photon SDK specifics**: RESOLVED by the Step 1 spike against the live service (see
+   Open Question 2 for the recorded call shapes). One deviation from [8]: auth is a
+   project id + project secret from the dashboard, not device-code OAuth; AL12's key list
+   reflects the real variable names.
+2. **Replay after disconnect**: RESOLVED by the Step 1 spike (Jul 17, live test). A
+   message texted while the listener process was dead was queued server-side and delivered
+   8 seconds after reconnect. Photon is a go; the Mac-asleep window closes without the
+   fallback. Spike findings for `photon.ts`: SDK `spectrum-ts@11.1.0`; auth via
+   `Spectrum({ projectId, projectSecret })` from `SPECTRUM_PROJECT_ID` /
+   `SPECTRUM_PROJECT_SECRET` in `.env`; outbound initiation via
+   `imessage(app).user(e164)` then `im.space.create(user)` then `space.send(text)`,
+   returning a message `id` (`spc-msg-<uuid>`, the dedup key); inbound via
+   `for await (const [space, message] of app.messages)` with `message.sender.id` as the
+   E.164 allowlist key, `message.content.{type,text}`, `message.id`, and
+   `message.timestamp`; DM space id encodes the recipient (`any;-;+1480...`) with
+   `phone: 'shared'` on the free tier. Working reference: `scripts/spike-photon.ts`.
 3. **Sendblue webhook verification scheme** (unverified): webhooks exist on all plans per
    [1][2][3], but the exact signature/secret mechanism was not verifiable from reachable
    docs (docs.sendblue.com returned 404 on the receiving-messages path). Needed only if the
