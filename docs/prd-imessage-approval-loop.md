@@ -47,7 +47,6 @@ The pipeline can now go from arXiv ID to a grounded draft, but there is no way t
 
 **A2. Ping content**
 - On a draft entering `awaiting_approval`: one text containing recipient name + institution, paper title (short), the draft's one-line gist, the draft's short ID, and the review-page link.
-- Every outbound text from this system starts with a `[N]` origin marker, because the iMessage line is shared with the daily-prompts sibling project.
 - Pings contain Tier A/B context only; Tier C facts never appear in a text (they transit a third party). Full rationale, including Tier C, lives only on the tailnet-bound review page.
 
 **A3. Reply grammar**
@@ -56,7 +55,7 @@ The pipeline can now go from arXiv ID to a grounded draft, but there is no way t
 - `edit <id>: <instructions>`: redraft with the instructions, re-run the grounding check, re-ping with the new version (same ID, new revision number).
 - Bare `send` / `skip` / `edit: ...` with exactly one pending draft applies to it; with more than one pending, the bot replies with the ID'd list and asks for an explicit ID.
 - `list`: returns all pending drafts with IDs and gists.
-- Anything unrecognized but command-shaped (starts with a grammar keyword or a draft ID): one short help message with the grammar. No action taken. Other texts are ignored silently (logged only): the line is shared with the daily-prompts sibling project, and its traffic must never trigger replies from this system.
+- Anything unrecognized: one short help message with the grammar. No action taken.
 
 **A4. Review page**
 - Serves per-draft pages at a stable URL included in the ping. Bound to the tailnet interface only (Tailscale); no additional page auth in v1. Never bound to a public interface.

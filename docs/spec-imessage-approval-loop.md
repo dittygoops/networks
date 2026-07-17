@@ -341,15 +341,10 @@ provider accepts it. Poll interval 3s against the 10s latency budget leaves marg
 outbox attempt. Polling (rather than an in-process call) keeps the CLI and daemon decoupled:
 `add` works whether or not the daemon is up, and pings fire when it is.
 
-**Shared-line prefix**: the Photon line is shared with a sibling project (daily-prompts),
-so every outbound text this system sends (pings, acks, failure reports, digests, help)
-begins with `TEXT_PREFIX = '[N] '` (config), making origin obvious at a glance. The prefix
-is applied in one place, the outbox enqueue, so no template can forget it.
-
 Ping template (`src/approval/ping.ts`):
 
 ```
-[N] d7 · Jane Doe (MIT)
+d7 · Jane Doe (MIT)
 "Attention Is Not All You Need" (short title)
 gist: your rss-gap framing vs my crawler results
 send d7 | skip d7 | edit d7: <how>
@@ -392,12 +387,9 @@ Rules (case-insensitive, whitespace-tolerant):
 | `list` | list |
 | anything else | help |
 
-**Shared-line etiquette**: because the line also carries daily-prompts traffic, the help
-reply fires only for messages that look like attempted commands for this system (first
-token is `send`/`skip`/`edit`/`list`/`help` or a `d<digits>` id, in any case). Anything
-else is logged `command_ignored` and gets no reply, so texts meant for the sibling project
-never trigger our help text. The PRD's "unrecognized replies get help" (A3) is narrowed
-accordingly: unrecognized command-shaped replies get help.
+The outreach Photon project is dedicated (daily-prompts runs on its own project after the
+Jul 17 spike), so every inbound text on this line is for this system and the unrecognized
+case can safely reply with help per PRD A3. No origin prefix on outbound texts.
 
 `src/approval/actions.ts` executes commands. Resolution of `shortId: null`: exactly one
 pending draft applies to it; zero pending replies "nothing pending"; more than one replies
@@ -599,8 +591,7 @@ design, preserved from this spec's first draft:
   `LOOPMESSAGE_AUTH_KEY`, `LOOPMESSAGE_SECRET_KEY`, `CHANNEL_WEBHOOK_SECRET`. Build step 1
   sets `chmod 600 .env`; `outreach doctor`-style check in `/health` warns if permissions
   are wider.
-- **Config** (`src/config.ts`): `TEXT_PREFIX='[N] '` (shared-line origin marker, applied at
-  outbox enqueue), `REVIEW_PORT=7777`, `PING_POLL_MS=3000`, outbox backoff
+- **Config** (`src/config.ts`): `REVIEW_PORT=7777`, `PING_POLL_MS=3000`, outbox backoff
   schedule (also the stream reconnect schedule), `RETRY_WINDOW_H=3`, digest hour.
   (`WEBHOOK_PORT=7788` exists but is used only if the AL11 fallback fires.)
 - Message content transits Photon's servers: accepted PRD tradeoff, restated here so

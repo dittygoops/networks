@@ -26,7 +26,7 @@ if (!skipSend) {
   const im = imessage(app);
   const aditya = await im.user(approverPhone);
   const dm = await im.space.create(aditya);
-  const sent = await dm.send(`hermes spike ${ts()}: reply anything to test inbound`);
+  const sent = await dm.send(`outreach spike ${ts()}: reply anything to test inbound`);
   console.log(`[${ts()}] outbound sent`, JSON.stringify(sent, null, 2));
 }
 
