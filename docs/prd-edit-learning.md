@@ -1,5 +1,9 @@
 # PRD: Edit Learning (human corrections improve future drafts)
 
+> Part of the Academic Networking Email Assistant suite. Consumes revision capture from
+> the approval loop (`prd-imessage-approval-loop.md`, A7); produces exemplars and style
+> notes for draft generation (`prd-draft.md`).
+
 ## Overview
 
 Every time Aditya edits a draft (inline on the review page) or issues an edit instruction (`edit <id>: ...` over iMessage), the approval loop (see `prd-imessage-approval-loop.md`, A7) captures the before/after revisions with provenance and context. This subsystem turns that capture into a gold-standard corpus and feeds it back into draft generation, so first drafts steadily converge toward Aditya's voice and stop repeating corrections he has already made. Human-written revisions are the gold standard: they outrank every model output as evidence of what a draft should look like.

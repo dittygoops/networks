@@ -1,5 +1,9 @@
 # PRD: iMessage Approval Loop (F5)
 
+> Part of the Academic Networking Email Assistant suite. Consumes drafts from draft
+> generation (`prd-draft.md`); produces approved drafts for the sender (F6) and captured
+> revisions for edit learning (`prd-edit-learning.md`).
+
 ## Overview
 
 The approval loop is the human gate between draft generation and sending. When the pipeline produces a draft, the system texts Aditya a short ping (recipient, paper, one-line gist, review link) via a hosted iMessage API. Aditya can act from either surface: reply over text with a small grammar (`send <id>` / `skip <id>` / `edit <id>: <instructions>`), or open the review page, which shows full context (draft, paper summary, person profile, intersection rationale) and supports the same actions plus direct inline editing of the draft text. Nothing is ever sent without an explicit approval. In this milestone, approval hands the draft to a stub sender that logs and archives the email, so the loop is rehearsable end to end before real Gmail sending (F6) exists.
@@ -92,7 +96,7 @@ The pipeline can now go from arXiv ID to a grounded draft, but there is no way t
 - **Latency**: ping dispatched within 10 seconds of a draft entering `awaiting_approval`; inbound command acted on within 5 seconds of receipt.
 - **Security**: no publicly reachable surface in the primary design (inbound arrives on the outbound stream); the sender number is verified on every message. Review page is tailnet-only. Provider credentials stored locally with restrictive permissions. (Webhook fallback, if ever used: that endpoint is the only public surface and verifies a shared secret.)
 - **Privacy**: Tier C research facts never leave the machine except to the tailnet page (A2).
-- **Resilience**: if the Mac sleeps and the stream drops, replies are processed on reconnect (server-side replay if the provider supports it, verified by the spec's Step 1 spike; otherwise an on-reconnect pending notice); late by hours is acceptable.
+- **Resilience**: if the Mac sleeps and the stream drops, replies are processed on reconnect (server-side replay, verified working by the spec's Step 1 spike on Jul 17, plus a belt-and-suspenders on-reconnect pending notice); late by hours is acceptable.
 - **Auditability**: every ping, inbound command (including rejected/unrecognized), revision, and decision is logged with timestamps.
 
 ## Edge Cases & Open Questions
@@ -106,7 +110,7 @@ The pipeline can now go from arXiv ID to a grounded draft, but there is no way t
 - Redraft or inline edit repeatedly fails grounding → draft stays pending with the failure and the specific missing requirement reported in-thread and on the page; the last passing revision stays sendable, and skip is always available.
 
 ### Open questions
-1. **Provider selection**: resolved in the spec phase. Photon Spectrum (managed free tier, gRPC stream inbound, no public endpoint); LoopMessage fallback ($20/mo, verified webhook scheme). Remaining unknown: replay-after-disconnect behavior, settled empirically by the spec's Step 1 spike.
+1. **Provider selection**: resolved. Photon Spectrum (managed free tier, gRPC stream inbound, no public endpoint); LoopMessage fallback ($20/mo, verified webhook scheme). Replay-after-disconnect was verified working by the spec's Step 1 spike (Jul 17); no unknowns remain.
 2. **Tailscale Funnel constraints**: resolved. Funnel can expose a single mounted route while everything else stays tailnet-only (verified against Tailscale KB); only relevant if the webhook fallback is ever exercised.
 3. **Gist generation**: is the one-line gist a cheap-tier LLM call at draft time or derived from the chosen hook? Decide in spec; must not add noticeable latency to the ping.
 4. **v2 candidates** (deferred): intake-via-text (texting an arXiv link), re-pings via F7's scheduler, native on-Mac channel as a cost-reduction fallback.

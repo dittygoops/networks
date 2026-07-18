@@ -34,9 +34,11 @@ Covers PRD A1 through A9. The master spec's native `imessage-kit` / chat.db chan
 Stack table row and Steps 2 and 10) is superseded by the hosted provider behind an adapter
 interface; the native path stays a documented fallback only (PRD non-goal).
 
-## AL1. Provider selection (A1)
+## Resolved Decisions
 
-### Comparison (researched July 2026)
+### AL1. Provider selection (A1)
+
+#### Comparison (researched July 2026)
 
 | | Sendblue | LoopMessage | Photon Spectrum |
 |---|---|---|---|
@@ -44,8 +46,8 @@ interface; the native path stays a documented fallback only (PRD non-goal).
 | Cheapest paid | AI Agent plan $100/mo per dedicated line, unlimited send/receive [2][3] | Shared sender $20/mo (50 monthly contacts); dedicated Light $59.99/mo plus $15/mo phone number [4] | Pro $25/mo (managed shared number, 100 users); Business $250/line/mo dedicated [7] |
 | Sender identity | Service number (shared on sandbox, dedicated on paid) [1][2] | Service number (shared or dedicated) [4] | Managed: Photon service number. Self-hosted open source on Aditya's own Mac uses his own iCloud account as the sender [6][7] |
 | Inbound delivery | Webhooks and callbacks on all plans, delivery receipts, Node SDK, `POST /send-message` [1][2][3] | Webhooks (`message_inbound`, `message_delivered`, `message_failed`, `message_reaction`); dashboard-configured Authorization header the server must verify on every event; 30 retries over roughly 3 hours (10 x 30s, 10 x 3min, 10 x 15min), 15s timeout per attempt [5] | Long-lived bidirectional gRPC stream the client opens outbound; replaced their earlier webhook design, removing the public-URL requirement [8] |
-| Inbound auth | Exists per [1][2][3]; exact scheme (signature vs secret) unverified | Verified: shared secret via configurable Authorization header [5] | Device-code OAuth (RFC 8628) against app.photon.codes; project secret rotation [8] |
-| Inbound polling API | Unverified | Not documented; webhooks only per [5] | Not needed for liveness (persistent stream); replay-after-disconnect behavior unverified, Step 1 spike item |
+| Inbound auth | Exists per [1][2][3]; exact scheme (signature vs secret) unverified | Verified: shared secret via configurable Authorization header [5] | Dashboard-issued project id + secret (verified by the Step 1 spike; [8] claimed device-code OAuth, superseded by observation) |
+| Inbound polling API | Unverified | Not documented; webhooks only per [5] | Not needed: persistent stream, and replay-after-disconnect verified working by the Step 1 spike (Jul 17) |
 | Mac-online requirement | No (hosted) | No (hosted) | Self-hosted mode: yes (it runs on the Mac); managed mode: no |
 
 Sources:
@@ -59,7 +61,7 @@ writeup of the managed Spectrum service; its claims about the gRPC transport, de
 OAuth, and shared-line-pool behavior are re-verified by the Step 1 spike before any code
 depends on them).
 
-### Decision: Photon Spectrum (managed, free shared-line tier)
+#### Decision: Photon Spectrum (managed, free shared-line tier)
 
 Decided with Aditya (Jul 16): the shared-number caveat is acceptable, which unlocks the
 free tier.
@@ -89,7 +91,7 @@ free tier.
 The `ChannelProvider` adapter (AL3) makes this decision cheap to reverse: switching
 providers is one new file plus an env var.
 
-## AL2. Module layout
+### AL2. Module layout
 
 Follows the existing conventions: prompts in the single `src/llm/prompts.ts`, DDL in
 `src/db/schema.sql` applied idempotently by `openDb`, injectable deps for offline tests.
@@ -128,13 +130,13 @@ outreach/
         └── db.ts             # + typed helpers for the new tables
 ```
 
-## AL3. Channel provider adapter (A1)
+### AL3. Channel provider adapter (A1)
 
 ```ts
 // src/channel/types.ts
 export interface InboundMessage {
   providerMessageId: string;   // provider's unique id, dedup key
-  from: string;                // E.164, e.g. '+14806928263'
+  from: string;                // E.164, e.g. '+15555550100'
   text: string;
   receivedAt: string;          // ISO
 }
@@ -157,7 +159,9 @@ export interface ChannelProvider {
 
 `src/channel/photon.ts` implements it over the Spectrum SDK/gRPC API: `send` posts the
 outbound message; `start` opens the long-lived bidirectional stream (credentials from the
-device-code OAuth flow, AL12) and maps inbound texts to `InboundMessage`, reconnecting with
+dashboard-issued project id + secret, AL12) and maps inbound texts to `InboundMessage`
+(dropping and logging any event whose `sender` is missing: the SDK types it
+`TSender | undefined`, so the mapper must guard before reading `sender.id`), reconnecting with
 the outbox's backoff schedule on disconnect and logging `channel_disconnected` /
 `channel_connected` events. Exact SDK call shapes and payload fields are recorded by the
 Step 1 spike before this file is written [8]. Delivery failures are not dropped: they are
@@ -182,7 +186,7 @@ retries failures with exponential backoff (30s, 2min, 10min, 30min, then hourly;
 attempts per AL12 config). The PRD provider-outage edge
 case falls out: pings queue locally, the tailnet review page keeps working, nothing blocks.
 
-## AL4. Data model (DDL in `src/db/schema.sql`)
+### AL4. Data model (DDL in `src/db/schema.sql`)
 
 The master spec sketched `drafts` (keyed by `outreach_id`, `version` column, `superseded`
 status) and `approvals` (`action IN ('send','skip','edit')`, `edit_instructions`). Both are
@@ -249,7 +253,7 @@ CREATE TABLE IF NOT EXISTS decisions (
 CREATE TABLE IF NOT EXISTS draft_events (
   id INTEGER PRIMARY KEY,
   draft_id INTEGER REFERENCES drafts(id),
-  type TEXT NOT NULL,                      -- 'draft_created','ping_sent','ping_failed',
+  type TEXT NOT NULL,                      -- 'draft_created','ping_queued','ping_sent','ping_failed',
                                            -- 'command','command_rejected','revision',
                                            -- 'grounding_failed','redraft_failed','decision',
                                            -- 'stub_sent','stub_failed','inbound_rejected',
@@ -299,7 +303,7 @@ persisted row id per hook (lookup by `(self_fact_id, person_fact_id)` against th
 `intersections` table, or extend the type with `id`). `entity` = the hook's `personValue`,
 `facet` = the person fact's facet (one lookup by `personFactId`), `tier` = the hook tier.
 
-## AL5. Short IDs (A9)
+### AL5. Short IDs (A9)
 
 `short_id = 'd' + String(drafts.id)`. Rowids are monotonic and never reused for our insert
 pattern, so IDs are permanent, unique, strictly increasing, and never shift as new drafts
@@ -310,7 +314,7 @@ switch the column to AUTOINCREMENT first. `src/approval/ids.ts` owns formatting 
 `parseShortId('d7' | 'D7' | '7') -> 7` (bare digits accepted for phone ergonomics), format
 always renders the canonical `d7`. No per-session renumbering, ever.
 
-## AL6. Draft persistence and pings (A2)
+### AL6. Draft persistence and pings (A2)
 
 **CLI change** (`src/cli.ts` `add` path, replacing DR6's print-only ending): after
 `generateDraft`, in one transaction insert the `drafts` row (with `draft_input_json`,
@@ -335,9 +339,15 @@ DR3 already forces subjects to be short, specific, and lowercase-casual; reusing
 zero latency and zero extra LLM calls. No separate gist call.
 
 **Ping dispatch**: the daemon polls every `PING_POLL_MS` (3s) for
-`drafts WHERE status='awaiting_approval' AND id NOT IN (SELECT draft_id FROM draft_events
-WHERE type='ping_sent')`, enqueues the ping into the outbox, and logs `ping_sent` when the
-provider accepts it. Poll interval 3s against the 10s latency budget leaves margin for one
+`drafts d WHERE status='awaiting_approval' AND NOT EXISTS (SELECT 1 FROM draft_events e
+WHERE e.draft_id = d.id AND e.type='ping_queued')` (`NOT EXISTS`, not `NOT IN`: a single
+NULL `draft_id` row would make `NOT IN` return nothing and silently stop all pings),
+enqueues the ping into the outbox, and logs `ping_queued` in the same transaction as the
+enqueue. `ping_sent` is logged separately when the provider accepts the send. The dedup
+marker is `ping_queued` at enqueue time, deliberately: if it were `ping_sent`, a provider
+outage would leave the draft matching the poll every 3s and queue hundreds of duplicate
+pings for the outbox to faithfully drain on recovery. One queued ping per draft; the
+outbox's own retries handle delivery. Poll interval 3s against the 10s latency budget leaves margin for one
 outbox attempt. Polling (rather than an in-process call) keeps the CLI and daemon decoupled:
 `add` works whether or not the daemon is up, and pings fire when it is.
 
@@ -355,10 +365,16 @@ http://<mac-tailnet-name>:7777/review/d7
 `PingFields` type (`shortId`, `personName`, `affiliation`, `paperTitleShort`, `gist`,
 `url`, and for failures a `reason` drawn from a fixed enum plus the grounding requirement
 name). Ontology fact values, intersection rationales, and tiers are not in the type, so
-Tier C content cannot be interpolated into a text by construction. The gist is a draft
-subject, which is model output already constrained to Tier A/B hooks by the drafter.
+Tier C content cannot be interpolated into a text by construction, with one exception the
+type cannot close: the gist is LLM-written text (the draft subject), and nothing in the
+current drafter constrains subjects to Tier A/B hooks (the CLI passes hooks with no tier
+filter and `DRAFT_SYSTEM` has no tier rule). So the gist gets a deterministic screen
+before it enters `PingFields`: stem-match it (reusing the DR4 `stems` helper) against the
+values and details of every Tier C fact for this recipient; on any hit, replace the gist
+with the short paper title and log `gist_tierc_screened`. The same screened gist is what
+`list` renders. This keeps PRD A2 mechanical for every field including the LLM one.
 
-## AL7. Grammar and actions (A3, A9)
+### AL7. Grammar and actions (A3, A9)
 
 `src/approval/grammar.ts`, a pure function:
 
@@ -409,7 +425,7 @@ or skip" (A5).
 Replies (`list` output, help text, already-decided notices) go through the outbox like any
 other text. Help text is the grammar in four short lines.
 
-## AL8. Revisions: instruction redrafts and inline edits (A5, A7)
+### AL8. Revisions: instruction redrafts and inline edits (A5, A7)
 
 `src/approval/revise.ts` owns both write paths; there is no other way a revision is created.
 
@@ -465,12 +481,20 @@ Near-simultaneous edits from both surfaces serialize on the single DB connection
 `send` always sends `sendable_revision_id`, which is the latest passing revision, matching
 the PRD edge case.
 
-## AL9. Review page (A4)
+### AL9. Review page (A4)
 
 `src/review/server.ts`, Hono, server-rendered HTML (no client framework), bound via
 `config.ts` to the tailnet IP (`tailscale ip -4` at startup) plus `127.0.0.1`, port `7777`.
-Never `0.0.0.0`. This supersedes the master spec's `REVIEW_TOKEN` bearer idea: the tailnet
-binding is the v1 auth boundary (PRD A4, no page auth).
+Never `0.0.0.0`. If Tailscale is down at startup, fail closed: bind `127.0.0.1` only and
+warn in `/health`, never fall back to a wider interface. This supersedes the master spec's
+`REVIEW_TOKEN` bearer idea: the tailnet binding is the v1 auth boundary (PRD A4, no page
+auth). Network position alone does not stop cross-site requests, though: a malicious page
+open in a browser on a tailnet device sits inside the boundary, and short IDs are
+guessable (`d1`, `d2`, ...). So every state-changing POST is additionally gated,
+mechanically: reject unless the `Host` header matches the configured review host:port
+exactly (kills DNS rebinding) and, when a `Sec-Fetch-Site` header is present, it is
+`same-origin` or `none` (kills cross-site form posts from modern browsers). Both checks
+are three lines of Hono middleware, logged as `web_rejected` on failure.
 
 | Route | Method | Purpose |
 |---|---|---|
@@ -501,7 +525,7 @@ Per-draft page content, top to bottom:
 
 Decided drafts render read-only with the outcome banner ("sent (stubbed) Tue via imessage").
 
-## AL10. Failure reporting (A6)
+### AL10. Failure reporting (A6)
 
 Every failure writes a `draft_events` row and (except where noted) enqueues an iMessage
 text. Templates live in `src/approval/ping.ts`; each states what happened, the draft ID,
@@ -519,7 +543,7 @@ and the draft's current state:
 The review page event log renders the same rows, so phone and page never disagree about
 history.
 
-## AL11. Stub sender (A8) and inbound ingress (A1)
+### AL11. Stub sender (A8) and inbound ingress (A1)
 
 **Sender seam** (`src/sender/types.ts`):
 
@@ -548,12 +572,12 @@ secret, no public URL. Disconnects are expected (Mac sleep): the adapter reconne
 backoff and logs `channel_disconnected`/`channel_connected` so gaps are visible in the
 event log.
 
-**Catch-up after disconnect**: log `daemon_start`; whether Photon queues messages sent
-while the stream was down and replays them on reconnect is unverified [8] and is settled
-by the Step 1 spike (text while disconnected, reconnect, observe). If replay exists, the
-dedup key makes it safe. If it does not: on reconnect after a gap longer than
-`RETRY_WINDOW_H` (3h) with any draft pending, the daemon re-sends the pending `list`, so
-Aditya knows to re-issue anything that fell in the gap. See Open Question 2.
+**Catch-up after disconnect**: log `daemon_start`. Replay is verified working (Step 1
+spike, Jul 17: a message texted while the listener was dead arrived 8 seconds after
+reconnect), so queued messages redeliver on reconnect and the dedup key makes redelivery
+safe. Belt-and-suspenders: on reconnect after a gap longer than `RETRY_WINDOW_H` (3h)
+with any draft pending, the daemon still re-sends the pending `list`, guarding against
+replay-window limits Photon has not documented. See Open Question 2 (resolved).
 
 **Fallback appendix: webhook ingress (LoopMessage)**. If the spike disqualifies Photon
 (broken replay with real message loss, unusable SDK, or shared-pool behavior that breaks
@@ -575,7 +599,7 @@ design, preserved from this spec's first draft:
 - LoopMessage's 3-hour webhook retry schedule [5] then covers the Mac-asleep window that
   motivated the catch-up logic above.
 
-## AL12. Security, privacy, config
+### AL12. Security, privacy, config
 
 - **No public surface**: inbound arrives on the outbound gRPC stream; there is no inbound
   port and no funnel in the primary design. The sender allowlist still gates every message
@@ -584,20 +608,27 @@ design, preserved from this spec's first draft:
 - **Review page**: tailnet interface + localhost only; never `0.0.0.0`; never funneled.
   Tier C facts and full rationale render only here (A2, A4).
 - **Texts**: `PingFields` type guard (AL6) keeps ontology facts and rationale out of every
-  outbound text by construction.
+  outbound text by construction, plus the deterministic Tier C stem screen over the gist
+  (the one LLM-written field).
 - **Keys**: `.env` holds `OPENROUTER_API_KEY`, `TAVILY_API_KEY`, `CHANNEL_PROVIDER=photon`,
   `SPECTRUM_PROJECT_ID`, `SPECTRUM_PROJECT_SECRET` (dashboard-issued; verified by the
   Step 1 spike), plus `APPROVER_PHONE`, `SENDER_EMAIL`. Fallback-only:
-  `LOOPMESSAGE_AUTH_KEY`, `LOOPMESSAGE_SECRET_KEY`, `CHANNEL_WEBHOOK_SECRET`. Build step 1
-  sets `chmod 600 .env`; `outreach doctor`-style check in `/health` warns if permissions
-  are wider.
+  `LOOPMESSAGE_AUTH_KEY`, `LOOPMESSAGE_SECRET_KEY`, `CHANNEL_WEBHOOK_SECRET`. `.env` is
+  `chmod 600` (applied Jul 18; build step 2's checkpoint re-verifies); an
+  `outreach doctor`-style check in `/health` warns if permissions are wider.
 - **Config** (`src/config.ts`): `REVIEW_PORT=7777`, `PING_POLL_MS=3000`, outbox backoff
   schedule (also the stream reconnect schedule), `RETRY_WINDOW_H=3`, digest hour.
   (`WEBHOOK_PORT=7788` exists but is used only if the AL11 fallback fires.)
 - Message content transits Photon's servers: accepted PRD tradeoff, restated here so
   nobody later mistakes the texts for a private channel.
+- **Residual trust assumption, called out deliberately**: inbound command authenticity
+  rests entirely on Photon honestly reporting `sender.id`. A compromised or buggy provider
+  could forge `APPROVER_PHONE` and issue `send`/`edit` commands; there is no second
+  factor. Acceptable while `send` produces a stubbed `.eml` (AL11); before F6 makes
+  `send` deliver real email, revisit: either require a review-page confirmation for
+  `send` specifically, or accept the risk explicitly in the F6 spec.
 
-## AL13. Supersessions of the master spec (collected)
+### AL13. Supersessions of the master spec (collected)
 
 | Master spec item | Status |
 |---|---|
@@ -628,8 +659,8 @@ grounding bar.
 
 Each step ends with a ✅ human-verifiable checkpoint; do not proceed until it passes.
 
-1. **Provider spike** (scratch script, no app code): Photon account via the device-code
-   OAuth flow [8]; from a one-file script, send a text to Aditya's phone over the API,
+1. **Provider spike** (scratch script, no app code): Photon project + dashboard-issued
+   project id/secret; from a one-file script, send a text to Aditya's phone over the API,
    open the gRPC stream, reply from the phone, and print the inbound event. Then the
    replay test: close the stream, text the line, reopen, and observe whether the missed
    message is delivered. Record: exact SDK call shapes, credential variable names and
@@ -714,7 +745,7 @@ Each step ends with a ✅ human-verifiable checkpoint; do not proceed until it p
    returning a message `id` (`spc-msg-<uuid>`, the dedup key); inbound via
    `for await (const [space, message] of app.messages)` with `message.sender.id` as the
    E.164 allowlist key, `message.content.{type,text}`, `message.id`, and
-   `message.timestamp`; DM space id encodes the recipient (`any;-;+1480...`) with
+   `message.timestamp`; DM space id encodes the recipient's E.164 number with
    `phone: 'shared'` on the free tier. Working reference: `scripts/spike-photon.ts`.
 3. **Sendblue webhook verification scheme** (unverified): webhooks exist on all plans per
    [1][2][3], but the exact signature/secret mechanism was not verifiable from reachable
