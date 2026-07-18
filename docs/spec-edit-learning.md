@@ -31,9 +31,10 @@ L3 (distillation), L4 (SQLite only), L5 (metrics CLI).
 ## Read contract on the approval loop (owned by the approval-loop spec)
 
 This subsystem reads two tables the approval-loop spec owns and defines. The columns below are
-the contract this spec requires of them; names are the requirement, exact DDL will live in
-`spec-imessage-approval-loop.md` (not yet written, see Open Question 4). If that spec picks
-different names, `learning/` is the only consumer to update.
+the contract this spec requires of them; names are the requirement, and the exact DDL
+lives in `spec-imessage-approval-loop.md` (AL4), which states the contract "is matched
+exactly" (confirmed: the column lists match). If a future revision there renames anything,
+`learning/` is the only consumer to update.
 
 ```
 revisions                                   -- one row per draft revision (A7)
@@ -46,7 +47,11 @@ revisions                                   -- one row per draft revision (A7)
   prior_revision_id INTEGER                 -- NULL only for rev_no = 1
   instruction   TEXT                        -- edit-instruction text; NULL for inline edits
                                             -- and first drafts
-  context_json  TEXT NOT NULL               -- draft context at generation: { intent,
+  context_json  TEXT NOT NULL               -- draft context at generation, incl. the
+                                            -- groundingTerms key (AL8: paper title lives
+                                            -- in groundingTerms.recipientTerms; EL6's
+                                            -- redactor sources title stems from it):
+                                            -- { intent,
                                             --   hook: { intersectionId, entity, facet, tier },
                                             --   recipientProfileSummary }
   created_at    TEXT
@@ -353,14 +358,28 @@ AFTER: <after_body>
 ```
 
 **Deterministic redaction (mechanical privacy enforcement, v1)**: before assembly, the block
-assembler redacts each exemplar's recipient identity from the `before/after` bodies it
-renders: the example recipient's name tokens (from the example's `people` row) are replaced
-with `<Name>`, and paper-title stems plus the example's `hook_entity` stems (from the stored
-draft context) are replaced with `<their work>`. Matching reuses the same 5-char stem helper
-as DR4, so "olfaction" catches "olfactory". Redaction applies only to the prompt block; the
-stored rows keep full text for auditability. A prompt rule alone would not be enforcement,
-and DR4 cannot catch echoes of a PAST recipient's name (it only checks for the presence of
-CURRENT hook and sender stems), so redaction is the actual guarantee.
+assembler redacts each exemplar's recipient identity from everything it renders, the
+`before/after` bodies AND the instruction text (an instruction like "say her Nature paper
+came first" carries recipient facts too). The redaction vocabulary for an example is: the
+example recipient's name tokens (from the example's `people` row), paper-title stems (from
+`context_json.groundingTerms.recipientTerms`, which the read contract includes), the
+example's `hook_entity` stems, and the stems of ALL of that recipient's `ontology_facts`
+values (institutions, collaborators, locations; this was Open Question 3's v2 scope,
+pulled into v1 because misclassification makes narrow redaction leaky). Name tokens
+become `<Name>`; everything else becomes `<their work>`. Matching reuses the same 5-char
+stem helper as DR4, so "olfaction" catches "olfactory". Redaction applies only to the
+prompt block; the stored rows keep full text for auditability. A prompt rule alone would
+not be enforcement, and DR4 cannot catch echoes of a PAST recipient's name (it only checks
+for the presence of CURRENT hook and sender stems), so redaction is the actual guarantee.
+Because redaction is unconditional, an exemplar the cheap-tier classifier mislabels
+`stylistic` (EL2: an LLM decision, unaudited) still crosses recipients only in redacted
+form; the scope label narrows selection, it is not the privacy boundary.
+
+The same vocabulary guards the distiller output: EL4's post-processing runs the stem
+screen over the produced `style_notes.body` against every `recipient_specific`/`mixed`
+source example's redaction vocabulary; any hit drops that rule line and logs
+`style_notes_screened`. Style notes are injected into every future draft, so they get the
+same mechanical treatment as exemplars, not just the prompt instruction.
 
 Why the user message and not `DRAFT_SYSTEM`: the system prompt is the stable contract
 (structure, style, TRUTH and stance rules) and stays constant; learned content is per-draft
@@ -374,11 +393,12 @@ sender facts, so a draft that leaned on exemplar facts instead of real hooks get
 Privacy (PRD non-functional): exemplar text is used only in this local prompt assembly and
 the OpenRouter call the system already makes for drafting. Three layers keep past recipients
 out of outbound emails: (1) the selection filter (EL3) surfaces `recipient_specific` and
-`mixed` examples only for the same `person_id`; (2) deterministic redaction (above) strips
-the example recipient's name and work stems from the prompt block itself; (3) the NEVER-reuse
-prompt rule steers the model away from imitating example content. Only (1) and (2) are
-enforcement; (3) is best-effort steering, and the DR4 grounding check is NOT a leakage
-detector (it checks only that current-hook and sender stems are present).
+`mixed` examples only for the same `person_id`; (2) unconditional deterministic redaction
+(above) over bodies, instructions, and distilled style notes, with the full ontology-fact
+vocabulary; (3) the NEVER-reuse prompt rule steers the model away from imitating example
+content. Only (1) and (2) are enforcement; (3) is best-effort steering, and the DR4
+grounding check is NOT a leakage detector (it checks only that current-hook and sender
+stems are present).
 
 Call-site wiring (lives in the approval-loop draft path when it exists; the CLI `add` path
 gets the same three lines): before `generateDraft`, call `selectLearnedBlock(db, ctx)`; after
@@ -494,9 +514,13 @@ flipped. No conflict detection heuristics in v1; recency is the arbiter.
    until observed.
 2. **Subject-line edits**: `change_ratio` currently measures the body only; if Aditya turns
    out to edit subjects often, extend the ratio to a weighted body+subject measure.
-3. **Redaction coverage**: v1 redaction (EL6) covers the example recipient's name, paper
-   title, and hook entity. Other identifying facts in an exemplar body (an institution, a
-   collaborator's name) are not stemmed out. If leakage of those is ever observed in a draft,
-   widen redaction to all stems from the example recipient's `ontology_facts` values.
-4. **Revisions read contract**: confirm final column names when
-   `spec-imessage-approval-loop.md` lands; `learning/` is the only consumer to adjust.
+3. **Redaction coverage**: RESOLVED into v1 (code-review finding, Jul 18). EL6 redaction
+   now uses the full vocabulary (name, paper title via `groundingTerms`, hook entity, and
+   all of the example recipient's `ontology_facts` value stems), applies to instruction
+   text, and screens distilled style notes at write time. Remaining residual: facts about
+   a recipient that appear in an exemplar body but were never captured as ontology facts;
+   accepted, since the corpus is Aditya's own writing about people he researched.
+4. **Revisions read contract**: RESOLVED. `spec-imessage-approval-loop.md` AL4 landed in
+   the same commit and matches this contract exactly (including
+   `context_json.groundingTerms`, which EL6 relies on); `learning/` remains the only
+   consumer to adjust if it ever drifts.
