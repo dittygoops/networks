@@ -10,6 +10,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/nodemailer": "^8.0.1",
     "spectrum-ts": "^11.2.0",
     "tsx": "^4.23.1",
     "typescript": "^5.6.0",
@@ -20,6 +21,7 @@
     "@types/better-sqlite3": "^7.6.13",
     "better-sqlite3": "^12.11.1",
     "fast-xml-parser": "^5.10.0",
+    "nodemailer": "^9.0.3",
     "tldts": "^7.4.8",
     "unpdf": "^0.12.0"
   }
