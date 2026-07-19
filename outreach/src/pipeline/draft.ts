@@ -14,12 +14,28 @@ export interface Draft {
 }
 
 const MAX_WORDS = 160; // hard flag ceiling; the prompt aims for < 120
+
+// Canonical sign-off, appended deterministically so every email is identical and
+// the model can never mangle Aditya's credentials or links. The drafter is told
+// NOT to sign; edit this block to change the signature everywhere.
+export const SIGNATURE = [
+  'Best,',
+  'Aditya Gupta',
+  'MS Student, Computer Science, Arizona State University',
+  'https://linkedin.com/in/aditya-gupta-asu',
+  'https://github.com/dittygoops',
+].join('\n');
 const wordCount = (s: string): number => s.split(/\s+/).filter(Boolean).length;
 // Replace em/en dashes with a comma (Aditya's hard no-em-dash rule).
 const stripDashes = (s: string): string => s.replace(/\s*[—–]\s*/g, ', ');
 // The prompt tags sender facts [done]/[exploring] to control honesty; the model
 // sometimes echoes those tags into the body. Strip them (and any leftover space).
 const stripStanceTags = (s: string): string => s.replace(/\s*\[(?:done|exploring)\]/gi, '');
+// The model is told not to sign, but sometimes still ends with "Best,\nAditya".
+// Strip a trailing closing word (optionally followed by a short name line) so the
+// canonical SIGNATURE is not doubled up.
+const stripTrailingSignoff = (s: string): string =>
+  s.replace(/\n+\s*(?:best|thanks|thank you|cheers|regards|sincerely|warmly|all the best)[,!.]?\s*(?:\n+\s*[A-Za-z][A-Za-z.\s]{0,30})?\s*$/i, '');
 // Stems (first 5 chars of each >=5-char word), so "olfactory" and "olfaction"
 // both reduce to "olfac" and the grounding check tolerates natural paraphrase.
 const stems = (s: string): Set<string> =>
@@ -47,7 +63,7 @@ export async function generateDraft(llm: LLMClient, input: DraftInput): Promise<
   // Enforce the no-em-dash rule deterministically: the model ignores the prompt
   // instruction often, so replace em/en dashes with a comma.
   const subject = stripStanceTags(stripDashes(parsed.subject));
-  const body = stripStanceTags(stripDashes(parsed.body));
+  const body = stripTrailingSignoff(stripStanceTags(stripDashes(parsed.body)));
   const wc = wordCount(body);
   if (wc > MAX_WORDS) notes.push(`body is long (${wc} words)`);
 
@@ -63,7 +79,10 @@ export async function generateDraft(llm: LLMClient, input: DraftInput): Promise<
   const grounded = recipientGrounded && senderGrounded;
   if (!grounded) notes.push('draft may be ungrounded (missing a specific recipient or sender reference)');
 
-  return { subject, body, grounded, wordCount: wc, notes };
+  // Grounding and word count are measured on the model's content only; the fixed
+  // signature is appended after, so it never affects the checks or the word budget.
+  const signedBody = `${body.trimEnd()}\n\n${SIGNATURE}`;
+  return { subject, body: signedBody, grounded, wordCount: wc, notes };
 }
 
 function parseDraft(text: string): { subject: string; body: string } | null {
