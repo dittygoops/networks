@@ -6,7 +6,16 @@ import { readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
 import { openDb, saveSelfFacts, replaceSelfFacts, factRows, getPerson } from './db/db.js';
 import { decide, markSendFailed, markSent, persistDraft, priorThreads } from './approval/ledger.js';
+import { createGmailApiSender } from './sender/gmail-api.js';
 import { createGmailSmtpSender } from './sender/gmail.js';
+import type { Sender } from './sender/types.js';
+
+// Pick the sender: Gmail API OAuth if configured (the path that works on ASU
+// Workspace, which blocks SMTP app passwords), else SMTP for personal accounts.
+function makeSender(): Sender {
+  if (process.env.GMAIL_OAUTH_REFRESH_TOKEN) return createGmailApiSender();
+  return createGmailSmtpSender();
+}
 import { processPaper } from './pipeline/orchestrate.js';
 import { generateDraft } from './pipeline/draft.js';
 import { buildSelfOntology } from './pipeline/persona.js';
@@ -216,7 +225,7 @@ async function main(): Promise<void> {
         console.log(`already decided: ${decision.existing.action} via ${decision.existing.via} at ${decision.existing.createdAt}`);
         return;
       }
-      const sender = createGmailSmtpSender();
+      const sender = makeSender();
       try {
         const { sentId } = await sender.send({
           to: toAddr,
