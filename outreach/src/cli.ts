@@ -3,7 +3,10 @@
 //   npx tsx --env-file=.env src/cli.ts add <arxiv-id>
 import { basename } from 'node:path';
 import { readFileSync } from 'node:fs';
+import { createInterface } from 'node:readline/promises';
 import { openDb, saveSelfFacts, replaceSelfFacts, factRows, getPerson } from './db/db.js';
+import { decide, markSendFailed, markSent, persistDraft, priorThreads } from './approval/ledger.js';
+import { createGmailSmtpSender } from './sender/gmail.js';
 import { processPaper } from './pipeline/orchestrate.js';
 import { generateDraft } from './pipeline/draft.js';
 import { buildSelfOntology } from './pipeline/persona.js';
@@ -143,11 +146,97 @@ async function main(): Promise<void> {
       senderFacts,
     });
 
-    console.log(`\n--- DRAFT (review only, not sent) ---`);
+    console.log(`\n--- DRAFT ---`);
     console.log(`Subject: ${draft.subject}`);
     console.log(`\n${draft.body}`);
     console.log(`\n(${draft.wordCount} words${draft.grounded ? '' : ', CHECK: may be ungrounded'})`);
     if (draft.notes.length) console.log(`draft notes: ${draft.notes.join('; ')}`);
+
+    if (!draft.subject || !draft.body) {
+      console.log('draft generation failed; nothing persisted');
+      return;
+    }
+
+    // Persist to the ledger (spec AL4): draft + revision 1 + audit events.
+    const topHook = r.hooks[0]!;
+    const persisted = persistDraft(db, {
+      personId: r.personId,
+      paperArxivId: r.arxivId,
+      paperTitle: r.paperTitle,
+      intent,
+      draftInput: {
+        recipient: { name: r.target, affiliation, profileSummary: r.profileSummary, paperTitle: r.paperTitle },
+        hooks: r.hooks.slice(0, 3),
+        intent,
+        senderName: 'Aditya Gupta',
+        senderFacts,
+      },
+      draft,
+      contextJson: {
+        intent,
+        hook: { entity: topHook.personValue, tier: topHook.tier },
+        recipientProfileSummary: r.profileSummary ?? null,
+        groundingTerms: {
+          recipientTerms: r.hooks.flatMap((h) => [h.personValue, h.personDetail ?? '']).concat(r.paperTitle).filter(Boolean),
+          senderTerms: r.hooks.flatMap((h) => [h.selfValue, h.selfDetail ?? '']).concat(senderFacts.map((f) => f.text)).filter(Boolean),
+        },
+      },
+    });
+    console.log(`\nledgered as ${persisted.shortId}`);
+
+    // CLI approval gate (MVP for F5): nothing sends without an explicit yes.
+    if (!r.email) {
+      console.log('no email found: draft stays awaiting_approval in the manual-lookup queue');
+      return;
+    }
+    if (!persisted.sendable) {
+      console.log('draft failed grounding: not sendable; fix and re-run before any send');
+      return;
+    }
+
+    // F9 hard rule: warn (and require override) when this person already has a thread.
+    const prior = priorThreads(db, r.personId);
+    if (prior.length > 0 && !process.argv.includes('--force')) {
+      console.log(`REFUSED: ${r.target} already has a thread (${prior.map((t) => `${t.shortId} ${t.status}`).join(', ')}).`);
+      console.log('Re-run with --force to override.');
+      return;
+    }
+
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const answer = (await rl.question(`\nsend to ${r.email.email}? [y = send / s = skip / anything else = leave pending] `)).trim().toLowerCase();
+    rl.close();
+
+    if (answer === 'y' || answer === 'yes') {
+      const decision = decide(db, persisted.draftId, 'send', 'cli');
+      if (!decision.applied) {
+        console.log(`already decided: ${decision.existing.action} via ${decision.existing.via} at ${decision.existing.createdAt}`);
+        return;
+      }
+      const sender = createGmailSmtpSender();
+      try {
+        const { sentId } = await sender.send({
+          to: r.email.email,
+          from: process.env.SENDER_EMAIL ?? 'apgupta3@asu.edu',
+          subject: draft.subject,
+          body: draft.body,
+          draftShortId: persisted.shortId,
+        });
+        markSent(db, persisted.draftId, sentId);
+        console.log(`SENT ${persisted.shortId} to ${r.email.email} (${sentId})`);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        markSendFailed(db, persisted.draftId, msg);
+        console.log(`send failed (${msg}); ${persisted.shortId} stays approved, re-run send later`);
+      }
+    } else if (answer === 's' || answer === 'skip') {
+      const rl2 = createInterface({ input: process.stdin, output: process.stdout });
+      const reason = (await rl2.question('skip reason (optional): ')).trim();
+      rl2.close();
+      decide(db, persisted.draftId, 'skip', 'cli', reason || undefined);
+      console.log(`${persisted.shortId} skipped`);
+    } else {
+      console.log(`${persisted.shortId} left awaiting_approval`);
+    }
   }
 }
 
