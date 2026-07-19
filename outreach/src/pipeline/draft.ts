@@ -17,6 +17,9 @@ const MAX_WORDS = 160; // hard flag ceiling; the prompt aims for < 120
 const wordCount = (s: string): number => s.split(/\s+/).filter(Boolean).length;
 // Replace em/en dashes with a comma (Aditya's hard no-em-dash rule).
 const stripDashes = (s: string): string => s.replace(/\s*[—–]\s*/g, ', ');
+// The prompt tags sender facts [done]/[exploring] to control honesty; the model
+// sometimes echoes those tags into the body. Strip them (and any leftover space).
+const stripStanceTags = (s: string): string => s.replace(/\s*\[(?:done|exploring)\]/gi, '');
 // Stems (first 5 chars of each >=5-char word), so "olfactory" and "olfaction"
 // both reduce to "olfac" and the grounding check tolerates natural paraphrase.
 const stems = (s: string): Set<string> =>
@@ -43,8 +46,8 @@ export async function generateDraft(llm: LLMClient, input: DraftInput): Promise<
 
   // Enforce the no-em-dash rule deterministically: the model ignores the prompt
   // instruction often, so replace em/en dashes with a comma.
-  const subject = stripDashes(parsed.subject);
-  const body = stripDashes(parsed.body);
+  const subject = stripStanceTags(stripDashes(parsed.subject));
+  const body = stripStanceTags(stripDashes(parsed.body));
   const wc = wordCount(body);
   if (wc > MAX_WORDS) notes.push(`body is long (${wc} words)`);
 

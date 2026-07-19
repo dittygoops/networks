@@ -202,8 +202,12 @@ async function main(): Promise<void> {
       return;
     }
 
+    // --to-self: first-live-test mode; the email goes to Aditya's own inbox
+    // instead of the real recipient, everything else identical.
+    const toSelf = process.argv.includes('--to-self');
+    const toAddr = toSelf ? (process.env.SENDER_EMAIL ?? 'apgupta3@asu.edu') : r.email.email;
     const rl = createInterface({ input: process.stdin, output: process.stdout });
-    const answer = (await rl.question(`\nsend to ${r.email.email}? [y = send / s = skip / anything else = leave pending] `)).trim().toLowerCase();
+    const answer = (await rl.question(`\nsend to ${toAddr}${toSelf ? ' (SELF-TEST, real recipient withheld)' : ''}? [y = send / s = skip / anything else = leave pending] `)).trim().toLowerCase();
     rl.close();
 
     if (answer === 'y' || answer === 'yes') {
@@ -215,14 +219,14 @@ async function main(): Promise<void> {
       const sender = createGmailSmtpSender();
       try {
         const { sentId } = await sender.send({
-          to: r.email.email,
+          to: toAddr,
           from: process.env.SENDER_EMAIL ?? 'apgupta3@asu.edu',
           subject: draft.subject,
           body: draft.body,
           draftShortId: persisted.shortId,
         });
         markSent(db, persisted.draftId, sentId);
-        console.log(`SENT ${persisted.shortId} to ${r.email.email} (${sentId})`);
+        console.log(`SENT ${persisted.shortId} to ${toAddr} (${sentId})`);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         markSendFailed(db, persisted.draftId, msg);
