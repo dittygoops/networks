@@ -71,3 +71,33 @@ describeStance('stance-tag stripping', () => {
     expectStance(d.body).toContain('multi-agent system');
   });
 });
+
+import { describe as descSig, it as itSig, expect as expectSig } from 'vitest';
+import { generateDraft as genSig, SIGNATURE } from '../src/pipeline/draft.js';
+
+describe('signature handling', () => {
+  const mkLlm = (body: string) => ({ complete: async () => JSON.stringify({ subject: 's', body }) });
+  const input = {
+    recipient: { name: 'X', paperTitle: 'Olfaction paper' },
+    hooks: [{ selfValue: 'multi-agent system', personValue: 'olfaction', tier: 'A' as const }],
+    intent: 'connect', senderName: 'Aditya',
+  };
+
+  itSig('appends the canonical signature', async () => {
+    const d = await genSig(mkLlm('I work on multi-agent systems and olfaction.') as never, input);
+    expectSig(d.body.endsWith(SIGNATURE)).toBe(true);
+    expectSig(d.body).toContain('MS Student, Computer Science, Arizona State University');
+    expectSig(d.body).toContain('github.com/dittygoops');
+  });
+
+  itSig('does not double up when the model still signs off', async () => {
+    const d = await genSig(mkLlm('I work on multi-agent systems and olfaction.\n\nBest,\nAditya') as never, input);
+    expectSig(d.body.match(/Best,/g)?.length).toBe(1);
+    expectSig(d.body.endsWith(SIGNATURE)).toBe(true);
+  });
+
+  itSig('word count excludes the signature', async () => {
+    const d = await genSig(mkLlm('I work on multi-agent systems and olfaction.') as never, input);
+    expectSig(d.wordCount).toBeLessThan(12);
+  });
+});
