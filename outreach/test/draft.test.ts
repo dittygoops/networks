@@ -51,3 +51,23 @@ describe('generateDraft (DR3-DR5)', () => {
     expect(draft.notes.join(' ')).toMatch(/parse/i);
   });
 });
+
+import { describe as describeStance, it as itStance, expect as expectStance } from 'vitest';
+import { generateDraft as genStance } from '../src/pipeline/draft.js';
+
+describeStance('stance-tag stripping', () => {
+  itStance('removes [done]/[exploring] the model echoes into the body', async () => {
+    const llm = { complete: async () => JSON.stringify({
+      subject: 'quick question on olfaction',
+      body: 'I built a multi-agent system [done] and explored odor mapping [exploring] with olfaction sensors.',
+    }) };
+    const d = await genStance(llm as never, {
+      recipient: { name: 'X', paperTitle: 'Olfaction paper' },
+      hooks: [{ selfValue: 'multi-agent system', personValue: 'olfaction', tier: 'A' }],
+      intent: 'connect', senderName: 'Aditya',
+    });
+    expectStance(d.body).not.toContain('[done]');
+    expectStance(d.body).not.toContain('[exploring]');
+    expectStance(d.body).toContain('multi-agent system');
+  });
+});
