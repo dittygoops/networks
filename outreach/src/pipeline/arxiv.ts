@@ -74,9 +74,22 @@ export function buildPaperContext(paper: ArxivPaper, target: { name: string; ind
   };
 }
 
-export async function fetchArxivPaper(arxivId: string, opts: { fetchFn?: FetchFn } = {}): Promise<ArxivPaper> {
+export async function fetchArxivPaper(
+  arxivId: string,
+  opts: { fetchFn?: FetchFn; retryDelaysMs?: number[] } = {},
+): Promise<ArxivPaper> {
   const doFetch = opts.fetchFn ?? fetch;
-  const res = await doFetch(`${ARXIV_API}?id_list=${encodeURIComponent(arxivId)}`);
-  if (!res.ok) throw new Error(`arXiv HTTP ${res.status} for ${arxivId}`);
-  return parseArxivAtom(await res.text());
+  // arXiv rate-limits (429) and occasionally 5xxs. Retry those with backoff;
+  // fail fast on real errors (404 = bad id). arXiv asks for ~1 req / 3s.
+  const url = `${ARXIV_API}?id_list=${encodeURIComponent(arxivId)}`;
+  const delays = opts.retryDelaysMs ?? [3000, 8000, 20000];
+  for (let attempt = 0; ; attempt++) {
+    const res = await doFetch(url);
+    if (res.ok) return parseArxivAtom(await res.text());
+    const retryable = res.status === 429 || res.status >= 500;
+    if (!retryable || attempt >= delays.length) {
+      throw new Error(`arXiv HTTP ${res.status} for ${arxivId}`);
+    }
+    await new Promise((r) => setTimeout(r, delays[attempt]));
+  }
 }

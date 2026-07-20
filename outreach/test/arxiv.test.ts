@@ -1,5 +1,5 @@
-import { describe, expect, test } from 'vitest';
-import { parseArxivAtom, selectTargetAuthor, buildPaperContext } from '../src/pipeline/arxiv.js';
+import { describe, expect, test, vi } from 'vitest';
+import { parseArxivAtom, selectTargetAuthor, buildPaperContext, fetchArxivPaper } from '../src/pipeline/arxiv.js';
 
 const ATOM = `<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
@@ -31,6 +31,34 @@ describe('parseArxivAtom', () => {
     const solo = ATOM.replace(/<author><name>Georgios[\s\S]*?George Drettakis<\/name><\/author>/, '');
     const p = parseArxivAtom(solo);
     expect(p.authors).toEqual(['Bernhard Kerbl']);
+  });
+});
+
+describe('fetchArxivPaper retry', () => {
+  const ok = () => new Response(ATOM, { status: 200 });
+  const err = (s: number) => new Response('', { status: s });
+
+  test('retries on 429 then succeeds', async () => {
+    const fetchFn = vi.fn().mockResolvedValueOnce(err(429)).mockResolvedValueOnce(err(429)).mockResolvedValueOnce(ok());
+    const p = await fetchArxivPaper('2308.04079', { fetchFn: fetchFn as unknown as typeof fetch, retryDelaysMs: [0, 0, 0] });
+    expect(p.arxivId).toBe('2308.04079');
+    expect(fetchFn).toHaveBeenCalledTimes(3);
+  });
+
+  test('gives up after exhausting retries', async () => {
+    const fetchFn = vi.fn().mockResolvedValue(err(429));
+    await expect(
+      fetchArxivPaper('2308.04079', { fetchFn: fetchFn as unknown as typeof fetch, retryDelaysMs: [0] }),
+    ).rejects.toThrow('arXiv HTTP 429');
+    expect(fetchFn).toHaveBeenCalledTimes(2); // initial + 1 retry
+  });
+
+  test('does not retry a 404 (bad id)', async () => {
+    const fetchFn = vi.fn().mockResolvedValue(err(404));
+    await expect(
+      fetchArxivPaper('9999.99999', { fetchFn: fetchFn as unknown as typeof fetch, retryDelaysMs: [0, 0] }),
+    ).rejects.toThrow('arXiv HTTP 404');
+    expect(fetchFn).toHaveBeenCalledTimes(1);
   });
 });
 
