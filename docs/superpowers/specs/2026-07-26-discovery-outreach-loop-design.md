@@ -151,6 +151,31 @@ gate:
   max_messages_per_run: 3               # hard cap so the phone never floods
 ```
 
+### Seed derivation, confirmed against the live DB
+
+Research gaps are already queryable, so no new storage is needed. They are the self ontology
+facts carrying `stance='exploring'`:
+
+```sql
+SELECT facet, key, value, detail, confidence
+FROM ontology_facts
+WHERE person_id IS NULL AND stance = 'exploring';
+```
+
+As of 2026-07-26 this returns 9 facts, all `usability_tier='A'` with confidence 0.7 to 0.9.
+Query terms are built from `key`, `value`, and `detail`. The complementary `stance='done'`
+facts (41 of them) are the credibility material the drafter already uses, and are not gap
+seeds.
+
+**Gaps span multiple research threads, so queries must be derived per thread.** The current
+9 exploring facts split into two unrelated domains: 3D Gaussian Splatting and reflective
+surface modeling (Mirror-3DGS, Ref-Gaussian, depth supervised 3DGS), and olfaction
+(olfactory embedding space, learned embedding alignment, paired sensor to POM dataset,
+BME688, hierarchical mixture of experts). Deriving queries from one blended bag would emit
+incoherent cross domain queries such as "gaussian splatting olfactory embedding" that match
+nothing. The derivation clusters exploring facts into threads and emits queries per thread.
+Threads the user is not currently pursuing are suppressed with `queries.mute`.
+
 If the file is absent, pure auto derivation runs. `max_messages_per_run` is the flood guard:
 even if twenty relevant papers land, at most N iMessages go out per run. Sendable drafts over
 the cap are parked at `queued_for_message` and emitted on the next run, highest relevance
@@ -160,8 +185,8 @@ first, ahead of newly discovered candidates.
 
 A cheap first cascade, so most decisions cost nothing and only ambiguous ones spend a token:
 
-- **Stage 1, deterministic prefilter.** Compare title and abstract against research gap
-  ontology terms, by embedding cosine similarity where embeddings exist, otherwise weighted
+- **Stage 1, deterministic prefilter.** Compare title and abstract against the research gap
+  terms defined in Section 7 (`stance='exploring'` self facts), by embedding cosine similarity where embeddings exist, otherwise weighted
   term overlap. Clear keeps and clear drops resolve here. Fully unit testable with fixtures.
 - **Stage 2, LLM judge, borderline only.** For candidates inside the borderline band around
   the threshold, one small LLM call returns a score from 0 to 1 plus a one line reason, for
@@ -233,7 +258,8 @@ resolution is factual and small, so pattern assertions suffice.
 
 ## 12. Open questions
 
-None. All design decisions are settled:
+None. Gap storage was verified against the live DB (Section 7), and the remaining design
+decisions are settled:
 discovery sources are saved query, author watch, and recommend;
 the touchpoint is relevance gated auto draft;
 scheduling is pure scheduled batch with approvals drained at the next run;
