@@ -37,4 +37,16 @@ describe('deriveGapQueries', () => {
   it('returns an empty list when no gaps are recorded', () => {
     expect(deriveGapQueries(openDb(':memory:'))).toEqual([]);
   });
+
+  it('excludes exploring facts belonging to other people', () => {
+    const db = openDb(':memory:');
+    seedFact(db, 'research_area', 'olfactory embedding space', 'exploring');
+    const strangerId = db.prepare("INSERT INTO people (name) VALUES ('Some Researcher')").run()
+      .lastInsertRowid as number;
+    db.prepare(
+      `INSERT INTO ontology_facts (person_id, facet, key, value, detail, stance, confidence, usability_tier)
+       VALUES (?, 'academic', 'method', 'stranger secret method', NULL, 'exploring', 0.9, 'A')`,
+    ).run(strangerId);
+    expect(deriveGapQueries(db)).toEqual(['olfactory embedding space']);
+  });
 });
