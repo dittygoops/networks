@@ -33,6 +33,9 @@ export function recordDiscovered(db: DB, c: Candidate): void {
   ).run(c.arxivId, c.title, c.discoveredVia, c.sourceDetail);
 }
 
+// Audit-trail semantics: reason and draft_id are append-only, not clearable. Omitting
+// an arg preserves any existing value (via COALESCE), by design. This ensures the
+// columns retain complete historical record and never lose prior context.
 export function setStatus(
   db: DB,
   arxivId: string,
