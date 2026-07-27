@@ -59,6 +59,32 @@ describe('savedQuery source', () => {
     expect(await src.fetch()).toEqual([]);
     expect(fetchFn).not.toHaveBeenCalled();
   });
+
+  it('paces requests process wide, so two sources run concurrently do not burst', async () => {
+    const delayMs = 40;
+    const callTimes: number[] = [];
+    const fetchFn = vi.fn().mockImplementation(async () => {
+      callTimes.push(Date.now());
+      return new Response(EMPTY, { status: 200 });
+    });
+
+    const sourceA = createSavedQuerySource(['term a1', 'term a2'], {
+      fetchFn: fetchFn as unknown as typeof fetch,
+      delayMs,
+    });
+    const sourceB = createSavedQuerySource(['term b1', 'term b2'], {
+      fetchFn: fetchFn as unknown as typeof fetch,
+      delayMs,
+    });
+
+    await Promise.all([sourceA.fetch(), sourceB.fetch()]);
+
+    expect(callTimes).toHaveLength(4);
+    for (let i = 1; i < callTimes.length; i++) {
+      const gap = callTimes[i]! - callTimes[i - 1]!;
+      expect(gap).toBeGreaterThanOrEqual(delayMs - 10);
+    }
+  });
 });
 
 describe('parseSearchFeed', () => {

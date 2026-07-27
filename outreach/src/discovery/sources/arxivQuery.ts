@@ -44,6 +44,22 @@ export function parseSearchFeed(xml: string): Array<{ arxivId: string; title: st
 // sequentially with a delay between them.
 export const sleep = (ms: number) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
 
+// arXiv etiquette is roughly one request per three seconds. Sources run
+// concurrently (see discoverAll), so pacing has to be process wide: a per call
+// delay would let two arXiv backed sources burst against the same endpoint,
+// which is how this project earned an IP level block before.
+let arxivChain: Promise<void> = Promise.resolve();
+let lastArxivRequestAt = 0;
+
+function arxivGate(delayMs: number): Promise<void> {
+  arxivChain = arxivChain.then(async () => {
+    const wait = lastArxivRequestAt + delayMs - Date.now();
+    if (wait > 0) await sleep(wait);
+    lastArxivRequestAt = Date.now();
+  });
+  return arxivChain;
+}
+
 export async function queryArxivFeed(
   prefix: 'all' | 'au',
   terms: string[],
@@ -56,9 +72,8 @@ export async function queryArxivFeed(
   const delayMs = opts.delayMs ?? 3000;
 
   const out: Candidate[] = [];
-  let i = 0;
   for (const term of terms) {
-    if (i > 0) await sleep(delayMs);
+    await arxivGate(delayMs);
     try {
       const url =
         `http://export.arxiv.org/api/query?search_query=${prefix}:${encodeURIComponent(`"${term}"`)}` +
@@ -76,8 +91,6 @@ export async function queryArxivFeed(
       }
     } catch {
       continue;
-    } finally {
-      i++;
     }
   }
   return out;
