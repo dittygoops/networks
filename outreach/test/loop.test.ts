@@ -201,6 +201,112 @@ describe('runLoop approvals', () => {
     expect(row.status).toBe('skipped');
   });
 
+  it('marks a candidate unsendable and keeps the run going when gateCandidate throws', async () => {
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'Someone', email: 'someone@uni.edu' });
+    const { deps, channel } = baseDeps(db, {
+      sources: [source([cand('2601.00020', 'Olfactory Embedding Space Sensors')])],
+      processPaper: vi.fn().mockResolvedValue(resolvedResult('2601.00020', pid)),
+    });
+    const original = deps.generateDraft as ReturnType<typeof vi.fn>;
+    original.mockRejectedValueOnce(new Error('llm outage'));
+    const summary = await runLoop(deps, { dryRun: false });
+    expect(summary.unsendable).toBe(1);
+    expect(summary.errors.some((e) => e.includes('llm outage'))).toBe(true);
+    const row = db.prepare('SELECT status, reason FROM seen_papers WHERE arxiv_id = ?').get('2601.00020') as {
+      status: string;
+      reason: string;
+    };
+    expect(row.status).toBe('drafted_unsendable');
+    expect(row.reason).toContain('llm outage');
+    expect(channel.notices.length).toBeGreaterThan(0);
+    expect(channel.notices[channel.notices.length - 1]).toContain('errors:');
+  });
+
+  it('still processes a second candidate after an earlier one throws', async () => {
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'Someone', email: 'someone@uni.edu' });
+    const cands = ['2601.00021', '2601.00022'].map((id) => cand(id, 'Olfactory Embedding Space Sensors'));
+    const generateDraft = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('llm outage'))
+      .mockResolvedValue(groundedDraft);
+    const { deps } = baseDeps(db, {
+      sources: [source(cands)],
+      processPaper: vi.fn(async (_d: unknown, id: string) => resolvedResult(id, pid)),
+      generateDraft,
+    });
+    const summary = await runLoop(deps, { dryRun: false });
+    expect(summary.unsendable).toBe(1);
+    expect(summary.messaged).toBe(1);
+    const rows = db.prepare('SELECT arxiv_id AS arxivId, status FROM seen_papers ORDER BY arxiv_id').all() as {
+      arxivId: string;
+      status: string;
+    }[];
+    expect(rows.find((r) => r.arxivId === '2601.00021')?.status).toBe('drafted_unsendable');
+    expect(rows.find((r) => r.arxivId === '2601.00022')?.status).toBe('messaged');
+  });
+
+  it('queues a draft for retry when sendDraftMessage rejects while messaging a fresh candidate', async () => {
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'Someone', email: 'someone@uni.edu' });
+    const { deps, channel } = baseDeps(db, {
+      sources: [source([cand('2601.00023', 'Olfactory Embedding Space Sensors')])],
+      processPaper: vi.fn().mockResolvedValue(resolvedResult('2601.00023', pid)),
+    });
+    channel.sendDraftMessage = vi.fn().mockRejectedValueOnce(new Error('imessage down'));
+    const summary = await runLoop(deps, { dryRun: false });
+    expect(summary.messaged).toBe(0);
+    expect(summary.queued).toBe(1);
+    const row = db.prepare('SELECT status, reason FROM seen_papers WHERE arxiv_id = ?').get('2601.00023') as {
+      status: string;
+      reason: string;
+    };
+    expect(row.status).toBe('queued_for_message');
+    expect(row.reason).toContain('imessage down');
+  });
+
+  it('retries an approved-but-unsent draft on the next run', async () => {
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'Someone', email: 'someone@uni.edu' });
+    const p = persistDraft(db, {
+      personId: pid,
+      paperArxivId: '2601.00024',
+      paperTitle: 'A Paper',
+      intent: 'seeking direction',
+      draftInput,
+      draft: groundedDraft,
+      contextJson: {},
+    });
+    db.prepare("UPDATE drafts SET status = 'approved' WHERE id = ?").run(p.draftId);
+    const { deps } = baseDeps(db);
+    const summary = await runLoop(deps, { dryRun: false });
+    expect(deps.sender.send).toHaveBeenCalledTimes(1);
+    expect(summary.sent).toBe(1);
+    const row = db.prepare('SELECT status FROM drafts WHERE id = ?').get(p.draftId) as { status: string };
+    expect(row.status).toBe('sent');
+  });
+
+  it('does not retry an approved-but-unsent draft under dry run', async () => {
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'Someone', email: 'someone@uni.edu' });
+    const p = persistDraft(db, {
+      personId: pid,
+      paperArxivId: '2601.00025',
+      paperTitle: 'A Paper',
+      intent: 'seeking direction',
+      draftInput,
+      draft: groundedDraft,
+      contextJson: {},
+    });
+    db.prepare("UPDATE drafts SET status = 'approved' WHERE id = ?").run(p.draftId);
+    const { deps } = baseDeps(db);
+    await runLoop(deps, { dryRun: true });
+    expect(deps.sender.send).not.toHaveBeenCalled();
+    const row = db.prepare('SELECT status FROM drafts WHERE id = ?').get(p.draftId) as { status: string };
+    expect(row.status).toBe('approved');
+  });
+
   it('answers an edit reply with a not-supported notice and does not send', async () => {
     const db = openDb(':memory:');
     const pid = upsertPerson(db, { name: 'Someone', email: 'someone@uni.edu' });

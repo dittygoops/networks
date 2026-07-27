@@ -141,9 +141,16 @@ async function emit(
     summary.queued++;
     return;
   }
-  await deps.channel.sendDraftMessage({ shortId, subject, body, to, personName });
-  setStatus(deps.db, c.arxivId, 'messaged');
-  summary.messaged++;
+  try {
+    await deps.channel.sendDraftMessage({ shortId, subject, body, to, personName });
+    setStatus(deps.db, c.arxivId, 'messaged');
+    summary.messaged++;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    setStatus(deps.db, c.arxivId, 'queued_for_message', `message failed, queued for retry: ${msg}`);
+    summary.queued++;
+    summary.errors.push(`${c.arxivId}: ${msg}`);
+  }
 }
 
 async function processCandidate(
@@ -152,66 +159,114 @@ async function processCandidate(
   summary: LoopSummary,
   c: Candidate,
 ): Promise<void> {
-  const verdict = await gateCandidate(c, deps.terms, deps.config.gate, deps.llm);
-  setRelevance(deps.db, c.arxivId, verdict.score);
-  if (!verdict.keep) {
-    setStatus(deps.db, c.arxivId, 'filtered_low_relevance', verdict.reason);
-    summary.filtered++;
-    return;
-  }
-
-  let result: OrchestrateResult;
   try {
-    result = await deps.processPaper(deps.orchestrateDeps, c.arxivId);
+    const verdict = await gateCandidate(c, deps.terms, deps.config.gate, deps.llm);
+    setRelevance(deps.db, c.arxivId, verdict.score);
+    if (!verdict.keep) {
+      setStatus(deps.db, c.arxivId, 'filtered_low_relevance', verdict.reason);
+      summary.filtered++;
+      return;
+    }
+
+    let result: OrchestrateResult;
+    try {
+      result = await deps.processPaper(deps.orchestrateDeps, c.arxivId);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setStatus(deps.db, c.arxivId, 'drafted_unsendable', `pipeline failed: ${msg}`);
+      summary.unsendable++;
+      summary.errors.push(`${c.arxivId}: ${msg}`);
+      return;
+    }
+
+    if (!result.personId) {
+      setStatus(deps.db, c.arxivId, 'drafted_unsendable', 'identity unconfirmed');
+      summary.unsendable++;
+      return;
+    }
+    if (!result.email) {
+      setStatus(deps.db, c.arxivId, 'drafted_unsendable', 'no email resolved');
+      summary.unsendable++;
+      return;
+    }
+    if (result.noStrongHook || result.hooks.length === 0) {
+      setStatus(deps.db, c.arxivId, 'drafted_unsendable', 'no grounded hook');
+      summary.unsendable++;
+      return;
+    }
+    const prior = priorThreads(deps.db, result.personId);
+    if (prior.length > 0) {
+      setStatus(deps.db, c.arxivId, 'drafted_unsendable', `prior thread exists (${prior[0]?.shortId ?? ''})`);
+      summary.unsendable++;
+      return;
+    }
+
+    const input = deps.buildDraftInput(result);
+    const draft = await deps.generateDraft(deps.llm as LLMClient, input);
+    if (!draft.grounded) {
+      setStatus(deps.db, c.arxivId, 'drafted_unsendable', `grounding failed: ${draft.notes.join('; ')}`);
+      summary.unsendable++;
+      return;
+    }
+
+    const persisted = persistDraft(deps.db, {
+      personId: result.personId,
+      paperArxivId: result.arxivId,
+      paperTitle: result.paperTitle,
+      intent: input.intent,
+      draftInput: input,
+      draft,
+      contextJson: { discoveredVia: c.discoveredVia, sourceDetail: c.sourceDetail, relevance: verdict.score },
+    });
+    setStatus(deps.db, c.arxivId, 'discovered', verdict.reason, persisted.draftId);
+    await emit(deps, opts, summary, c, persisted.shortId, draft.subject, draft.body, result.email.email, result.target);
   } catch (e) {
+    // gateCandidate or generateDraft (or anything else unexpected) threw. One
+    // bad candidate must never sink the whole run (F1: survive partial failure).
     const msg = e instanceof Error ? e.message : String(e);
-    setStatus(deps.db, c.arxivId, 'drafted_unsendable', `pipeline failed: ${msg}`);
+    setStatus(deps.db, c.arxivId, 'drafted_unsendable', `pipeline error: ${msg}`);
     summary.unsendable++;
     summary.errors.push(`${c.arxivId}: ${msg}`);
-    return;
   }
+}
 
-  if (!result.personId) {
-    setStatus(deps.db, c.arxivId, 'drafted_unsendable', 'identity unconfirmed');
-    summary.unsendable++;
-    return;
-  }
-  if (!result.email) {
-    setStatus(deps.db, c.arxivId, 'drafted_unsendable', 'no email resolved');
-    summary.unsendable++;
-    return;
-  }
-  if (result.noStrongHook || result.hooks.length === 0) {
-    setStatus(deps.db, c.arxivId, 'drafted_unsendable', 'no grounded hook');
-    summary.unsendable++;
-    return;
-  }
-  const prior = priorThreads(deps.db, result.personId);
-  if (prior.length > 0) {
-    setStatus(deps.db, c.arxivId, 'drafted_unsendable', `prior thread exists (${prior[0]?.shortId ?? ''})`);
-    summary.unsendable++;
-    return;
-  }
+// Retries drafts already at status 'approved' (explicit user approval already
+// happened; this never promotes anything into that status) whose previous
+// send attempt failed. markSendFailed leaves a draft 'approved' precisely so
+// this step can heal it; without this nothing ever retried it (Fix 3).
+async function retryApprovedUnsent(deps: LoopDeps, summary: LoopSummary): Promise<void> {
+  const rows = deps.db
+    .prepare(
+      `SELECT d.id AS draftId, d.short_id AS shortId, d.person_id AS personId, r.subject AS subject, r.body AS body
+       FROM drafts d JOIN revisions r ON r.id = d.sendable_revision_id
+       WHERE d.status = 'approved' AND d.sendable_revision_id IS NOT NULL`,
+    )
+    .all() as { draftId: number; shortId: string; personId: number; subject: string; body: string }[];
 
-  const input = deps.buildDraftInput(result);
-  const draft = await deps.generateDraft(deps.llm as LLMClient, input);
-  if (!draft.grounded) {
-    setStatus(deps.db, c.arxivId, 'drafted_unsendable', `grounding failed: ${draft.notes.join('; ')}`);
-    summary.unsendable++;
-    return;
+  for (const row of rows) {
+    const person = getPerson(deps.db, row.personId);
+    if (!person?.email) {
+      await deps.channel.notify(`${row.shortId} has no email on record.`);
+      continue;
+    }
+    try {
+      const { sentId } = await deps.sender.send({
+        to: person.email,
+        from: deps.senderEmail ?? process.env.SENDER_EMAIL ?? 'apgupta3@asu.edu',
+        subject: row.subject,
+        body: row.body,
+        draftShortId: row.shortId,
+      });
+      markSent(deps.db, row.draftId, sentId);
+      summary.sent++;
+      await deps.channel.notify(`${row.shortId} sent to ${person.email}.`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      markSendFailed(deps.db, row.draftId, msg);
+      summary.errors.push(`${row.shortId}: retry send failed: ${msg}`);
+      await deps.channel.notify(`${row.shortId} failed to send: ${msg}`);
+    }
   }
-
-  const persisted = persistDraft(deps.db, {
-    personId: result.personId,
-    paperArxivId: result.arxivId,
-    paperTitle: result.paperTitle,
-    intent: input.intent,
-    draftInput: input,
-    draft,
-    contextJson: { discoveredVia: c.discoveredVia, sourceDetail: c.sourceDetail, relevance: verdict.score },
-  });
-  setStatus(deps.db, c.arxivId, 'discovered', verdict.reason, persisted.draftId);
-  await emit(deps, opts, summary, c, persisted.shortId, draft.subject, draft.body, result.email.email, result.target);
 }
 
 export async function runLoop(deps: LoopDeps, opts: LoopOptions): Promise<LoopSummary> {
@@ -226,51 +281,84 @@ export async function runLoop(deps: LoopDeps, opts: LoopOptions): Promise<LoopSu
     errors: [],
   };
 
-  await drainApprovals(deps, opts, summary);
+  try {
+    await drainApprovals(deps, opts, summary);
 
-  // Queued drafts from earlier runs go out before anything newly discovered.
-  if (!opts.dryRun) {
-    for (const q of getQueued(deps.db, deps.config.gate.maxMessagesPerRun)) {
-      if (summary.messaged >= deps.config.gate.maxMessagesPerRun) break;
-      const row = deps.db
-        .prepare(
-          `SELECT d.short_id AS shortId, d.person_id AS personId, r.subject AS subject, r.body AS body
-           FROM seen_papers s JOIN drafts d ON d.id = s.draft_id
-           JOIN revisions r ON r.id = d.sendable_revision_id
-           WHERE s.arxiv_id = ?`,
-        )
-        .get(q.arxivId) as { shortId: string; personId: number; subject: string; body: string } | undefined;
-      if (!row) continue;
-      const person = getPerson(deps.db, row.personId);
-      if (!person?.email) continue;
-      await deps.channel.sendDraftMessage({
-        shortId: row.shortId,
-        subject: row.subject,
-        body: row.body,
-        to: person.email,
-        personName: person.name,
-      });
-      setStatus(deps.db, q.arxivId, 'messaged');
-      summary.messaged++;
+    // Retry approved-but-unsent drafts before anything else (F3): the user's
+    // approval already happened, so a transient send failure must heal here,
+    // not wait on a step that only runs for newly discovered/queued work.
+    // Never runs in a dry run: a dry run must send nothing.
+    if (!opts.dryRun) {
+      try {
+        await retryApprovedUnsent(deps, summary);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        summary.errors.push(`retry approved unsent failed: ${msg}`);
+      }
+    }
+
+    // Queued drafts from earlier runs go out before anything newly discovered.
+    if (!opts.dryRun) {
+      for (const q of getQueued(deps.db, deps.config.gate.maxMessagesPerRun)) {
+        if (summary.messaged >= deps.config.gate.maxMessagesPerRun) break;
+        const row = deps.db
+          .prepare(
+            `SELECT d.short_id AS shortId, d.person_id AS personId, r.subject AS subject, r.body AS body
+             FROM seen_papers s JOIN drafts d ON d.id = s.draft_id
+             JOIN revisions r ON r.id = d.sendable_revision_id
+             WHERE s.arxiv_id = ?`,
+          )
+          .get(q.arxivId) as { shortId: string; personId: number; subject: string; body: string } | undefined;
+        if (!row) continue;
+        const person = getPerson(deps.db, row.personId);
+        if (!person?.email) continue;
+        try {
+          await deps.channel.sendDraftMessage({
+            shortId: row.shortId,
+            subject: row.subject,
+            body: row.body,
+            to: person.email,
+            personName: person.name,
+          });
+          setStatus(deps.db, q.arxivId, 'messaged');
+          summary.messaged++;
+        } catch (e) {
+          // Row stays at queued_for_message (no setStatus above); the next
+          // run's flush loop will pick it up again (F2).
+          const msg = e instanceof Error ? e.message : String(e);
+          summary.errors.push(`${q.arxivId}: ${msg}`);
+        }
+      }
+    }
+
+    const discovered = await discoverAll(deps.sources);
+    summary.errors.push(...discovered.errors);
+
+    const fresh = filterUnseen(deps.db, discovered.candidates);
+    summary.seen = fresh.length;
+    for (const c of fresh) recordDiscovered(deps.db, c);
+
+    for (const c of fresh) {
+      await processCandidate(deps, opts, summary, c);
+    }
+  } catch (e) {
+    // Nothing above should throw anymore (each stage catches its own
+    // failures), but if something unexpected still escapes, the run must
+    // still complete and still notify (F1) rather than reject silently.
+    const msg = e instanceof Error ? e.message : String(e);
+    summary.errors.push(`run failed: ${msg}`);
+  } finally {
+    const line =
+      `outreach loop${opts.dryRun ? ' (dry run)' : ''}: seen ${summary.seen}, filtered ${summary.filtered}, ` +
+      `unsendable ${summary.unsendable}, messaged ${summary.messaged}, queued ${summary.queued}, sent ${summary.sent}` +
+      (summary.errors.length ? `, errors: ${summary.errors.join(' | ')}` : '');
+    try {
+      await deps.channel.notify(line);
+    } catch {
+      // A notify transport failure must not mask whatever the real problem
+      // was above; swallow it here.
     }
   }
-
-  const discovered = await discoverAll(deps.sources);
-  summary.errors.push(...discovered.errors);
-
-  const fresh = filterUnseen(deps.db, discovered.candidates);
-  summary.seen = fresh.length;
-  for (const c of fresh) recordDiscovered(deps.db, c);
-
-  for (const c of fresh) {
-    await processCandidate(deps, opts, summary, c);
-  }
-
-  const line =
-    `outreach loop${opts.dryRun ? ' (dry run)' : ''}: seen ${summary.seen}, filtered ${summary.filtered}, ` +
-    `unsendable ${summary.unsendable}, messaged ${summary.messaged}, queued ${summary.queued}, sent ${summary.sent}` +
-    (summary.errors.length ? `, errors: ${summary.errors.join(' | ')}` : '');
-  await deps.channel.notify(line);
 
   return summary;
 }
