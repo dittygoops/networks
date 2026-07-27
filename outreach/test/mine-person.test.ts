@@ -154,6 +154,78 @@ describe('minePerson (D4/D5b/D6a)', () => {
     expect(hobbies.every((f) => f.tier === 'B')).toBe(true);
   });
 
+  test('admits a github.com profile page whose username matches the author name (D5b GitHub exception)', async () => {
+    const gh = 'https://github.com/bernhardkerbl';
+    const { client, calls } = makeLLM(() =>
+      JSON.stringify([{ facet: 'interest', key: 'oss_project', value: 'gaussian-splatting-cuda', confidence: 0.8, proposedTier: 'A' }]),
+    );
+    const deps = makeDeps({
+      llm: client,
+      searchResults: [{ url: gh, title: 'bernhardkerbl (Bernhard Kerbl)', content: '' }],
+      fetched: { [gh]: 'Bernhard Kerbl on GitHub.' },
+    });
+
+    const { facts } = await minePerson(deps, resolution, raw);
+
+    expect(calls.extract).toHaveLength(1); // admitted, not gated out
+    const mined = facts.find((f) => f.sourceUrl === gh && f.key === 'oss_project');
+    expect(mined).toBeDefined();
+    // Tier cap: even though the LLM proposed A, GitHub-admitted pages cap at B
+    // so they can never be the sole basis for a cold email.
+    expect(mined!.tier).toBe('B');
+  });
+
+  test('rejects a github.com profile page whose username does not match the author name (homonym guard)', async () => {
+    const gh = 'https://github.com/some-other-person';
+    const { client, calls } = makeLLM(() =>
+      JSON.stringify([{ facet: 'interest', key: 'oss_project', value: 'unrelated-repo', confidence: 0.8, proposedTier: 'A' }]),
+    );
+    const deps = makeDeps({
+      llm: client,
+      searchResults: [{ url: gh, title: 'some-other-person', content: '' }],
+      fetched: { [gh]: 'Not Bernhard Kerbl.' },
+    });
+
+    const { facts } = await minePerson(deps, resolution, raw);
+
+    expect(calls.extract).toHaveLength(0); // gated out, never sent to the LLM
+    expect(facts.some((f) => f.sourceUrl === gh)).toBe(false);
+  });
+
+  test('rejects a non-profile github.com URL even when it names the author (path must be a single segment)', async () => {
+    const gh = 'https://github.com/bernhardkerbl/gaussian-splatting-cuda/issues/1';
+    const { client, calls } = makeLLM(() =>
+      JSON.stringify([{ facet: 'interest', key: 'oss_project', value: 'gaussian-splatting-cuda', confidence: 0.8, proposedTier: 'A' }]),
+    );
+    const deps = makeDeps({
+      llm: client,
+      searchResults: [{ url: gh, title: 'Issue #1 - bernhardkerbl/gaussian-splatting-cuda', content: '' }],
+      fetched: { [gh]: 'An issue thread.' },
+    });
+
+    const { facts } = await minePerson(deps, resolution, raw);
+
+    expect(calls.extract).toHaveLength(0);
+    expect(facts.some((f) => f.sourceUrl === gh)).toBe(false);
+  });
+
+  test('still rejects an unrelated off-institution, non-github domain (randomblog.com)', async () => {
+    const blog = 'https://randomblog.com/about-bernhard-kerbl';
+    const { client, calls } = makeLLM(() =>
+      JSON.stringify([{ facet: 'trajectory', key: 'role', value: 'Blogger', confidence: 0.8, proposedTier: 'A' }]),
+    );
+    const deps = makeDeps({
+      llm: client,
+      searchResults: [{ url: blog, title: 'Bernhard Kerbl', content: '' }],
+      fetched: { [blog]: 'A post about Bernhard Kerbl.' },
+    });
+
+    const { facts } = await minePerson(deps, resolution, raw);
+
+    expect(calls.extract).toHaveLength(0);
+    expect(facts.some((f) => f.sourceUrl === blog)).toBe(false);
+  });
+
   test('retries once on JSON parse failure then skips the page without crashing', async () => {
     const talk = 'https://www.cg.tuwien.ac.at/talks/kerbl';
     const { client, calls } = makeLLM(() => 'not json at all {');
