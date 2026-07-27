@@ -31,8 +31,11 @@ export function parseSearchFeed(xml: string): Array<{ arxivId: string; title: st
   const feed = parser.parse(xml)?.feed;
   return asArray<AtomEntry>(feed?.entry)
     .map((e) => {
-      const m = String(e.id ?? '').match(/abs\/([^v]+)/);
-      return m ? { arxivId: m[1], title: clean(e.title), abstract: clean(e.summary) } : null;
+      const idUrl = String(e.id ?? '');
+      const rawId = idUrl.split('/abs/')[1];
+      if (rawId === undefined) return null;
+      const arxivId = rawId.replace(/v\d+$/, '');
+      return { arxivId, title: clean(e.title), abstract: clean(e.summary) };
     })
     .filter((x): x is { arxivId: string; title: string; abstract: string } => x !== null);
 }
