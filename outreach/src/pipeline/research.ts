@@ -449,10 +449,14 @@ async function minePersonalFacts(
 ): Promise<void> {
   const name = author.displayName;
   const affiliation = currentAffiliation(raw) ?? '';
+  // No github query: the D5b domain gate admits only pages on the author's
+  // institution domain, so a github.com result can never survive it. Matching
+  // GitHub by username was tried and reverted: usernames are pseudonymous, so
+  // it both missed real profiles and matched same-surname strangers. Re-add
+  // this query only alongside an identity check that does not guess from a name.
   const queries = [
     `"${name}" ${affiliation} homepage`.replace(/\s+/g, ' ').trim(),
     `"${name}" blog OR talk`,
-    `"${name}" github`,
   ];
 
   const seen = new Set<string>();

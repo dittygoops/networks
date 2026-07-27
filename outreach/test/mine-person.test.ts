@@ -67,14 +67,17 @@ function makeDeps(opts: {
 }
 
 describe('minePerson (D4/D5b/D6a)', () => {
-  test('includes deterministic OpenAlex facts and runs the 3 personal searches', async () => {
+  // Two searches, not three: the github query was removed because the D5b gate
+  // admits only institution-domain pages, so its results were always discarded.
+  test('includes deterministic OpenAlex facts and runs the 2 personal searches', async () => {
     const searchLog: string[] = [];
     const { client } = makeLLM(() => '[]');
     const deps = makeDeps({ llm: client, searchResults: [], fetched: {}, searchLog });
 
     const { facts, profileSummary } = await minePerson(deps, resolution, raw);
 
-    expect(searchLog).toHaveLength(3);
+    expect(searchLog).toHaveLength(2);
+    expect(searchLog.some((q) => q.includes('github'))).toBe(false);
     expect(facts.some((f) => f.facet === 'trajectory' && f.key === 'institution' && f.value === 'TU Wien')).toBe(true);
     expect(profileSummary).toBe('A short profile.');
   });
