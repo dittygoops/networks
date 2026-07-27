@@ -1,0 +1,19 @@
+# Discovery overrides. Auto derivation runs on top of this: queries come from
+# your stance='exploring' self ontology facts, authors from people you have
+# already emailed, seeds from papers you have drafted against.
+#
+# Muting 3D Gaussian Splatting: those exploring facts are still true, but
+# olfaction is the active outreach thread as of 2026-07-26. Delete the mute
+# block to start chasing 3DGS again.
+queries:
+  mute:
+    - "gaussian splatting"
+    - "3DGS"
+    - "Mirror-3DGS"
+    - "Ref-Gaussian"
+
+gate:
+  threshold: 0.6
+  borderline_band: 0.1
+  # Start conservative. Raise once a few real runs have landed on the phone.
+  max_messages_per_run: 3
