@@ -77,4 +77,43 @@ describe('gateCandidate', () => {
     const v = await gateCandidate(borderline, TERMS, GATE);
     expect(v.score).toBeCloseTo(scoreOverlap(borderline, TERMS), 5);
   });
+
+  it('names the term that actually drove a fractional-match keep, never an unrelated term', async () => {
+    const wirelessSensor = cand('Sensor Networks and Array Design', 'routing in wireless sensor networks');
+    const v = await gateCandidate(wirelessSensor, TERMS, GATE);
+    expect(v.keep).toBe(true);
+    expect(v.reason).not.toContain('olfactory');
+    expect(v.reason).toContain('gas sensor array');
+  });
+
+  it('says "matches gap term" (not "partially") when the whole phrase appears verbatim', async () => {
+    const exact = cand('Olfactory Embedding Space for Robots');
+    const v = await gateCandidate(exact, TERMS, GATE);
+    expect(v.keep).toBe(true);
+    expect(v.reason).toContain('matches gap term:');
+    expect(v.reason).not.toContain('partially');
+    expect(v.reason).toContain('olfactory embedding space');
+  });
+});
+
+describe('gateCandidate judge score range check', () => {
+  it('falls back to the deterministic score when the judge returns a score above 1', async () => {
+    const llm = llmReturning('{"score":42,"reason":"very relevant"}');
+    const borderline = cand('Embedding Space Sensor Study', 'partial mention of gas sensor only');
+    const raw = scoreOverlap(borderline, TERMS);
+    const v = await gateCandidate(borderline, TERMS, GATE, llm);
+    expect(v.score).toBeCloseTo(raw, 5);
+    expect(v.score).not.toBe(42);
+    expect(v.reason).toContain('judge unavailable');
+  });
+
+  it('falls back to the deterministic score when the judge returns a negative score', async () => {
+    const llm = llmReturning('{"score":-5,"reason":"not relevant"}');
+    const borderline = cand('Embedding Space Sensor Study', 'partial mention of gas sensor only');
+    const raw = scoreOverlap(borderline, TERMS);
+    const v = await gateCandidate(borderline, TERMS, GATE, llm);
+    expect(v.score).toBeCloseTo(raw, 5);
+    expect(v.score).not.toBe(-5);
+    expect(v.reason).toContain('judge unavailable');
+  });
 });

@@ -15,28 +15,48 @@ function haystack(c: Candidate): string {
   return `${c.title} ${c.abstract ?? ''}`.toLowerCase();
 }
 
+export interface TermMatch {
+  score: number;
+  term: string | null;
+  exact: boolean;
+}
+
 // Fraction of gap terms present in the title or abstract, weighted so that a
-// single strong multi-word match already scores well.
-export function scoreOverlap(c: Candidate, terms: string[]): number {
-  if (terms.length === 0) return 0;
+// single strong multi-word match already scores well. Tracks which term
+// actually produced the best score, and whether that was an exact whole
+// phrase match or a partial word match, so callers never have to guess.
+export function bestTermMatch(c: Candidate, terms: string[]): TermMatch {
+  if (terms.length === 0) return { score: 0, term: null, exact: false };
   const hay = haystack(c);
-  let best = 0;
-  let hits = 0;
+  let bestScore = 0;
+  let bestTerm: string | null = null;
+  let bestExact = false;
   for (const term of terms) {
     const t = term.toLowerCase().trim();
     if (!t) continue;
     if (hay.includes(t)) {
-      hits++;
-      best = Math.max(best, 1);
+      if (!bestExact) {
+        bestScore = 1;
+        bestTerm = term;
+        bestExact = true;
+      }
       continue;
     }
+    if (bestExact) continue;
     const words = t.split(/\s+/).filter((w) => w.length > 3);
     if (!words.length) continue;
     const matched = words.filter((w) => hay.includes(w)).length;
-    best = Math.max(best, matched / words.length);
+    const fraction = matched / words.length;
+    if (fraction > bestScore) {
+      bestScore = fraction;
+      bestTerm = term;
+    }
   }
-  if (hits > 0) return 1;
-  return Math.min(1, best);
+  return { score: Math.min(1, bestScore), term: bestTerm, exact: bestExact };
+}
+
+export function scoreOverlap(c: Candidate, terms: string[]): number {
+  return bestTermMatch(c, terms).score;
 }
 
 export function matchedTerms(c: Candidate, terms: string[]): string[] {
@@ -66,12 +86,16 @@ export async function gateCandidate(
   const high = gate.threshold + gate.borderlineBand;
 
   if (raw >= high) {
-    const hit = matchedTerms(c, terms);
-    return {
-      keep: true,
-      score: raw,
-      reason: `matches gap term: ${hit.length ? hit.join(', ') : terms[0]}`,
-    };
+    const match = bestTermMatch(c, terms);
+    let reason: string;
+    if (match.term) {
+      reason = match.exact
+        ? `matches gap term: ${match.term}`
+        : `partially matches gap term: ${match.term}`;
+    } else {
+      reason = `overlap ${raw.toFixed(2)} at or above threshold ${gate.threshold}`;
+    }
+    return { keep: true, score: raw, reason };
   }
   if (raw <= low) {
     return { keep: false, score: raw, reason: `overlap ${raw.toFixed(2)} below threshold ${gate.threshold}` };
@@ -90,7 +114,14 @@ export async function gateCandidate(
     const match = text.match(/\{[\s\S]*\}/);
     if (!match) throw new Error('no json');
     const parsed = JSON.parse(match[0]) as JudgeReply;
-    if (typeof parsed.score !== 'number' || Number.isNaN(parsed.score)) throw new Error('no score');
+    if (
+      typeof parsed.score !== 'number' ||
+      Number.isNaN(parsed.score) ||
+      parsed.score < 0 ||
+      parsed.score > 1
+    ) {
+      throw new Error('score out of range');
+    }
     return {
       keep: parsed.score >= gate.threshold,
       score: parsed.score,
