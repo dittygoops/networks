@@ -121,14 +121,24 @@ export interface PriorThread {
 }
 
 // F9 hard rule: never email a person with an existing thread without explicit
-// override. Sent (any variant) and approved-but-unsent drafts both count.
-export function priorThreads(db: DB, personId: number): PriorThread[] {
+// override. Sent (any variant), approved-but-unsent, and drafts still pending
+// approval all count: a pending draft is an existing thread, so a second
+// candidate for the same person within one run (the normal output of an
+// author-watch source, which queries by author) must see it and be skipped,
+// not draft and message a second cold email before the first is even decided.
+//
+// excludeDraftId lets a caller that persists the draft it is checking about
+// (the CLI's add flow does this, unlike the loop's processCandidate which
+// checks before persisting) leave its own just-created awaiting_approval row
+// out of the count, so it does not spuriously match itself.
+export function priorThreads(db: DB, personId: number, excludeDraftId?: number): PriorThread[] {
   return db
     .prepare(
       `SELECT short_id AS shortId, status, paper_title AS paperTitle, created_at AS createdAt
        FROM drafts
-       WHERE person_id = ? AND (status LIKE 'sent%' OR status = 'approved')
+       WHERE person_id = ? AND (status LIKE 'sent%' OR status = 'approved' OR status = 'awaiting_approval')
+         AND (? IS NULL OR id != ?)
        ORDER BY id`,
     )
-    .all(personId) as PriorThread[];
+    .all(personId, excludeDraftId ?? null, excludeDraftId ?? null) as PriorThread[];
 }

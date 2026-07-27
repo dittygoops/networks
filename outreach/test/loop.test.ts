@@ -106,12 +106,17 @@ describe('runLoop discovery', () => {
 
   it('queues sendable drafts beyond the per-run cap', async () => {
     const db = openDb(':memory:');
-    const pid = upsertPerson(db, { name: 'Someone', email: 'someone@uni.edu' });
+    // Two distinct people, not one: this test is about the per-run cap, and
+    // the awaiting_approval prior-thread guard would otherwise skip the
+    // second candidate for an unrelated reason if it shared a person with
+    // the first.
+    const pid1 = upsertPerson(db, { name: 'Someone', email: 'someone@uni.edu' });
+    const pid2 = upsertPerson(db, { name: 'Someone Else', email: 'someone-else@uni.edu' });
     const cands = ['2601.00010', '2601.00011'].map((id) => cand(id, 'Olfactory Embedding Space Sensors'));
     const { deps, channel } = baseDeps(db, {
       config: { queries: [], authors: [], seeds: [], gate: { ...GATE, maxMessagesPerRun: 1 } },
       sources: [source(cands)],
-      processPaper: vi.fn(async (_d: unknown, id: string) => resolvedResult(id, pid)),
+      processPaper: vi.fn(async (_d: unknown, id: string) => resolvedResult(id, id === '2601.00010' ? pid1 : pid2)),
     });
     const summary = await runLoop(deps, { dryRun: false });
     expect(summary.messaged).toBe(1);
@@ -156,6 +161,34 @@ describe('runLoop discovery', () => {
     expect(channel.sent).toHaveLength(0);
     const row = db.prepare('SELECT reason FROM seen_papers WHERE arxiv_id = ?').get('2601.00005') as { reason: string };
     expect(row.reason).toContain('prior thread');
+  });
+
+  it('drafts and messages only one of two candidates that share a person within one run', async () => {
+    // The author-watch source's normal output is two papers by the same
+    // author. Without the awaiting_approval guard, both would clear
+    // priorThreads (neither is sent/approved yet) and both would be
+    // messaged, sending that person two cold emails.
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'Someone', email: 'someone@uni.edu' });
+    const cands = ['2601.00030', '2601.00031'].map((id) => cand(id, 'Olfactory Embedding Space Sensors'));
+    const { deps, channel } = baseDeps(db, {
+      sources: [source(cands)],
+      processPaper: vi.fn(async (_d: unknown, id: string) => resolvedResult(id, pid)),
+    });
+    const summary = await runLoop(deps, { dryRun: false });
+    expect(summary.messaged).toBe(1);
+    expect(summary.unsendable).toBe(1);
+    expect(channel.sent).toHaveLength(1);
+    const rows = db.prepare('SELECT arxiv_id AS arxivId, status, reason FROM seen_papers ORDER BY arxiv_id').all() as {
+      arxivId: string;
+      status: string;
+      reason: string | null;
+    }[];
+    const first = rows.find((r) => r.arxivId === '2601.00030');
+    const second = rows.find((r) => r.arxivId === '2601.00031');
+    expect(first?.status).toBe('messaged');
+    expect(second?.status).toBe('drafted_unsendable');
+    expect(second?.reason).toContain('prior thread');
   });
 });
 

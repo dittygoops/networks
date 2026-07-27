@@ -48,73 +48,105 @@ export interface LoopSummary {
   errors: string[];
 }
 
+// A parsed short id only proves the text was well formed, not that the draft
+// it names exists. decisions.draft_id and draft_events.draft_id both
+// REFERENCES drafts(id) with foreign_keys = ON, and INSERT OR IGNORE does NOT
+// suppress a foreign key violation, so passing an unknown id straight through
+// to decide/logEvent throws and, uncaught, would take the whole batch down
+// with it. Check existence first and report unknown ids without throwing.
+function draftExists(db: DB, draftId: number): boolean {
+  return db.prepare('SELECT 1 FROM drafts WHERE id = ?').get(draftId) !== undefined;
+}
+
+async function handleReply(deps: LoopDeps, opts: LoopOptions, summary: LoopSummary, reply: { text: string }): Promise<void> {
+  const parsed = parseReply(reply.text);
+  if (parsed.kind === 'unparseable') {
+    await deps.channel.notify(`Could not read "${reply.text}". Reply like "d7 y" or "d7 n".`);
+    return;
+  }
+  const draftId = parseShortId(parsed.shortId);
+  if (draftId === null) return;
+
+  if (!draftExists(deps.db, draftId)) {
+    await deps.channel.notify(`No draft found for ${parsed.shortId}. Ignoring that reply.`);
+    return;
+  }
+
+  if (parsed.kind === 'unsupported') {
+    // Edits are F5 territory (docs/spec-imessage-approval-loop.md).
+    logEvent(deps.db, draftId, 'edit_reply_unsupported', { text: reply.text });
+    await deps.channel.notify(`Edits are not yet supported for ${parsed.shortId}. Reply "y" to send or "n" to skip.`);
+    return;
+  }
+
+  if (parsed.kind === 'skip') {
+    const res = decide(deps.db, draftId, 'skip', 'imessage');
+    await deps.channel.notify(
+      res.applied ? `${parsed.shortId} skipped.` : `${parsed.shortId} was already ${res.existing.action}.`,
+    );
+    return;
+  }
+
+  const res = decide(deps.db, draftId, 'send', 'imessage');
+  if (!res.applied) {
+    await deps.channel.notify(`${parsed.shortId} was already ${res.existing.action}.`);
+    return;
+  }
+  if (opts.dryRun) {
+    await deps.channel.notify(`${parsed.shortId} approved (dry run, nothing sent).`);
+    return;
+  }
+
+  const row = deps.db
+    .prepare(
+      `SELECT d.person_id AS personId, r.subject AS subject, r.body AS body
+       FROM drafts d JOIN revisions r ON r.id = d.sendable_revision_id
+       WHERE d.id = ?`,
+    )
+    .get(draftId) as { personId: number; subject: string; body: string } | undefined;
+  if (!row) {
+    await deps.channel.notify(`${parsed.shortId} has no grounded revision to send.`);
+    return;
+  }
+  const person = getPerson(deps.db, row.personId);
+  if (!person?.email) {
+    await deps.channel.notify(`${parsed.shortId} has no email on record.`);
+    return;
+  }
+  try {
+    const { sentId } = await deps.sender.send({
+      to: person.email,
+      from: deps.senderEmail ?? process.env.SENDER_EMAIL ?? 'apgupta3@asu.edu',
+      subject: row.subject,
+      body: row.body,
+      draftShortId: parsed.shortId,
+    });
+    markSent(deps.db, draftId, sentId);
+    summary.sent++;
+    await deps.channel.notify(`${parsed.shortId} sent to ${person.email}.`);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    markSendFailed(deps.db, draftId, msg);
+    await deps.channel.notify(`${parsed.shortId} failed to send: ${msg}`);
+  }
+}
+
 async function drainApprovals(deps: LoopDeps, opts: LoopOptions, summary: LoopSummary): Promise<void> {
   const replies = await deps.channel.captureReplies(deps.replyWindowMs ?? 0);
   for (const reply of replies) {
-    const parsed = parseReply(reply.text);
-    if (parsed.kind === 'unparseable') {
-      await deps.channel.notify(`Could not read "${reply.text}". Reply like "d7 y" or "d7 n".`);
-      continue;
-    }
-    const draftId = parseShortId(parsed.shortId);
-    if (draftId === null) continue;
-
-    if (parsed.kind === 'unsupported') {
-      // Edits are F5 territory (docs/spec-imessage-approval-loop.md).
-      logEvent(deps.db, draftId, 'edit_reply_unsupported', { text: reply.text });
-      await deps.channel.notify(`Edits are not yet supported for ${parsed.shortId}. Reply "y" to send or "n" to skip.`);
-      continue;
-    }
-
-    if (parsed.kind === 'skip') {
-      const res = decide(deps.db, draftId, 'skip', 'imessage');
-      await deps.channel.notify(
-        res.applied ? `${parsed.shortId} skipped.` : `${parsed.shortId} was already ${res.existing.action}.`,
-      );
-      continue;
-    }
-
-    const res = decide(deps.db, draftId, 'send', 'imessage');
-    if (!res.applied) {
-      await deps.channel.notify(`${parsed.shortId} was already ${res.existing.action}.`);
-      continue;
-    }
-    if (opts.dryRun) {
-      await deps.channel.notify(`${parsed.shortId} approved (dry run, nothing sent).`);
-      continue;
-    }
-
-    const row = deps.db
-      .prepare(
-        `SELECT d.person_id AS personId, r.subject AS subject, r.body AS body
-         FROM drafts d JOIN revisions r ON r.id = d.sendable_revision_id
-         WHERE d.id = ?`,
-      )
-      .get(draftId) as { personId: number; subject: string; body: string } | undefined;
-    if (!row) {
-      await deps.channel.notify(`${parsed.shortId} has no grounded revision to send.`);
-      continue;
-    }
-    const person = getPerson(deps.db, row.personId);
-    if (!person?.email) {
-      await deps.channel.notify(`${parsed.shortId} has no email on record.`);
-      continue;
-    }
     try {
-      const { sentId } = await deps.sender.send({
-        to: person.email,
-        from: deps.senderEmail ?? process.env.SENDER_EMAIL ?? 'apgupta3@asu.edu',
-        subject: row.subject,
-        body: row.body,
-        draftShortId: parsed.shortId,
-      });
-      markSent(deps.db, draftId, sentId);
-      summary.sent++;
-      await deps.channel.notify(`${parsed.shortId} sent to ${person.email}.`);
+      await handleReply(deps, opts, summary, reply);
     } catch (e) {
+      // One malformed or unlucky reply must never discard the rest of the
+      // batch: the approved-unsent retry, the queued flush, and discovery
+      // all run after this loop and must not be skipped because of it.
       const msg = e instanceof Error ? e.message : String(e);
-      markSendFailed(deps.db, draftId, msg);
-      await deps.channel.notify(`${parsed.shortId} failed to send: ${msg}`);
+      summary.errors.push(`reply "${reply.text}": ${msg}`);
+      try {
+        await deps.channel.notify(`Could not process "${reply.text}": ${msg}`);
+      } catch {
+        // A notify failure here must not mask the original error; swallow it.
+      }
     }
   }
 }

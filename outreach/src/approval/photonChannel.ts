@@ -72,10 +72,12 @@ export async function createPhotonChannel(opts: PhotonOptions): Promise<Approval
         while (Date.now() < deadline) {
           const remaining = deadline - Date.now();
           if (!pending) pending = iterator.next();
+          let timer: ReturnType<typeof setTimeout> | undefined;
           const next = await Promise.race([
             pending,
-            new Promise<null>((r) => setTimeout(() => r(null), remaining)),
+            new Promise<null>((r) => { timer = setTimeout(() => r(null), remaining); }),
           ]);
+          clearTimeout(timer);
           if (next === null) break; // timeout won; pending stays for the grace check below
           pending = undefined;
           if (next.done) break;
@@ -87,10 +89,12 @@ export async function createPhotonChannel(opts: PhotonOptions): Promise<Approval
         // as the window closed should still be drained, not lost silently.
         if (pending) {
           const graceMs = 500;
+          let graceTimer: ReturnType<typeof setTimeout> | undefined;
           const settled = await Promise.race([
             pending,
-            new Promise<null>((r) => setTimeout(() => r(null), graceMs)),
+            new Promise<null>((r) => { graceTimer = setTimeout(() => r(null), graceMs); }),
           ]);
+          clearTimeout(graceTimer);
           if (settled && !settled.done) {
             acceptIfAllowed(settled.value as [unknown, RawMessage]);
           }
@@ -101,7 +105,7 @@ export async function createPhotonChannel(opts: PhotonOptions): Promise<Approval
       return out;
     },
     async close() {
-      await (app as unknown as { close?: () => Promise<void> }).close?.();
+      await app.stop();
     },
   };
 }
