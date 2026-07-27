@@ -14,8 +14,18 @@ describe('parseReply', () => {
     expect(parseReply('no d7')).toEqual({ kind: 'skip', shortId: 'd7' });
   });
 
-  it('accepts a bare id as approval', () => {
+  it('accepts a prefixed bare id as approval', () => {
     expect(parseReply('d7')).toEqual({ kind: 'approve', shortId: 'd7' });
+  });
+
+  it('rejects an unprefixed bare digit as unparseable, not approval', () => {
+    expect(parseReply('7')).toEqual({ kind: 'unparseable' });
+    expect(parseReply('2026')).toEqual({ kind: 'unparseable' });
+  });
+
+  it('accepts a bare digit id paired with an explicit keyword', () => {
+    expect(parseReply('7 y')).toEqual({ kind: 'approve', shortId: 'd7' });
+    expect(parseReply('7 n')).toEqual({ kind: 'skip', shortId: 'd7' });
   });
 
   it('treats an edit instruction as unsupported, not as approval', () => {

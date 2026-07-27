@@ -56,17 +56,47 @@ export async function createPhotonChannel(opts: PhotonOptions): Promise<Approval
       const out: InboundReply[] = [];
       const deadline = Date.now() + windowMs;
       const iterator = app.messages[Symbol.asyncIterator]();
-      while (Date.now() < deadline) {
-        const remaining = deadline - Date.now();
-        const next = await Promise.race([
-          iterator.next(),
-          new Promise<null>((r) => setTimeout(() => r(null), remaining)),
-        ]);
-        if (!next || next.done) break;
-        const [, message] = next.value as [unknown, { id: string; sender?: { id?: string }; content?: { type?: string; text?: string } }];
-        if (message.sender?.id !== opts.approverPhone) continue; // allowlist
-        if (message.content?.type !== 'text' || !message.content.text) continue;
+      type RawMessage = { id: string; sender?: { id?: string }; content?: { type?: string; text?: string } };
+      const acceptIfAllowed = (value: [unknown, RawMessage]) => {
+        const [, message] = value;
+        if (message.sender?.id !== opts.approverPhone) return; // allowlist
+        if (message.content?.type !== 'text' || !message.content.text) return;
         out.push({ text: message.content.text, messageId: message.id });
+      };
+
+      // Holds the in-flight iterator.next() promise across loop iterations so
+      // a message that arrives right as the timeout wins is not discarded:
+      // only call iterator.next() when nothing is already pending.
+      let pending: ReturnType<typeof iterator.next> | undefined;
+      try {
+        while (Date.now() < deadline) {
+          const remaining = deadline - Date.now();
+          if (!pending) pending = iterator.next();
+          const next = await Promise.race([
+            pending,
+            new Promise<null>((r) => setTimeout(() => r(null), remaining)),
+          ]);
+          if (next === null) break; // timeout won; pending stays for the grace check below
+          pending = undefined;
+          if (next.done) break;
+          acceptIfAllowed(next.value as [unknown, RawMessage]);
+        }
+
+        // The timeout won with a next() still in flight. Give it a short
+        // grace period rather than discarding it: a reply that arrived just
+        // as the window closed should still be drained, not lost silently.
+        if (pending) {
+          const graceMs = 500;
+          const settled = await Promise.race([
+            pending,
+            new Promise<null>((r) => setTimeout(() => r(null), graceMs)),
+          ]);
+          if (settled && !settled.done) {
+            acceptIfAllowed(settled.value as [unknown, RawMessage]);
+          }
+        }
+      } catch (err) {
+        console.warn(`captureReplies: message stream error, returning ${out.length} reply(ies) collected so far: ${String(err)}`);
       }
       return out;
     },
