@@ -216,6 +216,11 @@ async function processCandidate(
       summary.unsendable++;
       return;
     }
+    if (result.identityCollisionReason) {
+      setStatus(deps.db, c.arxivId, 'drafted_unsendable', result.identityCollisionReason);
+      summary.unsendable++;
+      return;
+    }
     if (!result.email) {
       setStatus(deps.db, c.arxivId, 'drafted_unsendable', 'no email resolved');
       summary.unsendable++;

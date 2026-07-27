@@ -8,7 +8,7 @@ import {
   type FetchFn,
   type OpenAlexAuthorRaw,
 } from '../openalex/client.js';
-import { resolveAuthor, minePerson } from './research.js';
+import { resolveAuthor, minePerson, detectIdentityCollision } from './research.js';
 import { extractContact, type PageFetcher, type SearchClient, type SelectedEmail } from './contacts.js';
 import { persistPerson } from './persist.js';
 import { computeIntersections, SelfOntologyMissingError, type Intersection } from './intersect.js';
@@ -37,6 +37,10 @@ export interface OrchestrateResult {
   hooks: Intersection[];
   noStrongHook: boolean;
   notes: string[];
+  // Set (with a human-readable reason) when the mined profile looks like an
+  // OpenAlex identity collision (several real people merged under one author
+  // id). The loop must never draft from a flagged person; see loop.ts.
+  identityCollisionReason?: string;
 }
 
 // arXiv ids encode YYMM: 2308.x -> 2023-08. Used for D1 paper-email age decay.
@@ -95,6 +99,7 @@ export async function processPaper(deps: OrchestrateDeps, arxivId: string): Prom
   let hooks: Intersection[] = [];
   let noStrongHook = true;
   let profileSummary: string | undefined;
+  let identityCollisionReason: string | undefined;
 
   if (resolution && raw) {
     resolution.author.homepageUrls = await fetchIdentityAnchors(raw, { fetchFn }).catch(() => []);
@@ -102,6 +107,11 @@ export async function processPaper(deps: OrchestrateDeps, arxivId: string): Prom
     personId = persistPerson(deps.db, resolution, raw, mineResult);
     factCount = mineResult.facts.length;
     profileSummary = mineResult.profileSummary;
+    const collision = detectIdentityCollision(mineResult.facts);
+    if (collision.suspected) {
+      identityCollisionReason = collision.reason;
+      notes.push(collision.reason!);
+    }
     if (email) {
       upsertPerson(deps.db, {
         name: target.name,
@@ -141,5 +151,6 @@ export async function processPaper(deps: OrchestrateDeps, arxivId: string): Prom
     hooks,
     noStrongHook,
     notes,
+    identityCollisionReason,
   };
 }

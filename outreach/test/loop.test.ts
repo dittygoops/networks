@@ -89,6 +89,29 @@ describe('runLoop discovery', () => {
     expect(row.reason).toContain('email');
   });
 
+  it('marks a flagged identity collision unsendable and never messages it', async () => {
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'Wenwen Zhang' });
+    const collided = {
+      ...resolvedResult('2601.00040', pid),
+      identityCollisionReason: 'identity collision suspected (176 collaborators, 136 institutions)',
+    };
+    const { deps, channel } = baseDeps(db, {
+      sources: [source([cand('2601.00040', 'Olfactory Embedding Space Sensors')])],
+      processPaper: vi.fn().mockResolvedValue(collided),
+    });
+    const summary = await runLoop(deps, { dryRun: false });
+    expect(summary.unsendable).toBe(1);
+    expect(summary.messaged).toBe(0);
+    expect(channel.sent).toHaveLength(0);
+    const row = db.prepare('SELECT status, reason FROM seen_papers WHERE arxiv_id = ?').get('2601.00040') as {
+      status: string;
+      reason: string;
+    };
+    expect(row.status).toBe('drafted_unsendable');
+    expect(row.reason).toContain('identity collision suspected (176 collaborators, 136 institutions)');
+  });
+
   it('messages a sendable draft and records it', async () => {
     const db = openDb(':memory:');
     const pid = upsertPerson(db, { name: 'Someone', email: 'someone@uni.edu' });
