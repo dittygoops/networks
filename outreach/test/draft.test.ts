@@ -101,3 +101,65 @@ describe('signature handling', () => {
     expectSig(d.wordCount).toBeLessThan(12);
   });
 });
+
+// Requirement 4: drafts whose ONLY hooks are paper-derived must not collapse
+// into a generic "I read your paper" opener that merely restates the title.
+import { describe as descPaper, it as itPaper, expect as expectPaper } from 'vitest';
+import { generateDraft as genPaper } from '../src/pipeline/draft.js';
+
+describe('paper-derived hook specificity check', () => {
+  const mkLlm = (subject: string, body: string) => ({ complete: async () => JSON.stringify({ subject, body }) });
+  // Title deliberately shares no 5+ char word stem with the hook's entity/detail
+  // or with Aditya's fact, so a body that only quotes the title (the generic
+  // "I read your paper <title>" pattern) cannot accidentally satisfy the
+  // specific-entity check by coincidence.
+  const paperOnlyInput: DraftInput = {
+    recipient: {
+      name: 'Zhiying Du',
+      paperTitle: 'HiMoE-VLA: Toward Scalable Learning At Web Scale',
+    },
+    hooks: [{
+      selfValue: 'hierarchical mixture of experts',
+      personValue: 'hierarchical mixture of experts',
+      selfDetail: 'built a routing layer for a multi-task model',
+      personDetail: 'routes robot manipulation tasks through specialized experts',
+      selfStance: 'done',
+      tier: 'B',
+      personSourceUrl: 'https://arxiv.org/abs/2512.05693',
+    }],
+    intent: 'get direction on MoE routing',
+    senderName: 'Aditya Gupta',
+    senderFacts: [{ text: 'built a routing layer for a multi-task model', stance: 'done' }],
+  };
+
+  itPaper('is NOT grounded when the body merely restates the paper title', async () => {
+    const body = 'Hi Zhiying,\n\nI read your paper HiMoE-VLA: Toward Scalable Learning At Web Scale and found it ' +
+      'interesting. I also work in machine learning broadly and would love any pointers on your research ' +
+      'direction.\n\nBest,\nAditya';
+    const d = await genPaper(mkLlm('quick question', body) as never, paperOnlyInput);
+    expectPaper(d.grounded).toBe(false);
+    expectPaper(d.notes.join(' ')).toMatch(/paper-derived hooks only/i);
+  });
+
+  itPaper('IS grounded when the body cites a specific method from the paper', async () => {
+    const body = 'Hi Zhiying,\n\nSaw your hierarchical mixture of experts routing for robot manipulation tasks, ' +
+      'really clever way to specialize experts. I built a routing layer for a multi-task model myself and hit ' +
+      'load-balancing issues. Any pointers?\n\nBest,\nAditya';
+    const d = await genPaper(mkLlm('quick question', body) as never, paperOnlyInput);
+    expectPaper(d.grounded).toBe(true);
+    expectPaper(d.notes.join(' ')).not.toMatch(/paper-derived hooks only/i);
+  });
+
+  itPaper('does not fire the paper-only check when a profile-derived hook is also present', async () => {
+    const mixedInput: DraftInput = {
+      ...paperOnlyInput,
+      hooks: [
+        ...paperOnlyInput.hooks,
+        { selfValue: 'olfaction', personValue: 'olfaction', tier: 'A' }, // no personSourceUrl: profile-derived
+      ],
+    };
+    const body = 'Hi Zhiying,\n\nSaw your work on olfaction. I built a routing layer for a multi-task model. Any pointers?\n\nBest,\nAditya';
+    const d = await genPaper(mkLlm('quick question', body) as never, mixedInput);
+    expectPaper(d.notes.join(' ')).not.toMatch(/paper-derived hooks only/i);
+  });
+});

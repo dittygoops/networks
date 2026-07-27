@@ -20,6 +20,7 @@ export interface Intersection {
   selfDetail?: string;
   personDetail?: string;
   selfStance?: OntologyFact['stance']; // honesty: did Aditya do it, or is he exploring it?
+  personSourceUrl: string; // traces the hook to the underlying person fact; draft.ts uses this to detect a paper-only hook
   strength: number;
   tier: OntologyFact['tier'];
   rationale: string;
@@ -108,6 +109,7 @@ function mapIntersections(raw: RawIntersection[], self: StoredFact[], person: St
       selfDetail: s.detail,
       personDetail: p.detail,
       selfStance: s.stance,
+      personSourceUrl: p.sourceUrl,
       strength,
       tier: minTier(s.tier, p.tier),
       rationale: String(r.rationale ?? ''),
@@ -141,6 +143,7 @@ function entityMatches(self: StoredFact[], person: StoredFact[]): Intersection[]
         selfDetail: s.detail,
         personDetail: p.detail,
         selfStance: s.stance,
+        personSourceUrl: p.sourceUrl,
         strength,
         tier: minTier(s.tier, p.tier),
         rationale: `both: ${p.value}`,
@@ -158,7 +161,19 @@ function mergeByPair(hooks: Intersection[]): Intersection[] {
     const cur = best.get(k);
     if (!cur || h.strength > cur.strength) best.set(k, h);
   }
-  return [...best.values()].sort((a, b) => b.strength - a.strength).slice(0, MAX_INTERSECTIONS);
+  return [...best.values()].sort(rankHook).slice(0, MAX_INTERSECTIONS);
+}
+
+// Tier ranks first (A before B before C), strength descending within a tier.
+// This is the tier-and-ranking discipline: a paper-derived fact is capped at
+// tier B (research.ts extractPaperFacts) and must never outrank a genuine
+// profile-derived tier A hook, even when both happen to score the same
+// strength, so a paper-derived hook can lead the draft only when no stronger,
+// better-evidenced hook exists.
+function rankHook(a: Intersection, b: Intersection): number {
+  const tierDiff = (TIER_RANK[a.tier] ?? 2) - (TIER_RANK[b.tier] ?? 2);
+  if (tierDiff !== 0) return tierDiff;
+  return b.strength - a.strength;
 }
 
 // Cleans up near-duplicate hooks from a strength-descending list (D6): collapse exact

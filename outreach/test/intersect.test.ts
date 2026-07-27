@@ -171,3 +171,72 @@ describe('computeIntersections dedupe (D6)', () => {
     expect(noStrongHook).toBe(false);
   });
 });
+
+// The diagnosed problem, reproduced directly: an author's mined profile facts
+// are bare OpenAlex concepts, too generic to match a specific self fact, so no
+// hook is possible from the profile alone. A paper-derived fact for the exact
+// entity closes that gap. HiMoE-VLA shape (see docs in the requirements): the
+// self fact "hierarchical mixture of experts" is what the paper itself is
+// about.
+describe('computeIntersections with paper-derived facts (paper-fact hook gap)', () => {
+  const paperFact = (over: Partial<OntologyFact> = {}): OntologyFact => ({
+    facet: 'academic',
+    key: 'method',
+    value: 'hierarchical mixture of experts',
+    stance: 'done',
+    sourceUrl: 'https://arxiv.org/abs/2512.05693',
+    confidence: 0.7,
+    tier: 'B',
+    ...over,
+  });
+
+  test('generic profile facts alone yield no hooks; adding the paper-derived fact yields one', async () => {
+    const db = openDb(':memory:');
+    saveSelfFacts(db, [fact({ key: 'method', value: 'hierarchical mixture of experts' })]); // s0, tier A
+    const pid = upsertPerson(db, { name: 'Zhiying Du', openalexId: 'A_HIMOE' });
+    // Bare OpenAlex concepts: too generic to match anything specific.
+    saveFacts(db, pid, [
+      fact({ key: 'research_area', value: 'Artificial intelligence' }),
+      fact({ key: 'research_area', value: 'Computer vision' }),
+      fact({ key: 'research_area', value: 'Computer science' }),
+    ]);
+
+    const before = await computeIntersections(db, { llm: fakeLLM('[]') }, pid);
+    expect(before.ranked).toHaveLength(0);
+    expect(before.noStrongHook).toBe(true);
+
+    // Now the paper contributes its own fact about the author.
+    saveFacts(db, pid, [paperFact()]);
+    const after = await computeIntersections(db, { llm: fakeLLM('[]') }, pid);
+    expect(after.ranked.length).toBeGreaterThan(0);
+    const hook = after.ranked.find((x) => x.personValue === 'hierarchical mixture of experts');
+    expect(hook).toBeDefined();
+    expect(hook?.tier).toBe('B'); // min(self A, person B) = B
+    expect(after.noStrongHook).toBe(false);
+  });
+
+  test('a profile-derived tier A hook still outranks a paper-derived tier B hook', async () => {
+    const db = openDb(':memory:');
+    saveSelfFacts(db, [
+      fact({ key: 'method', value: 'hierarchical mixture of experts' }), // s0, tier A
+      fact({ key: 'research_area', value: 'olfaction' }), // s1, tier A
+    ]);
+    const pid = upsertPerson(db, { name: 'Zhiying Du', openalexId: 'A_HIMOE2' });
+    saveFacts(db, pid, [
+      // Profile-derived, tier A, exact entity match: a real, well-evidenced hook.
+      fact({ key: 'research_area', value: 'olfaction' }),
+      // Paper-derived, tier B, also an exact entity match (same strength).
+      paperFact(),
+    ]);
+
+    const { ranked } = await computeIntersections(db, { llm: fakeLLM('[]') }, pid);
+    expect(ranked.length).toBeGreaterThanOrEqual(2);
+    const aIndex = ranked.findIndex((x) => x.personValue === 'olfaction');
+    const bIndex = ranked.findIndex((x) => x.personValue === 'hierarchical mixture of experts');
+    expect(aIndex).toBeGreaterThanOrEqual(0);
+    expect(bIndex).toBeGreaterThanOrEqual(0);
+    expect(ranked[aIndex]?.tier).toBe('A');
+    expect(ranked[bIndex]?.tier).toBe('B');
+    expect(aIndex).toBeLessThan(bIndex); // tier A hook ranks ahead despite equal strength
+  });
+});

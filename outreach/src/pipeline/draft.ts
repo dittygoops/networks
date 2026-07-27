@@ -2,6 +2,7 @@
 // casual-but-polite outreach email. No send. Spec: docs/spec-draft.md.
 import type { LLMClient } from '../llm/client.js';
 import { DRAFT_SYSTEM, buildDraftUser, type DraftPromptInput } from '../llm/prompts.js';
+import { isPaperSourceUrl } from './research.js';
 
 export type DraftInput = DraftPromptInput;
 
@@ -70,14 +71,26 @@ export async function generateDraft(llm: LLMClient, input: DraftInput): Promise<
   // DR4 grounding: the body should share a specific term with the recipient's
   // side (hook entities/details or the paper title) AND with Aditya's side.
   const bs = stems(body);
-  const recipientGrounded =
-    input.hooks.some((h) => shares(bs, h.personValue) || shares(bs, h.personDetail ?? '')) ||
-    shares(bs, input.recipient.paperTitle ?? '');
+  const recipientGroundedByHook = input.hooks.some((h) => shares(bs, h.personValue) || shares(bs, h.personDetail ?? ''));
+  const recipientGrounded = recipientGroundedByHook || shares(bs, input.recipient.paperTitle ?? '');
   const senderGrounded =
     input.hooks.some((h) => shares(bs, h.selfValue) || shares(bs, h.selfDetail ?? '')) ||
     (input.senderFacts ?? []).some((f) => shares(bs, f.text));
-  const grounded = recipientGrounded && senderGrounded;
+  let grounded = recipientGrounded && senderGrounded;
   if (!grounded) notes.push('draft may be ungrounded (missing a specific recipient or sender reference)');
+
+  // Paper-derived specificity check: when EVERY hook is paper-derived (sourced
+  // from the discovered paper itself rather than a mined profile fact, see
+  // research.ts isPaperSourceUrl), a body that only shares words with the paper
+  // TITLE is exactly the generic "I read your paper" opener this project is
+  // trying not to send. In that case the body must cite a specific entity from
+  // the hook (a method, dataset, architecture, or task), not just the title, so
+  // require recipientGroundedByHook specifically, not the title fallback alone.
+  const hooksAllPaperDerived = input.hooks.length > 0 && input.hooks.every((h) => isPaperSourceUrl(h.personSourceUrl));
+  if (hooksAllPaperDerived && !recipientGroundedByHook) {
+    grounded = false;
+    notes.push('paper-derived hooks only: body must cite a specific method, dataset, architecture, or task from the paper, not just restate the title');
+  }
 
   // Grounding and word count are measured on the model's content only; the fixed
   // signature is appended after, so it never affects the checks or the word budget.

@@ -11,7 +11,14 @@ import {
 } from './contacts.js';
 import { currentAffiliation, type OpenAlexAuthorRaw } from '../openalex/client.js';
 import type { LLMClient } from '../llm/client.js';
-import { buildExtractUser, buildSummaryUser, EXTRACT_SYSTEM, SUMMARY_SYSTEM } from '../llm/prompts.js';
+import {
+  buildExtractUser,
+  buildPaperExtractUser,
+  buildSummaryUser,
+  EXTRACT_SYSTEM,
+  PAPER_EXTRACT_SYSTEM,
+  SUMMARY_SYSTEM,
+} from '../llm/prompts.js';
 
 // Normalized OpenAlex author candidate (shape the client produces from raw API).
 export interface OpenAlexCandidate {
@@ -562,4 +569,79 @@ function safeClassify(page: WebPage, name: string): ReturnType<typeof classifyWe
   } catch {
     return 'aggregator'; // treat unparseable URLs as non-contributing
   }
+}
+
+// ---------------------------------------------------------------------------
+// Paper-fact extraction: let the discovered paper itself contribute facts
+// about its author, so the paper that justified contacting someone can also
+// justify what the draft says to them. The paper is a verified document with
+// their name on it, so this is not fabrication, but it is also not as strong
+// evidence as OpenAlex or a personal homepage: every fact caps at tier B
+// (never A, see PAPER_TIER_CAP) so a real profile-derived tier A hook always
+// outranks it (TIER_RANK in intersect.ts), and it can never be the ONLY
+// possible hook source discovered when the profile already has one.
+// ---------------------------------------------------------------------------
+
+export interface PaperFactContext {
+  arxivId: string;
+  title: string;
+  abstract: string;
+  authorName: string;
+}
+
+// Never 'A': a single paper's title/abstract is not the institutional-grade
+// evidence a mined profile fact is.
+const PAPER_TIER_CAP: OntologyFact['tier'] = 'B';
+
+// The canonical source_url stamped on every paper-derived fact. Also used
+// (via isPaperSourceUrl) to recognize a paper-derived hook downstream.
+export function paperSourceUrl(arxivId: string): string {
+  return `https://arxiv.org/abs/${arxivId}`;
+}
+
+const PAPER_SOURCE_RE = /^https:\/\/arxiv\.org\/abs\//;
+
+// True when a fact's (or hook's) source_url is a paper-fact source_url, i.e.
+// it came from extractPaperFacts rather than OpenAlex or a mined web page.
+export function isPaperSourceUrl(url: string | undefined): boolean {
+  return typeof url === 'string' && PAPER_SOURCE_RE.test(url);
+}
+
+// Derive ontology facts about a paper's author FROM THE PAPER ITSELF (title +
+// abstract only). Same JSON-parsing-with-retry robustness as
+// extractFactsFromPage: never throws, returns [] when the model output cannot
+// be parsed twice in a row, so an unattended run never crashes here. Every
+// returned fact is stance 'done' (published work) and sourced at the paper's
+// abs URL, regardless of what the model returned for those fields.
+export async function extractPaperFacts(llm: LLMClient, ctx: PaperFactContext): Promise<OntologyFact[]> {
+  const user = buildPaperExtractUser(ctx);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const raw = parseFacts(await llm.complete(PAPER_EXTRACT_SYSTEM, user));
+      if (raw) return normalizePaperFacts(raw, paperSourceUrl(ctx.arxivId));
+    } catch {
+      // LLM call itself threw (network/5xx/non-JSON body): count as a failed
+      // attempt and retry once, then give up quietly.
+    }
+  }
+  return [];
+}
+
+function normalizePaperFacts(raw: RawFact[], sourceUrl: string): OntologyFact[] {
+  const facts: OntologyFact[] = [];
+  for (const rf of raw.slice(0, MAX_FACTS_PER_PAGE)) {
+    if (!isFacet(rf.facet) || !rf.key || !rf.value) continue;
+    const confidence = Number.isFinite(rf.confidence) ? Math.max(0, Math.min(1, rf.confidence as number)) : 0.5;
+    facts.push({
+      facet: rf.facet,
+      key: normalizeKey(rf.facet, String(rf.key).slice(0, MAX_VALUE_LEN)),
+      value: String(rf.value).slice(0, MAX_VALUE_LEN),
+      detail: rf.detail ? String(rf.detail).slice(0, 400) : undefined,
+      stance: 'done', // the author's own published paper: this is completed work
+      sourceUrl,
+      confidence,
+      tier: PAPER_TIER_CAP, // never 'A', see PAPER_TIER_CAP above
+    });
+  }
+  return facts;
 }

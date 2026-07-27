@@ -8,11 +8,11 @@ import {
   type FetchFn,
   type OpenAlexAuthorRaw,
 } from '../openalex/client.js';
-import { resolveAuthor, minePerson, detectIdentityCollision } from './research.js';
+import { resolveAuthor, minePerson, detectIdentityCollision, extractPaperFacts } from './research.js';
 import { extractContact, type PageFetcher, type SearchClient, type SelectedEmail } from './contacts.js';
 import { persistPerson } from './persist.js';
 import { computeIntersections, SelfOntologyMissingError, type Intersection } from './intersect.js';
-import { upsertPerson, type DB } from '../db/db.js';
+import { getFacts, saveFacts, upsertPerson, type DB } from '../db/db.js';
 import type { LLMClient } from '../llm/client.js';
 import { extractPdfText } from './pdf.js';
 
@@ -112,6 +112,40 @@ export async function processPaper(deps: OrchestrateDeps, arxivId: string): Prom
       identityCollisionReason = collision.reason;
       notes.push(collision.reason!);
     }
+
+    // Let the discovered paper itself contribute facts about its author (see
+    // research.ts extractPaperFacts), so a genuinely on-topic paper can still
+    // seed a hook when the mined profile is too coarse (e.g. bare OpenAlex
+    // concepts) to match. Persist BEFORE computeIntersections so the existing
+    // engine picks these up with no change to its core logic. Never let a
+    // paper-derived fact (always tier B) overwrite an existing (facet, key,
+    // value) row: saveFacts upserts on that triple, so a paper fact that
+    // happened to collide with an already-persisted tier-A profile fact would
+    // silently downgrade it. Filter those out first.
+    try {
+      const paperFacts = await extractPaperFacts(deps.llm, {
+        arxivId: paper.arxivId,
+        title: paper.title,
+        abstract: paper.abstract,
+        authorName: target.name,
+      });
+      if (paperFacts.length > 0) {
+        const existingKeys = new Set(
+          getFacts(deps.db, personId).map((f) => `${f.facet}|${f.key}|${f.value.trim().toLowerCase()}`),
+        );
+        const newPaperFacts = paperFacts.filter(
+          (f) => !existingKeys.has(`${f.facet}|${f.key}|${f.value.trim().toLowerCase()}`),
+        );
+        if (newPaperFacts.length > 0) {
+          saveFacts(deps.db, personId, newPaperFacts);
+          factCount += newPaperFacts.length;
+        }
+      }
+    } catch {
+      // Paper-fact extraction is best-effort; a failure here must not block
+      // intersections from running on the profile facts already persisted.
+    }
+
     if (email) {
       upsertPerson(deps.db, {
         name: target.name,

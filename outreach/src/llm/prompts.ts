@@ -93,9 +93,60 @@ export function buildSelfExtractUser(sourceLabel: string, text: string): string 
   return [`Document: ${sourceLabel}`, '', text.slice(0, 6000)].join('\n');
 }
 
+// Paper-fact extraction: the discovered paper's title and abstract are the ONE
+// verified document that already carries the author's name, so they can seed
+// facts about that author even when their mined profile is too coarse
+// (OpenAlex concepts like "Computer vision") to intersect. Code always forces
+// stance "done" and caps tier at B, so this prompt only needs to find specific
+// entities, not judge honesty or usability tier.
+export const PAPER_EXTRACT_SYSTEM = [
+  'You extract structured facts about ONE named author from their own arXiv paper,',
+  'given only its title and abstract. Return ONLY a JSON array (no prose, no code',
+  'fences). Each element must be:',
+  '{ "facet": "academic"|"trajectory"|"interest", "key": string, "value": string,',
+  '  "detail": string, "confidence": number }.',
+  '',
+  ENTITY_RULES,
+  '',
+  'Extract only what the title and abstract actually state: the specific methods,',
+  'architectures, datasets, tasks, and application domains the paper covers. These',
+  'become facts about the author (they did this work). Prefer specific, matchable',
+  'entities over broad fields: "hierarchical mixture of experts" not "machine',
+  'learning"; "vision language action model" not "AI". Do NOT invent anything',
+  'beyond what the title and abstract state, and do not add encyclopedia facts',
+  'about the topic that are not tied to this paper. Prefer facet "academic"; a',
+  'single title and abstract rarely supports a trajectory (institution/company/',
+  'role) or interest fact, so only use those facets if genuinely stated.',
+  '',
+  'Confidence: 0.7 if the entity is named in the title, 0.6 if only in the',
+  'abstract, 0.5 if implied. If nothing specific can be extracted, return [].',
+].join('\n');
+
+export function buildPaperExtractUser(ctx: { title: string; abstract: string; authorName: string }): string {
+  return [
+    `Author: ${ctx.authorName}`,
+    `Paper title: ${ctx.title}`,
+    '',
+    'Abstract:',
+    ctx.abstract.slice(0, 4000),
+  ].join('\n');
+}
+
 export interface DraftPromptInput {
   recipient: { name: string; affiliation?: string | null; profileSummary?: string; paperTitle?: string };
-  hooks: { selfValue: string; personValue: string; selfDetail?: string; personDetail?: string; selfStance?: 'done' | 'exploring'; tier: 'A' | 'B' | 'C' }[];
+  hooks: {
+    selfValue: string;
+    personValue: string;
+    selfDetail?: string;
+    personDetail?: string;
+    selfStance?: 'done' | 'exploring';
+    tier: 'A' | 'B' | 'C';
+    // Source URL of the recipient-side fact behind this hook. Present when the
+    // hook can be traced to a specific fact; draft.ts uses it to tell a
+    // paper-derived hook (source is the discovered paper's arXiv abs URL) from a
+    // profile-derived one, for the paper-only specificity check (see draft.ts).
+    personSourceUrl?: string;
+  }[];
   intent: string;
   senderName: string;
   senderFacts?: { text: string; stance?: 'done' | 'exploring' }[];
