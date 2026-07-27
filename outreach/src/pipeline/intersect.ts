@@ -58,7 +58,8 @@ export async function computeIntersections(
   // Deterministic entity matches (nuScenes == nuScenes) are reliable strong
   // hooks; the LLM pass adds conceptual overlaps between different entities.
   const raw = await callModel(deps.llm, self, person);
-  const merged = mergeByPair([...entityMatches(self, person), ...mapIntersections(raw, self, person)]);
+  const candidates = [...entityMatches(self, person), ...mapIntersections(raw, self, person)].filter(isSpecificHook);
+  const merged = mergeByPair(candidates);
   const ranked = dedupe(merged);
 
   saveIntersections(db, personId, ranked.map((x) => ({
@@ -120,6 +121,40 @@ function mapIntersections(raw: RawIntersection[], self: StoredFact[], person: St
 
 const normEntity = (s: string): string => s.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
 
+// Entities that can never on their own constitute a hook: they are too broad or
+// too common to be discriminating (everyone shares them, so they are not common
+// ground). This is what let "both are involved in computer science" and "both
+// have connections to institutions in the United States" through at 0.30 to
+// 0.50 strength, above MIN_STRENGTH, even though neither says anything specific
+// about the two people.
+export const GENERIC_ENTITIES: readonly string[] = [
+  // broad fields
+  'computer science', 'artificial intelligence', 'machine learning', 'deep learning',
+  'engineering', 'mathematics', 'science', 'technology', 'data science',
+  // commodity tools every practitioner uses
+  'claude', 'anthropic claude', 'chatgpt', 'gpt-4', 'gpt4', 'python', 'pytorch',
+  'tensorflow', 'github', 'git', 'docker', 'linux', 'vs code', 'visual studio code',
+  'jupyter', 'numpy', 'pandas',
+  // geographic and organizational generics
+  'united states', 'usa', 'china', 'europe', 'university', 'institute', 'laboratory',
+];
+
+const GENERIC_SET = new Set(GENERIC_ENTITIES.map(normEntity));
+
+// Is this entity, taken as a whole, too generic to ever be a hook by itself?
+// Matches the WHOLE normalized entity, not a substring: "machine learning" is
+// generic, but "physics-informed machine learning" and "GitHub Actions runner
+// autoscaling" are specific overlaps that merely contain a generic word, and
+// must NOT be filtered. Only an entity that IS, in its entirety, one of the
+// generic terms gets caught here.
+export const isGenericEntity = (value: string): boolean => GENERIC_SET.has(normEntity(value));
+
+// Drop any hook whose matched entity is generic on either side: sharing a
+// broad field, a country, or a commodity tool is not common ground and must
+// never open a cold email, no matter how the LLM scored it.
+const isSpecificHook = (h: Intersection): boolean =>
+  !isGenericEntity(h.selfValue) && !isGenericEntity(h.personValue);
+
 // Deterministic entity overlap: same normalized value (0.95), or one clearly
 // contains the other (0.85), e.g. "gaussian splatting" in "3d gaussian splatting".
 // This is the reliable core of intersection scoring, independent of the LLM.
@@ -164,16 +199,18 @@ function mergeByPair(hooks: Intersection[]): Intersection[] {
   return [...best.values()].sort(rankHook).slice(0, MAX_INTERSECTIONS);
 }
 
-// Tier ranks first (A before B before C), strength descending within a tier.
-// This is the tier-and-ranking discipline: a paper-derived fact is capped at
-// tier B (research.ts extractPaperFacts) and must never outrank a genuine
-// profile-derived tier A hook, even when both happen to score the same
-// strength, so a paper-derived hook can lead the draft only when no stronger,
-// better-evidenced hook exists.
+// Strength ranks first, descending; tier only breaks ties (equal strength).
+// A strong, specific match is more valuable than a weak one, regardless of
+// which source produced it, so strength must dominate the ordering: this is
+// what makes a 0.95 exact-entity match (e.g. hierarchical mixture of experts,
+// capped at tier B because it came from a paper) outrank a 0.30 to 0.50
+// vacuous match that happens to be tier A (e.g. "both in computer science").
+// Tier only decides between hooks that scored the same, where the
+// better-evidenced (lower TIER_RANK) source should lead.
 function rankHook(a: Intersection, b: Intersection): number {
-  const tierDiff = (TIER_RANK[a.tier] ?? 2) - (TIER_RANK[b.tier] ?? 2);
-  if (tierDiff !== 0) return tierDiff;
-  return b.strength - a.strength;
+  const strengthDiff = b.strength - a.strength;
+  if (strengthDiff !== 0) return strengthDiff;
+  return (TIER_RANK[a.tier] ?? 2) - (TIER_RANK[b.tier] ?? 2);
 }
 
 // Cleans up near-duplicate hooks from a strength-descending list (D6): collapse exact

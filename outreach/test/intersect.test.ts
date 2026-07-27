@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import { openDb, upsertPerson, saveFacts, saveSelfFacts } from '../src/db/db.js';
-import { computeIntersections, SelfOntologyMissingError } from '../src/pipeline/intersect.js';
+import { computeIntersections, isGenericEntity, SelfOntologyMissingError } from '../src/pipeline/intersect.js';
 import type { LLMClient } from '../src/llm/client.js';
 import type { OntologyFact } from '../src/pipeline/research.js';
 
@@ -238,5 +238,142 @@ describe('computeIntersections with paper-derived facts (paper-fact hook gap)', 
     expect(ranked[aIndex]?.tier).toBe('A');
     expect(ranked[bIndex]?.tier).toBe('B');
     expect(aIndex).toBeLessThan(bIndex); // tier A hook ranks ahead despite equal strength
+  });
+});
+
+describe('isGenericEntity', () => {
+  test('flags broad fields, commodity tools, and geographic/organizational generics', () => {
+    expect(isGenericEntity('computer science')).toBe(true);
+    expect(isGenericEntity('Computer Science')).toBe(true); // case-insensitive
+    expect(isGenericEntity('Anthropic Claude')).toBe(true);
+    expect(isGenericEntity('United States')).toBe(true);
+    expect(isGenericEntity('Python')).toBe(true);
+  });
+
+  test('does not flag specific entities', () => {
+    expect(isGenericEntity('hierarchical mixture of experts')).toBe(false);
+    expect(isGenericEntity('nuScenes')).toBe(false);
+    expect(isGenericEntity('3D Gaussian Splatting')).toBe(false);
+    expect(isGenericEntity('physics-informed machine learning')).toBe(false);
+  });
+
+  test('matches the whole entity, not a substring: a specific entity that merely contains a generic word survives', () => {
+    // Contains "machine learning" but is a specific, narrower subfield.
+    expect(isGenericEntity('physics-informed machine learning')).toBe(false);
+    // Contains "GitHub" but is a specific project/topic, not the bare tool.
+    expect(isGenericEntity('GitHub Actions runner autoscaling')).toBe(false);
+  });
+});
+
+describe('computeIntersections drops generic-entity hooks (D6 genericness filter)', () => {
+  test('an LLM-proposed intersection is dropped when the person-side matched entity is generic', async () => {
+    const db = openDb(':memory:');
+    saveSelfFacts(db, [fact({ key: 'tool', facet: 'interest', value: 'Anthropic Claude' })]); // s0
+    const pid = upsertPerson(db, { name: 'P', openalexId: 'A9' });
+    saveFacts(db, pid, [fact({ key: 'research_area', value: 'Computer science' })]); // p0
+    const llm = fakeLLM(JSON.stringify([
+      { self: 's0', person: 'p0', strength: 0.3, rationale: 'Both are involved in computer science.' },
+    ]));
+    const { ranked } = await computeIntersections(db, { llm }, pid);
+    expect(ranked).toHaveLength(0);
+  });
+
+  test('an LLM-proposed intersection is dropped when the self-side matched entity is generic, even if the person side is specific', async () => {
+    const db = openDb(':memory:');
+    saveSelfFacts(db, [fact({ key: 'tool', facet: 'interest', value: 'Python' })]); // s0
+    const pid = upsertPerson(db, { name: 'P', openalexId: 'A10' });
+    saveFacts(db, pid, [fact({ key: 'method', value: 'nuScenes' })]); // p0
+    const llm = fakeLLM(JSON.stringify([
+      { self: 's0', person: 'p0', strength: 0.4, rationale: 'Both use common tooling.' },
+    ]));
+    const { ranked } = await computeIntersections(db, { llm }, pid);
+    expect(ranked).toHaveLength(0);
+  });
+
+  test('an exact entity match is still dropped when the shared value is itself generic (deterministic path, not just the LLM path)', async () => {
+    const db = openDb(':memory:');
+    saveSelfFacts(db, [fact({ key: 'research_area', value: 'Machine learning' })]); // s0
+    const pid = upsertPerson(db, { name: 'P', openalexId: 'A11' });
+    saveFacts(db, pid, [fact({ key: 'research_area', value: 'Machine learning' })]); // p0, would otherwise be a 0.95 exact match
+    const { ranked } = await computeIntersections(db, { llm: fakeLLM('[]') }, pid);
+    expect(ranked).toHaveLength(0);
+  });
+});
+
+describe('mergeByPair sorts by strength first, tier only as a tiebreaker', () => {
+  test('a 0.95 tier B hook ranks ahead of a 0.50 tier A hook', async () => {
+    const db = openDb(':memory:');
+    saveSelfFacts(db, [
+      fact({ key: 'method', value: 'WeakMatchSelf', tier: 'A' }), // s0
+      fact({ key: 'method', value: 'StrongMatchSelf', tier: 'B' }), // s1
+    ]);
+    const pid = upsertPerson(db, { name: 'P', openalexId: 'A12' });
+    saveFacts(db, pid, [
+      fact({ key: 'method', value: 'WeakMatchPerson', tier: 'A' }), // p0
+      fact({ key: 'method', value: 'StrongMatchPerson', tier: 'B' }), // p1
+    ]);
+    const llm = fakeLLM(JSON.stringify([
+      { self: 's0', person: 'p0', strength: 0.5, rationale: 'weak tier A match' },
+      { self: 's1', person: 'p1', strength: 0.95, rationale: 'strong tier B match' },
+    ]));
+    const { ranked } = await computeIntersections(db, { llm }, pid);
+    expect(ranked).toHaveLength(2);
+    expect(ranked[0]).toMatchObject({ strength: 0.95, tier: 'B' });
+    expect(ranked[1]).toMatchObject({ strength: 0.5, tier: 'A' });
+  });
+
+  test('given equal strength, the tier A hook ranks first', async () => {
+    const db = openDb(':memory:');
+    saveSelfFacts(db, [
+      fact({ key: 'method', value: 'TierASelf', tier: 'A' }), // s0
+      fact({ key: 'method', value: 'TierBSelf', tier: 'B' }), // s1
+    ]);
+    const pid = upsertPerson(db, { name: 'P', openalexId: 'A13' });
+    saveFacts(db, pid, [
+      fact({ key: 'method', value: 'TierAPerson', tier: 'A' }), // p0
+      fact({ key: 'method', value: 'TierBPerson', tier: 'B' }), // p1
+    ]);
+    const llm = fakeLLM(JSON.stringify([
+      { self: 's1', person: 'p1', strength: 0.7, rationale: 'tier B match' },
+      { self: 's0', person: 'p0', strength: 0.7, rationale: 'tier A match' },
+    ]));
+    const { ranked } = await computeIntersections(db, { llm }, pid);
+    expect(ranked).toHaveLength(2);
+    expect(ranked[0]).toMatchObject({ strength: 0.7, tier: 'A' });
+    expect(ranked[1]).toMatchObject({ strength: 0.7, tier: 'B' });
+  });
+});
+
+// The diagnosed live-run failure, reproduced end to end: the engine chose three
+// hooks for a real draft, and the weakest, most vacuous one ("I used Claude" /
+// "both in computer science") opened the email instead of the excellent exact
+// method match (hierarchical mixture of experts). The genericness filter must
+// drop both vacuous hooks, and strength-first sorting must put the MoE hook
+// first among whatever survives.
+describe('regression: the real bad-draft case (vacuous hooks dropped, MoE hook leads)', () => {
+  test('surviving ranked list leads with hierarchical mixture of experts; neither vacuous hook survives', async () => {
+    const db = openDb(':memory:');
+    saveSelfFacts(db, [
+      fact({ key: 'method', value: 'hierarchical mixture of experts', stance: 'exploring' }), // s0, exact entity match -> [B]
+      fact({ key: 'institution', facet: 'trajectory', value: 'Arizona State University', stance: 'done' }), // s1
+      fact({ key: 'tool', facet: 'interest', value: 'Anthropic Claude', stance: 'done' }), // s2
+    ]);
+    const pid = upsertPerson(db, { name: 'Author', openalexId: 'A_REGRESSION' });
+    saveFacts(db, pid, [
+      fact({ key: 'method', value: 'Hierarchical Mixture-of-Experts' }), // p0, exact entity match (case-insensitive) -> [B]
+      fact({ key: 'institution', value: 'United States' }), // p1, generic geography, would be [A]
+      fact({ key: 'research_area', value: 'Computer science' }), // p2, generic field, would be [A]
+    ]);
+    const llm = fakeLLM(JSON.stringify([
+      { self: 's1', person: 'p1', strength: 0.5, rationale: 'Both have connections to institutions in the United States.' },
+      { self: 's2', person: 'p2', strength: 0.3, rationale: 'Both are involved in computer science.' },
+    ]));
+
+    const { ranked } = await computeIntersections(db, { llm }, pid);
+
+    expect(ranked).toHaveLength(1);
+    expect(ranked[0]).toMatchObject({ personValue: 'Hierarchical Mixture-of-Experts', strength: 0.95 });
+    expect(ranked.some((x) => x.personValue === 'United States')).toBe(false);
+    expect(ranked.some((x) => x.personValue === 'Computer science')).toBe(false);
   });
 });
