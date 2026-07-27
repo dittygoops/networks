@@ -4,7 +4,6 @@ import { parse } from 'tldts';
 import {
   classifyWebPage,
   hostMatches,
-  nameMatches,
   type PageFetcher,
   type PaperContext,
   type SearchClient,
@@ -126,57 +125,6 @@ export function factsFromOpenAlex(candidate: OpenAlexCandidate, raw: OpenAlexAut
   for (const coauthor of candidate.coauthors) push('academic', 'collaborator', coauthor, 0.7);
 
   return facts;
-}
-
-// ---------------------------------------------------------------------------
-// Identity-collision detection: OpenAlex sometimes merges several distinct
-// real people under one author id (common names, shared initials). A merged
-// profile mines facts for multiple humans at once, and if any of those facts
-// happens to overlap the user's own interests, the pipeline would draft a
-// confident, well-grounded-looking email about a stranger. This is a pure,
-// DB-free check on the mined fact counts so it can run right after mining and
-// before any drafting decision.
-//
-// Thresholds are calibrated against the pilot database: the 4 legitimate
-// profiles on file have 11, 23, 25, and 16 total facts (single-digit to low
-// double-digit collaborator/institution counts). The one confirmed collision
-// ("Wenwen Zhang", several unrelated people merged under one OpenAlex id) has
-// 330 total facts: 176 distinct collaborators and 136 distinct institutions.
-// A real, prolific senior researcher can legitimately have dozens of
-// collaborators over a career, so these thresholds are set comfortably above
-// that, not just above the legitimate profiles on file: 80 collaborators
-// (roughly 3-4x the busiest legitimate profile's whole fact count) and 40
-// institutions (a real career move count is a handful; 40 distinct
-// institutions is only plausible if OpenAlex has merged several people's
-// affiliation histories). Both sit far below the 176/136 seen in the
-// confirmed collision, leaving headroom without being so tight that a
-// genuinely prolific, well-connected professor gets wrongly flagged.
-export const COLLISION_MIN_COLLABORATORS = 80;
-export const COLLISION_MIN_INSTITUTIONS = 40;
-
-export interface IdentityCollisionVerdict {
-  suspected: boolean;
-  reason?: string;
-}
-
-// Pure function: counts distinct collaborator and institution fact values
-// (case-insensitively) and flags a profile whose counts imply more than one
-// person was merged into a single OpenAlex identity.
-export function detectIdentityCollision(facts: OntologyFact[]): IdentityCollisionVerdict {
-  const collaborators = new Set<string>();
-  const institutions = new Set<string>();
-  for (const f of facts) {
-    if (f.facet === 'academic' && f.key === 'collaborator') collaborators.add(f.value.trim().toLowerCase());
-    if (f.facet === 'trajectory' && f.key === 'institution') institutions.add(f.value.trim().toLowerCase());
-  }
-
-  const suspected = collaborators.size >= COLLISION_MIN_COLLABORATORS || institutions.size >= COLLISION_MIN_INSTITUTIONS;
-  if (!suspected) return { suspected: false };
-
-  return {
-    suspected: true,
-    reason: `identity collision suspected (${collaborators.size} collaborators, ${institutions.size} institutions)`,
-  };
 }
 
 export interface AuthorResolution {
@@ -317,15 +265,10 @@ export interface MineDeps {
 type SourceClass = 'homepage' | 'directory' | 'github_profile' | 'blog' | 'social' | 'aggregator';
 
 // D3 tier caps: a source class can never yield a fact above its cap.
-// github_profile is capped at B, not A: the only way a github.com page ever
-// reaches extraction is via the strict-name-match exception in
-// buildDomainGate below (a GitHub profile has no institution domain to
-// corroborate it), so a fact from it must never be treated as tier-A-strong
-// as an institution homepage or directory page is.
 const TIER_CAP: Record<SourceClass, 'A' | 'B' | 'C'> = {
   homepage: 'A',
   directory: 'A',
-  github_profile: 'B',
+  github_profile: 'A',
   blog: 'B',
   social: 'C',
   aggregator: 'C',
@@ -418,20 +361,6 @@ async function extractFactsFromPage(llm: LLMClient, personName: string, page: We
 // D5b domain gate: a page contributes facts only if its registrable domain
 // matches a known identity anchor (the resolved author's homepage / affiliation
 // domains from OpenAlex). This is what stops a same-named homonym's page.
-//
-// Tradeoff on the GitHub exception below: github.com can never appear in the
-// institution allow-list (a personal GitHub account is not an institution
-// homepage), so without an exception every GitHub search result gets dropped
-// here, and the "<name> github" query at D4 is permanently dead code. But
-// GitHub is exactly the kind of homonym trap the gate exists to stop: two
-// different people can share a name with completely unrelated GitHub
-// accounts. So the exception is narrow and strict: only github.com, only a
-// profile-shaped URL (a single path segment, not a repo/issue/gist page), and
-// only when the username itself strongly matches the target's name via the
-// same nameMatches() rule used for email local-parts (D2). Even then, a
-// GitHub-admitted page is capped at tier B (see TIER_CAP), so it can never by
-// itself be the sole grounding for a cold email; it can only corroborate
-// facts already anchored elsewhere.
 function buildDomainGate(author: OpenAlexCandidate): (page: WebPage) => boolean {
   // Match on the institution LABEL (registrable domain minus public suffix), not
   // the full registrable domain: an institution's marketing domain (tuwien.at)
@@ -445,8 +374,7 @@ function buildDomainGate(author: OpenAlexCandidate): (page: WebPage) => boolean 
   }
   return (page: WebPage) => {
     const label = domainLabel(page.url);
-    if (label != null && allowed.has(label)) return true;
-    return isNameMatchedGithubProfile(page, author.displayName);
+    return label != null && allowed.has(label);
   };
 }
 
@@ -457,34 +385,6 @@ const domainLabel = (url: string): string | null => {
     return null;
   }
 };
-
-// Strict GitHub exception to the domain gate (see comment above
-// buildDomainGate): github.com host only, a bare "/<username>" profile path
-// only (no repo/issue/gist pages), and the username must strongly match the
-// target's full name via the same rule as email local-part matching (D2).
-// The username is the stable identifier and is REQUIRED to match; the page
-// title, when present, is checked as additional corroboration but a missing
-// or unhelpful title never blocks admission on its own (many GitHub profile
-// pages have thin titles). Requiring the username match is what actually
-// carries the homonym guard: reusing nameMatches keeps that rule identical to
-// the one already trusted for email local-parts, rather than a second,
-// possibly looser, matcher.
-function isNameMatchedGithubProfile(page: WebPage, personName: string): boolean {
-  let url: URL;
-  try {
-    url = new URL(page.url);
-  } catch {
-    return false;
-  }
-  const host = url.hostname.replace(/^www\./, '');
-  if (host !== 'github.com') return false;
-
-  const segments = url.pathname.split('/').filter(Boolean);
-  if (segments.length !== 1) return false; // profile-shaped only: github.com/<user>
-  const username = segments[0]!;
-
-  return nameMatches(username, personName);
-}
 
 // D4: mine personal-facet facts for a resolved author. Combines the deterministic
 // OpenAlex facts with LLM-extracted, domain-gated, tier-clamped personal facts,
