@@ -12,12 +12,49 @@ const FEED = `<?xml version="1.0" encoding="UTF-8"?>
   </entry>
 </feed>`;
 
+function insertDraft(db: ReturnType<typeof openDb>, shortId: string, personId: number, status: string): void {
+  db.prepare(
+    `INSERT INTO drafts (short_id, person_id, paper_arxiv_id, paper_title, draft_input_json)
+     VALUES (?, ?, '2508.09217', 'T', '{}')`,
+  ).run(shortId, personId);
+  db.prepare('UPDATE drafts SET status = ? WHERE short_id = ?').run(status, shortId);
+}
+
 describe('deriveWatchAuthors', () => {
-  it('returns people already in the database', () => {
+  it('does not watch a person with no draft', () => {
     const db = openDb(':memory:');
-    upsertPerson(db, { name: 'Akshay Sajan' });
-    upsertPerson(db, { name: 'Wenwen Zhang' });
-    expect(deriveWatchAuthors(db).sort()).toEqual(['Akshay Sajan', 'Wenwen Zhang']);
+    upsertPerson(db, { name: 'No Draft Person' });
+    expect(deriveWatchAuthors(db)).toEqual([]);
+  });
+
+  it('watches a person with a draft whose status is sent', () => {
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'Sent Person' });
+    insertDraft(db, 'd1', pid, 'sent');
+    expect(deriveWatchAuthors(db)).toEqual(['Sent Person']);
+  });
+
+  it('watches a person with a draft whose status is approved', () => {
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'Approved Person' });
+    insertDraft(db, 'd2', pid, 'approved');
+    expect(deriveWatchAuthors(db)).toEqual(['Approved Person']);
+  });
+
+  it('does not watch a person whose only drafts are skipped or awaiting approval', () => {
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'Skipped Person' });
+    insertDraft(db, 'd3', pid, 'skipped');
+    insertDraft(db, 'd4', pid, 'awaiting_approval');
+    expect(deriveWatchAuthors(db)).toEqual([]);
+  });
+
+  it('lists a person once even with two qualifying drafts', () => {
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'Twice Contacted Person' });
+    insertDraft(db, 'd5', pid, 'sent');
+    insertDraft(db, 'd6', pid, 'approved');
+    expect(deriveWatchAuthors(db)).toEqual(['Twice Contacted Person']);
   });
 });
 

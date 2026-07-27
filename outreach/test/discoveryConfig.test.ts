@@ -60,7 +60,13 @@ describe('loadConfig', () => {
 
   it('merges derived authors with configured ones', () => {
     const db = dbWithGaps([]);
-    db.prepare("INSERT INTO people (name) VALUES ('Akshay Sajan')").run();
+    const res = db.prepare("INSERT INTO people (name) VALUES ('Akshay Sajan')").run();
+    const pid = Number(res.lastInsertRowid);
+    // A person is only auto-derived once they have a real thread (sent or approved draft).
+    db.prepare(
+      `INSERT INTO drafts (short_id, person_id, paper_arxiv_id, paper_title, status, draft_input_json)
+       VALUES ('d1', ?, '2508.09217', 'T', 'sent', '{}')`,
+    ).run(pid);
     const p = writeYaml('authors:\n  add: ["Alexander Wiltschko"]\n');
     expect(loadConfig(db, p).authors).toEqual(['Akshay Sajan', 'Alexander Wiltschko']);
   });

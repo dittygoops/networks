@@ -6,8 +6,19 @@ import { queryArxivFeed, type ArxivQueryOptions } from './arxivQuery.js';
 
 export type AuthorWatchOptions = ArxivQueryOptions;
 
+// Watching every person ever inserted grows unboundedly and re-checks
+// researchers already looked at once and dismissed. The derived watchlist is
+// limited to people with a real thread (a draft that was sent or approved),
+// matching the never-email-twice guard in approval/ledger.ts's priorThreads.
+// Anyone else can still be watched explicitly via watchlist.yaml's authors.add.
 export function deriveWatchAuthors(db: DB): string[] {
-  const rows = db.prepare('SELECT DISTINCT name FROM people WHERE name IS NOT NULL').all() as Array<{ name: string }>;
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT p.name FROM people p
+         JOIN drafts d ON d.person_id = p.id
+        WHERE d.status LIKE 'sent%' OR d.status = 'approved'`,
+    )
+    .all() as Array<{ name: string }>;
   return rows.map((r) => r.name).filter(Boolean);
 }
 
