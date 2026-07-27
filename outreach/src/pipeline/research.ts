@@ -127,6 +127,48 @@ export function factsFromOpenAlex(candidate: OpenAlexCandidate, raw: OpenAlexAut
   return facts;
 }
 
+// Thresholds are calibrated against the pilot database: the 4 legitimate
+// profiles on file have 11, 23, 25, and 16 total facts (single-digit to low
+// double-digit collaborator/institution counts). The one confirmed collision
+// ("Wenwen Zhang", several unrelated people merged under one OpenAlex id) has
+// 330 total facts: 176 distinct collaborators and 136 distinct institutions.
+// A real, prolific senior researcher can legitimately have dozens of
+// collaborators over a career, so these thresholds are set comfortably above
+// that, not just above the legitimate profiles on file: 80 collaborators
+// (roughly 3-4x the busiest legitimate profile's whole fact count) and 40
+// institutions (a real career move count is a handful; 40 distinct
+// institutions is only plausible if OpenAlex has merged several people's
+// affiliation histories). Both sit far below the 176/136 seen in the
+// confirmed collision, leaving headroom without being so tight that a
+// genuinely prolific, well-connected professor gets wrongly flagged.
+export const COLLISION_MIN_COLLABORATORS = 80;
+export const COLLISION_MIN_INSTITUTIONS = 40;
+
+export interface IdentityCollisionVerdict {
+  suspected: boolean;
+  reason?: string;
+}
+
+// Pure function: counts distinct collaborator and institution fact values
+// (case-insensitively) and flags a profile whose counts imply more than one
+// person was merged into a single OpenAlex identity.
+export function detectIdentityCollision(facts: OntologyFact[]): IdentityCollisionVerdict {
+  const collaborators = new Set<string>();
+  const institutions = new Set<string>();
+  for (const f of facts) {
+    if (f.facet === 'academic' && f.key === 'collaborator') collaborators.add(f.value.trim().toLowerCase());
+    if (f.facet === 'trajectory' && f.key === 'institution') institutions.add(f.value.trim().toLowerCase());
+  }
+
+  const suspected = collaborators.size >= COLLISION_MIN_COLLABORATORS || institutions.size >= COLLISION_MIN_INSTITUTIONS;
+  if (!suspected) return { suspected: false };
+
+  return {
+    suspected: true,
+    reason: `identity collision suspected (${collaborators.size} collaborators, ${institutions.size} institutions)`,
+  };
+}
+
 export interface AuthorResolution {
   author: OpenAlexCandidate;
   signals: string[]; // which corroboration signals fired
