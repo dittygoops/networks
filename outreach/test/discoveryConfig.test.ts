@@ -58,6 +58,13 @@ describe('loadConfig', () => {
     expect(cfg.gate.borderlineBand).toBe(0.1);
   });
 
+  it('merges derived authors with configured ones', () => {
+    const db = dbWithGaps([]);
+    db.prepare("INSERT INTO people (name) VALUES ('Akshay Sajan')").run();
+    const p = writeYaml('authors:\n  add: ["Alexander Wiltschko"]\n');
+    expect(loadConfig(db, p).authors).toEqual(['Akshay Sajan', 'Alexander Wiltschko']);
+  });
+
   it('maps borderline_band through to borderlineBand', () => {
     const p = writeYaml('gate:\n  borderline_band: 0.25\n');
     expect(loadConfig(dbWithGaps([]), p).gate.borderlineBand).toBe(0.25);

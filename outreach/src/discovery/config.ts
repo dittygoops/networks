@@ -4,6 +4,8 @@ import { readFileSync } from 'node:fs';
 import { parse } from 'yaml';
 import type { DB } from '../db/db.js';
 import { deriveGapQueries } from './gapSeeds.js';
+import { deriveWatchAuthors } from './sources/authorWatch.js';
+import { deriveSeedPapers } from './sources/recommend.js';
 
 export interface GateConfig {
   threshold: number;
@@ -47,20 +49,25 @@ function readFile(path: string): RawFile {
   }
 }
 
+function mergeUnique(derived: string[], added: string[]): string[] {
+  const out: string[] = [];
+  for (const v of [...derived, ...added]) {
+    if (v && !out.some((e) => e.toLowerCase() === v.toLowerCase())) out.push(v);
+  }
+  return out;
+}
+
 export function loadConfig(db: DB, path = 'config/watchlist.yaml'): LoopConfig {
   const raw = readFile(path);
   const mute = (raw.queries?.mute ?? []).map((m) => m.toLowerCase());
   const derived = deriveGapQueries(db).filter((q) => !mute.some((m) => q.toLowerCase().includes(m)));
 
-  const queries: string[] = [];
-  for (const q of [...derived, ...(raw.queries?.add ?? [])]) {
-    if (!queries.some((e) => e.toLowerCase() === q.toLowerCase())) queries.push(q);
-  }
+  const queries = mergeUnique(derived, raw.queries?.add ?? []);
 
   return {
     queries,
-    authors: raw.authors?.add ?? [],
-    seeds: raw.seeds?.add ?? [],
+    authors: mergeUnique(deriveWatchAuthors(db), raw.authors?.add ?? []),
+    seeds: mergeUnique(deriveSeedPapers(db), raw.seeds?.add ?? []),
     gate: {
       threshold: raw.gate?.threshold ?? DEFAULT_GATE.threshold,
       borderlineBand: raw.gate?.borderline_band ?? DEFAULT_GATE.borderlineBand,
