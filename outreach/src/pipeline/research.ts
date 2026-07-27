@@ -4,6 +4,7 @@ import { parse } from 'tldts';
 import {
   classifyWebPage,
   hostMatches,
+  nameMatches,
   type PageFetcher,
   type PaperContext,
   type SearchClient,
@@ -347,7 +348,7 @@ const D4_MAX_EXTRACT_PAGES = 3; // budget: <= 3 extraction LLM calls (+1 summary
 
 const hostname = (url: string): string => {
   try {
-    return (parse(url).hostname ?? '').replace(/^www\./, '');
+    return (parse(url).hostname ?? '').toLowerCase().replace(/^www\./, '');
   } catch {
     return '';
   }
@@ -418,29 +419,68 @@ async function extractFactsFromPage(llm: LLMClient, personName: string, page: We
   return null;
 }
 
-// D5b domain gate: a page contributes facts only if its registrable domain
-// matches a known identity anchor (the resolved author's homepage / affiliation
-// domains from OpenAlex). This is what stops a same-named homonym's page.
+// D5b domain gate: a page contributes facts only if it plausibly belongs to a
+// known identity anchor (the resolved author's homepage / affiliation domains
+// from OpenAlex). This is what stops a same-named homonym's page.
+//
+// Two admission rules, both needed:
+//
+// 1. EXACT HOSTNAME match (modulo a leading "www."). Any page on the identical
+//    host as an anchor is the same site, regardless of how generic its label
+//    is. This is what lets `cas.cn` (bare) still admit more pages on that
+//    exact host without opening the door to sibling subdomains.
+//
+// 2. LABEL match (registrable domain minus public suffix), but ONLY when the
+//    label is distinctive enough to identify a single institution. This is
+//    what makes `tuwien.at` (marketing domain) admit `www.cg.tuwien.ac.at`
+//    (academic domain): they share the label "tuwien", a name no other
+//    organization uses, even though the registrable domains differ.
+//
+//    The label rule is deliberately NOT applied when the label is short/
+//    generic, because for some institutions the label is shared across many
+//    independently-run sub-institutions living on different SUBDOMAINS of the
+//    same registrable domain, which hostname-equality (rule 1) does not
+//    collapse but label-equality alone would:
+//      - Chinese Academy of Sciences: label "cas" (english.qdio.cas.cn is the
+//        Qingdao Institute of Oceanology; english.ie.cas.cn is the Institute
+//        of Electronics. Same label, different institutes, different hosts.)
+//      - Oxford: label "ox" (balliol.ox.ac.uk is Balliol College;
+//        maths.ox.ac.uk is the Mathematics department. Same label, different
+//        organizations, different hosts.)
+//    MIN_DISTINCTIVE_LABEL_LENGTH=4 draws the line above these observed
+//    collision-prone labels ("ox"=2, "cas"=3, and other umbrella-org labels
+//    like "edu"=3, "ac"=2) and below real, unique institution names
+//    ("tuwien"=6, "stanford"=8). Any label under the threshold falls back to
+//    exact-hostname matching only (rule 1), which is the conservative,
+//    never-fabricate-safe default: reject rather than guess.
+export const MIN_DISTINCTIVE_LABEL_LENGTH = 4;
+
+// The two-rule test itself, exported so the one-off purge script (Phase 2 data
+// cleanup) can re-apply the exact same admission logic against DB-stored URLs
+// without duplicating it.
+export function anchorAdmitsUrl(anchorUrl: string, candidateUrl: string): boolean {
+  const anchorHost = hostname(anchorUrl);
+  const pageHost = hostname(candidateUrl);
+  if (!anchorHost || !pageHost) return false;
+  if (anchorHost === pageHost) return true; // rule 1: exact same site
+  const anchorLabel = domainLabel(anchorUrl);
+  const pageLabel = domainLabel(candidateUrl);
+  return (
+    anchorLabel != null &&
+    pageLabel != null &&
+    anchorLabel === pageLabel &&
+    pageLabel.length >= MIN_DISTINCTIVE_LABEL_LENGTH
+  ); // rule 2: distinctive shared institution name across TLDs
+}
+
 function buildDomainGate(author: OpenAlexCandidate): (page: WebPage) => boolean {
-  // Match on the institution LABEL (registrable domain minus public suffix), not
-  // the full registrable domain: an institution's marketing domain (tuwien.at)
-  // and its academic domain (tuwien.ac.at) share the label "tuwien" but differ
-  // as registrable domains. Homonyms at other institutions have a different
-  // label and are still rejected.
-  const allowed = new Set<string>();
-  for (const url of author.homepageUrls ?? []) {
-    const label = domainLabel(url);
-    if (label) allowed.add(label);
-  }
-  return (page: WebPage) => {
-    const label = domainLabel(page.url);
-    return label != null && allowed.has(label);
-  };
+  const anchors = (author.homepageUrls ?? []).filter((url) => hostname(url));
+  return (page: WebPage) => anchors.some((anchor) => anchorAdmitsUrl(anchor, page.url));
 }
 
 const domainLabel = (url: string): string | null => {
   try {
-    return parse(url).domainWithoutSuffix || null;
+    return (parse(url).domainWithoutSuffix || '').toLowerCase() || null;
   } catch {
     return null;
   }
@@ -541,6 +581,7 @@ async function minePersonalFacts(
   let extractCalls = 0;
   for (const page of pages) {
     if (!gate(page)) continue; // D5b: off-domain (homonym) pages are dropped
+    if (!pageIsAboutPerson(page, name)) continue; // page is on-domain but about someone else
     if (extractCalls >= D4_MAX_EXTRACT_PAGES) break; // D4 budget
     extractCalls++;
     const cap = TIER_CAP[pageSourceClass(page, name)];
@@ -569,6 +610,54 @@ function safeClassify(page: WebPage, name: string): ReturnType<typeof classifyWe
   } catch {
     return 'aggregator'; // treat unparseable URLs as non-contributing
   }
+}
+
+// D5b page-identity gate: the domain gate only proves the page is on a known
+// institution's site, not that the page is ABOUT the target person. A
+// colleague's profile on the same site (e.g. a lab-mate's staff page, another
+// student's directory entry) passes the domain gate cleanly, which is exactly
+// how a stranger's facts got attributed to the wrong recipient in production.
+//
+// Be conservative: a page must show its OWN evidence of being about this
+// person, not merely mention them. Two sources of evidence, both reused
+// rather than reinvented:
+//   1. classifyWebPage's 'homepage' (or 'github_profile') classification,
+//      which already requires the person's name pattern to appear in the
+//      page's URL or title, not just its body.
+//   2. The page's leading heading line (its first non-blank line of content)
+//      carries the person's name, via the same local-part name matcher used
+//      for email addresses (nameMatches). This is deliberately NOT a scan of
+//      the whole body: a directory or lab-listing page legitimately mentions
+//      many people in its body, so "the name appears somewhere on the page"
+//      is not evidence the page is about them specifically; only a leading
+//      heading is.
+// A page about someone else entirely (a colleague sharing the institution
+// domain) matches neither and is rejected.
+export function pageIsAboutPerson(page: WebPage, personName: string): boolean {
+  const cls = safeClassify(page, personName);
+  if (cls === 'homepage' || cls === 'github_profile') return true;
+  const heading = (page.content ?? '').split('\n').map((l) => l.trim()).find((l) => l.length > 0) ?? '';
+  return heading.length > 0 && nameMatches(heading, personName);
+}
+
+// URL-only sibling of pageIsAboutPerson, for callers (the Phase 2 purge
+// script) that have only a stored source_url and no re-fetchable title or
+// content. Checks whether the URL's final path segment (the profile slug,
+// e.g. "dr-jan-delcker" or "BernhardKerbl") carries the target's name, via
+// the same nameMatches local-part matcher used for email addresses. Returns
+// null (not false) when the URL has no path segment to judge at all (a bare
+// domain root), since that is "cannot evaluate", not "fails": guessing either
+// way would be fabrication, so the caller must treat null as its own case.
+export function urlSlugMatchesPerson(url: string, personName: string): boolean | null {
+  let slug = '';
+  try {
+    const segments = new URL(url).pathname.split('/').filter(Boolean);
+    slug = segments.at(-1) ?? '';
+  } catch {
+    return null;
+  }
+  if (!slug) return null;
+  return nameMatches(slug, personName);
 }
 
 // ---------------------------------------------------------------------------

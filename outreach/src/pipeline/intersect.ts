@@ -155,9 +155,29 @@ export const isGenericEntity = (value: string): boolean => GENERIC_SET.has(normE
 const isSpecificHook = (h: Intersection): boolean =>
   !isGenericEntity(h.selfValue) && !isGenericEntity(h.personValue);
 
+// Whole-word containment: true when `needle`'s tokens appear as a CONTIGUOUS
+// run inside `haystack`'s tokens, at word boundaries. Plain raw substring
+// containment (`haystack.includes(needle)`) is wrong here: the normalized
+// string "heterogeneous molecular signatures of human odor perception"
+// CONTAINS the raw substring "nature" (inside "signatures"), which produced a
+// live bad hook ("both: Nature") built entirely on a spelling coincidence.
+// Tokenizing first and requiring a contiguous token match closes that hole
+// while still matching legitimate cases like "gaussian splatting" inside
+// "3d gaussian splatting".
+function containsWholeWords(haystack: string, needle: string): boolean {
+  const h = haystack.split(' ');
+  const n = needle.split(' ');
+  if (n.length === 0 || n.length > h.length) return false;
+  for (let i = 0; i <= h.length - n.length; i++) {
+    if (n.every((tok, j) => h[i + j] === tok)) return true;
+  }
+  return false;
+}
+
 // Deterministic entity overlap: same normalized value (0.95), or one clearly
-// contains the other (0.85), e.g. "gaussian splatting" in "3d gaussian splatting".
-// This is the reliable core of intersection scoring, independent of the LLM.
+// contains the other at word boundaries (0.85), e.g. "gaussian splatting" in
+// "3d gaussian splatting". This is the reliable core of intersection scoring,
+// independent of the LLM.
 function entityMatches(self: StoredFact[], person: StoredFact[]): Intersection[] {
   const out: Intersection[] = [];
   for (const s of self) {
@@ -168,7 +188,7 @@ function entityMatches(self: StoredFact[], person: StoredFact[]): Intersection[]
       if (np.length < 3) continue;
       let strength = 0;
       if (ns === np) strength = 0.95;
-      else if (Math.min(ns.length, np.length) >= 5 && (ns.includes(np) || np.includes(ns))) strength = 0.85;
+      else if (Math.min(ns.length, np.length) >= 5 && (containsWholeWords(ns, np) || containsWholeWords(np, ns))) strength = 0.85;
       if (!strength) continue;
       out.push({
         selfFactId: s.id,

@@ -121,6 +121,106 @@ describe('minePerson (D4/D5b/D6a)', () => {
     expect(facts.some((f) => f.sourceUrl === homonym)).toBe(false);
   });
 
+  test('rejects a different CAS institute sharing only the "cas" label (D5b domain gate, live case: Hanbo Bi)', async () => {
+    // Live bug: english.qdio.cas.cn (Qingdao Institute of Oceanology, the real
+    // anchor) and english.ie.cas.cn (Institute of Electronics) both reduce to
+    // the label "cas" under naive label matching, so Hanbo Bi's profile picked
+    // up 17 facts about Arctic sea ice from an entirely different institute.
+    const hanboBi: AuthorResolution = {
+      author: { ...candidate, displayName: 'Hanbo Bi', homepageUrls: ['https://english.qdio.cas.cn/'] },
+      signals: ['coauthor'],
+    };
+    const contaminated = 'https://english.ie.cas.cn/about/people/hanbo-bi';
+    const { client, calls } = makeLLM(() =>
+      JSON.stringify([{ facet: 'academic', key: 'research_area', value: 'Arctic sea ice variability', confidence: 0.8, proposedTier: 'A' }]),
+    );
+    const deps = makeDeps({
+      llm: client,
+      searchResults: [{ url: contaminated, title: 'Hanbo Bi', content: 'Hanbo Bi studies Arctic sea ice variability.' }],
+      fetched: { [contaminated]: 'Hanbo Bi studies Arctic sea ice variability.' },
+    });
+
+    const { facts } = await minePerson(deps, hanboBi, { ...raw, id: 'https://openalex.org/A_HANBO', display_name: 'Hanbo Bi' });
+
+    expect(calls.extract).toHaveLength(0); // gated out before the LLM ever sees it
+    expect(facts.some((f) => f.sourceUrl === contaminated)).toBe(false);
+  });
+
+  test('rejects a different Oxford college sharing only the "ox" label (D5b domain gate, live case: Robin Karlsson)', async () => {
+    // Live bug: balliol.ox.ac.uk (Balliol College) and maths.ox.ac.uk (Oxford
+    // Maths) both reduce to the label "ox", so Robin Karlsson's profile picked
+    // up 23 facts about Black Holes / AdS-CFT / conformal bootstrap from a
+    // completely different Oxford department.
+    const robinKarlsson: AuthorResolution = {
+      author: { ...candidate, displayName: 'Robin Karlsson', homepageUrls: ['https://balliol.ox.ac.uk/'] },
+      signals: ['coauthor'],
+    };
+    const contaminated = 'https://maths.ox.ac.uk/people/robin-karlsson';
+    const { client, calls } = makeLLM(() =>
+      JSON.stringify([{ facet: 'academic', key: 'research_area', value: 'AdS/CFT', confidence: 0.8, proposedTier: 'A' }]),
+    );
+    const deps = makeDeps({
+      llm: client,
+      searchResults: [{ url: contaminated, title: 'Robin Karlsson', content: 'Robin Karlsson works on Black Holes and AdS/CFT.' }],
+      fetched: { [contaminated]: 'Robin Karlsson works on Black Holes and AdS/CFT.' },
+    });
+
+    const { facts } = await minePerson(deps, robinKarlsson, { ...raw, id: 'https://openalex.org/A_ROBIN', display_name: 'Robin Karlsson' });
+
+    expect(calls.extract).toHaveLength(0);
+    expect(facts.some((f) => f.sourceUrl === contaminated)).toBe(false);
+  });
+
+  test('rejects a colleague page on the SAME on-domain site (D5b person-page gate, live case: Nicolai Plintz / Jan Delcker)', async () => {
+    // Live bug: the domain gate passes (same host as the anchor), but the page
+    // is a team profile for a different person, Dr. Jan Delcker. Nicolai
+    // Plintz's profile picked up 10 facts, including Jan Delcker's title and
+    // research areas, from this exact URL.
+    const nicolaiPlintz: AuthorResolution = {
+      author: { ...candidate, displayName: 'Nicolai Plintz', homepageUrls: ['https://www.bwl.uni-mannheim.de/ifenthaler/'] },
+      signals: ['coauthor'],
+    };
+    const colleaguePage = 'https://www.bwl.uni-mannheim.de/en/ifenthaler/team/dr-jan-delcker';
+    const { client, calls } = makeLLM(() =>
+      JSON.stringify([{ facet: 'trajectory', key: 'role', value: 'Research Associate', confidence: 0.8, proposedTier: 'A' }]),
+    );
+    const deps = makeDeps({
+      llm: client,
+      searchResults: [{ url: colleaguePage, title: 'Dr. Jan Delcker - Team - Chair of Ifenthaler', content: '' }],
+      fetched: { [colleaguePage]: 'Dr. Jan Delcker\nResearch Associate, Chair of Learning, Design and Technology.' },
+    });
+
+    const { facts } = await minePerson(deps, nicolaiPlintz, { ...raw, id: 'https://openalex.org/A_PLINTZ', display_name: 'Nicolai Plintz' });
+
+    expect(calls.extract).toHaveLength(0); // same-domain, but not about the target: rejected
+    expect(facts.some((f) => f.sourceUrl === colleaguePage)).toBe(false);
+  });
+
+  test('rejects a colleague page on the SAME on-domain site (D5b person-page gate, live case: Arvind Murari Vepa / Aravinth Ruppa)', async () => {
+    // Live bug: same host as the anchor, but the page is about a different
+    // student, Aravinth Ruppa. Arvind Murari Vepa's profile picked up 7 facts,
+    // including "Undergraduate Student" and Economics research areas, from
+    // this exact URL.
+    const arvindVepa: AuthorResolution = {
+      author: { ...candidate, displayName: 'Arvind Murari Vepa', homepageUrls: ['https://chianglab.healthsciences.ucla.edu/'] },
+      signals: ['coauthor'],
+    };
+    const colleaguePage = 'https://chianglab.healthsciences.ucla.edu/people/aravinth-ruppa';
+    const { client, calls } = makeLLM(() =>
+      JSON.stringify([{ facet: 'trajectory', key: 'role', value: 'Undergraduate Student', confidence: 0.8, proposedTier: 'A' }]),
+    );
+    const deps = makeDeps({
+      llm: client,
+      searchResults: [{ url: colleaguePage, title: 'Aravinth Ruppa | Chiang Lab', content: '' }],
+      fetched: { [colleaguePage]: 'Aravinth Ruppa\nUndergraduate Student, Economics.' },
+    });
+
+    const { facts } = await minePerson(deps, arvindVepa, { ...raw, id: 'https://openalex.org/A_VEPA', display_name: 'Arvind Murari Vepa' });
+
+    expect(calls.extract).toHaveLength(0);
+    expect(facts.some((f) => f.sourceUrl === colleaguePage)).toBe(false);
+  });
+
   test('allows a page on the institution academic domain when the anchor is its marketing domain', async () => {
     // Live case: TU Wien's OpenAlex homepage is tuwien.at, but Kerbl's real
     // staff page is on cg.tuwien.ac.at. Same institution, different registrable

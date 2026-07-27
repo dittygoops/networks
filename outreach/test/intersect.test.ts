@@ -241,6 +241,33 @@ describe('computeIntersections with paper-derived facts (paper-fact hook gap)', 
   });
 });
 
+// The diagnosed live-run failure: raw substring containment matched the
+// normalized self value "heterogeneous molecular signatures of human odor
+// perception" against the person value "Nature" because "nature" is a raw
+// substring of "signatures". That spelling coincidence was the ONLY hook for
+// two real people (Yitong Zhu, Zhuo Li), so their draft would have opened on
+// a fabricated shared interest. Word-boundary matching must not find "nature"
+// inside "signatures".
+describe('entityMatches word-boundary regression (D6, live bad case)', () => {
+  test('"Nature" does not match inside "...Signatures of Human Odor Perception..."', async () => {
+    const db = openDb(':memory:');
+    saveSelfFacts(db, [
+      fact({
+        key: 'key_paper',
+        value: 'Heterogeneous Molecular Signatures of Human Odor Perception (Zanineli 2026)',
+      }),
+    ]);
+    const pid = upsertPerson(db, { name: 'Yitong Zhu', openalexId: 'A_ZANINELI' });
+    saveFacts(db, pid, [fact({ key: 'venue', value: 'Nature' })]);
+
+    const { ranked, noStrongHook } = await computeIntersections(db, { llm: fakeLLM('[]') }, pid);
+
+    expect(ranked.some((x) => x.personValue === 'Nature')).toBe(false);
+    expect(ranked).toHaveLength(0);
+    expect(noStrongHook).toBe(true);
+  });
+});
+
 describe('isGenericEntity', () => {
   test('flags broad fields, commodity tools, and geographic/organizational generics', () => {
     expect(isGenericEntity('computer science')).toBe(true);
