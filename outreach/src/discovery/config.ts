@@ -27,11 +27,23 @@ interface RawFile {
 
 const DEFAULT_GATE: GateConfig = { threshold: 0.6, borderlineBand: 0.1, maxMessagesPerRun: 3 };
 
+// An absent file is the normal zero-config path, so it stays quiet. A file that
+// exists but cannot be read or parsed is reported: silently ignoring it would
+// un-mute queries and reset gate values that the user believes are in force.
 function readFile(path: string): RawFile {
+  let text: string;
   try {
-    return (parse(readFileSync(path, 'utf8')) as RawFile) ?? {};
-  } catch {
-    return {}; // absent or unreadable means pure auto derivation
+    text = readFileSync(path, 'utf8');
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return {};
+    console.warn(`watchlist config at ${path} could not be read, falling back to auto derivation: ${String(e)}`);
+    return {};
+  }
+  try {
+    return (parse(text) as RawFile) ?? {};
+  } catch (e) {
+    console.warn(`watchlist config at ${path} could not be parsed, falling back to auto derivation: ${String(e)}`);
+    return {};
   }
 }
 

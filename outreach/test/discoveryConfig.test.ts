@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -56,5 +56,36 @@ describe('loadConfig', () => {
     expect(cfg.gate.threshold).toBe(0.75);
     expect(cfg.gate.maxMessagesPerRun).toBe(1);
     expect(cfg.gate.borderlineBand).toBe(0.1);
+  });
+
+  it('maps borderline_band through to borderlineBand', () => {
+    const p = writeYaml('gate:\n  borderline_band: 0.25\n');
+    expect(loadConfig(dbWithGaps([]), p).gate.borderlineBand).toBe(0.25);
+  });
+
+  it('stays silent when the config file is simply absent', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      loadConfig(dbWithGaps(['olfactory embedding space']), '/nonexistent/watchlist.yaml');
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('warns and falls back to auto derivation when the file is malformed', () => {
+    // Unclosed flow sequence: verified to throw in the yaml parser.
+    const p = writeYaml('queries:\n  add: [unclosed\n');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const cfg = loadConfig(dbWithGaps(['olfactory embedding space']), p);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]?.[0])).toContain(p);
+      // The run still proceeds on auto derived defaults rather than throwing.
+      expect(cfg.queries).toEqual(['olfactory embedding space']);
+      expect(cfg.gate.threshold).toBe(0.6);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
