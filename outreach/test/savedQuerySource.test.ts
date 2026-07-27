@@ -127,3 +127,37 @@ describe('parseSearchFeed', () => {
     expect(got[0]).toMatchObject({ arxivId: '2601.00003', title: 'Solo Entry' });
   });
 });
+
+describe('savedQuery total failure reporting', () => {
+  const FEED_OK = `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry><id>http://arxiv.org/abs/2601.00009v1</id><title>Fine</title><summary>ok</summary></entry>
+</feed>`;
+
+  it('throws when every query fails, rather than reporting an empty quiet day', async () => {
+    const fetchFn = vi.fn().mockResolvedValue(new Response('', { status: 429 }));
+    const src = createSavedQuerySource(['a', 'b', 'c'], {
+      fetchFn: fetchFn as unknown as typeof fetch,
+      delayMs: 0,
+    });
+    await expect(src.fetch()).rejects.toThrow('all 3 arXiv all queries failed');
+  });
+
+  it('does not throw when at least one query succeeds', async () => {
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(new Response('', { status: 429 }))
+      .mockResolvedValueOnce(new Response(FEED_OK, { status: 200 }));
+    const src = createSavedQuerySource(['bad', 'good'], {
+      fetchFn: fetchFn as unknown as typeof fetch,
+      delayMs: 0,
+    });
+    expect(await src.fetch()).toHaveLength(1);
+  });
+
+  it('an empty query list is not a failure', async () => {
+    const fetchFn = vi.fn();
+    const src = createSavedQuerySource([], { fetchFn: fetchFn as unknown as typeof fetch, delayMs: 0 });
+    expect(await src.fetch()).toEqual([]);
+  });
+});

@@ -71,10 +71,26 @@ describe('authorWatch source', () => {
     });
   });
 
-  it('skips an author whose request fails', async () => {
-    const fetchFn = vi.fn().mockResolvedValue(new Response('', { status: 500 }));
-    const src = createAuthorWatchSource(['X'], { fetchFn: fetchFn as unknown as typeof fetch, delayMs: 0 });
-    expect(await src.fetch()).toEqual([]);
+  it('skips an author whose request fails but still returns the others', async () => {
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(new Response('', { status: 500 }))
+      .mockResolvedValueOnce(new Response(FEED, { status: 200 }));
+    const src = createAuthorWatchSource(['Broken', 'Working'], {
+      fetchFn: fetchFn as unknown as typeof fetch,
+      delayMs: 0,
+    });
+    const got = await src.fetch();
+    expect(got).toHaveLength(1);
+    expect(got[0]?.sourceDetail).toBe('author: Working');
+  });
+
+  // A silent wipeout reads as "no new papers" when arXiv is actually refusing
+  // us, so total failure has to surface rather than return an empty list.
+  it('throws when every author request fails, so the run reports it', async () => {
+    const fetchFn = vi.fn().mockResolvedValue(new Response('', { status: 429 }));
+    const src = createAuthorWatchSource(['A', 'B'], { fetchFn: fetchFn as unknown as typeof fetch, delayMs: 0 });
+    await expect(src.fetch()).rejects.toThrow('all 2 arXiv au queries failed');
   });
 });
 

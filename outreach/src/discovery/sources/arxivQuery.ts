@@ -72,6 +72,8 @@ export async function queryArxivFeed(
   const delayMs = opts.delayMs ?? 3000;
 
   const out: Candidate[] = [];
+  const failures: string[] = [];
+
   for (const term of terms) {
     await arxivGate(delayMs);
     try {
@@ -79,7 +81,12 @@ export async function queryArxivFeed(
         `http://export.arxiv.org/api/query?search_query=${prefix}:${encodeURIComponent(`"${term}"`)}` +
         `&sortBy=submittedDate&sortOrder=descending&max_results=${maxResults}`;
       const res = await fetchFn(url);
-      if (!res.ok) continue; // one bad term must not sink the rest
+      if (!res.ok) {
+        // One bad term must not sink the rest, but it must not vanish either.
+        failures.push(`${term}: HTTP ${res.status}`);
+        console.warn(`arXiv query failed for ${JSON.stringify(term)}: HTTP ${res.status}`);
+        continue;
+      }
       for (const e of parseSearchFeed(await res.text())) {
         out.push({
           arxivId: e.arxivId,
@@ -89,9 +96,19 @@ export async function queryArxivFeed(
           sourceDetail: label(term),
         });
       }
-    } catch {
-      continue;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      failures.push(`${term}: ${msg}`);
+      console.warn(`arXiv query failed for ${JSON.stringify(term)}: ${msg}`);
     }
+  }
+
+  // A total wipeout is indistinguishable from a quiet day if we stay silent,
+  // and "seen 0" would read as "no new papers" when arXiv is actually refusing
+  // us. Throwing here routes it into discoverAll's per source error list, which
+  // reaches the run summary the approver is texted.
+  if (terms.length > 0 && failures.length === terms.length) {
+    throw new Error(`all ${terms.length} arXiv ${prefix} queries failed (${failures[0] ?? 'unknown'})`);
   }
   return out;
 }
