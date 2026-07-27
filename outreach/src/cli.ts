@@ -23,6 +23,13 @@ import { extractPdfText } from './pipeline/pdf.js';
 import { createTavilyClient } from './search/tavily.js';
 import { createOpenRouterClient } from './llm/client.js';
 import type { OntologyFact } from './pipeline/research.js';
+import { runLoop } from './pipeline/loop.js';
+import { loadConfig } from './discovery/config.js';
+import { createSavedQuerySource } from './discovery/sources/savedQuery.js';
+import { createAuthorWatchSource } from './discovery/sources/authorWatch.js';
+import { createRecommendSource } from './discovery/sources/recommend.js';
+import { createStubChannel } from './approval/channel.js';
+import { createPhotonChannel, photonOptionsFromEnv } from './approval/photonChannel.js';
 
 // Read a source document as text (PDF via unpdf, otherwise UTF-8).
 async function readDocument(path: string): Promise<{ label: string; text: string }> {
@@ -92,6 +99,67 @@ function showSelfFacts(db: ReturnType<typeof openDb>): void {
   }
 }
 
+// `loop [--dry-run]`: one full discover-gate-draft-message cycle. A dry run
+// must never construct the real Photon channel and must never send email
+// (SAFETY, non-negotiable): the stub channel and a zero reply window keep it
+// fully offline on the notify/message side.
+async function cmdLoop(argv: string[]): Promise<void> {
+  const dryRun = argv.includes('--dry-run');
+  const db = openDb(DB_PATH);
+  const config = loadConfig(db);
+  const llm = createOpenRouterClient();
+
+  const tavilyKey = process.env.TAVILY_API_KEY;
+  if (!tavilyKey) throw new Error('TAVILY_API_KEY is not set');
+  const tavily = createTavilyClient(tavilyKey);
+
+  const sources = [
+    createSavedQuerySource(config.queries),
+    createAuthorWatchSource(config.authors),
+    createRecommendSource(config.seeds),
+  ];
+
+  // A dry run must never touch the real iMessage thread.
+  const channel = dryRun ? createStubChannel() : await createPhotonChannel(photonOptionsFromEnv());
+
+  try {
+    const summary = await runLoop(
+      {
+        db,
+        channel,
+        config,
+        sources,
+        terms: config.queries,
+        // LoopDeps types this as (deps: unknown, arxivId) for pipeline-agnostic
+        // callers; processPaper's real deps type is OrchestrateDeps, so the
+        // cast below just bridges that, orchestrateDeps below is still the
+        // real OrchestrateDeps shape at the call site.
+        processPaper: (deps, arxivId) => processPaper(deps as Parameters<typeof processPaper>[0], arxivId),
+        generateDraft,
+        buildDraftInput: (r) => ({
+          recipient: { name: r.target, paperTitle: r.paperTitle },
+          hooks: r.hooks,
+          intent: 'seeking direction',
+          senderName: 'Aditya Gupta',
+        }),
+        sender: makeSender(),
+        senderEmail: process.env.SENDER_EMAIL ?? 'apgupta3@asu.edu',
+        llm,
+        orchestrateDeps: { db, search: tavily, fetcher: tavily, llm },
+        replyWindowMs: dryRun ? 0 : 20000,
+      },
+      { dryRun },
+    );
+
+    console.log(JSON.stringify(summary, null, 2));
+  } finally {
+    // Must run even if runLoop throws: the real channel holds a resumable
+    // message stream open, so skipping this leaves the process hanging
+    // forever and the next scheduled run never starts.
+    await channel.close?.();
+  }
+}
+
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
   if (command === 'persona') return runPersona(rest);
@@ -99,10 +167,11 @@ async function main(): Promise<void> {
     showSelfFacts(openDb(DB_PATH));
     return;
   }
+  if (command === 'loop') return cmdLoop(rest);
 
   const arg = rest[0];
   if (command !== 'add' || !arg) {
-    console.error('usage: cli.ts add <arxiv-id>  |  cli.ts persona <doc-path...> [--answers <file.json>]');
+    console.error('usage: cli.ts add <arxiv-id>  |  cli.ts persona <doc-path...> [--answers <file.json>]  |  cli.ts loop [--dry-run]');
     process.exit(1);
   }
   const tavilyKey = process.env.TAVILY_API_KEY;
@@ -204,7 +273,7 @@ async function main(): Promise<void> {
     }
 
     // F9 hard rule: warn (and require override) when this person already has a thread.
-    const prior = priorThreads(db, r.personId);
+    const prior = priorThreads(db, r.personId, persisted.draftId);
     if (prior.length > 0 && !process.argv.includes('--force')) {
       console.log(`REFUSED: ${r.target} already has a thread (${prior.map((t) => `${t.shortId} ${t.status}`).join(', ')}).`);
       console.log('Re-run with --force to override.');

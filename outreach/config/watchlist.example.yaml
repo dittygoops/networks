@@ -1,0 +1,13 @@
+# Optional overrides. Delete this file entirely to run on pure auto derivation.
+# Copy to config/watchlist.yaml to activate.
+queries:
+  add: ["principal odor map", "olfactory embedding"]
+  mute: ["gaussian splatting"]   # suppress a research thread you are not pursuing
+authors:
+  add: ["Alexander Wiltschko"]
+seeds:
+  add: ["2306.12345"]
+gate:
+  threshold: 0.6
+  borderline_band: 0.1           # scores within this of threshold go to the LLM judge
+  max_messages_per_run: 3        # hard cap so the phone never floods

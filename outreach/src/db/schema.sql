@@ -96,3 +96,19 @@ CREATE TABLE IF NOT EXISTS draft_events (
   created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_events_draft ON draft_events(draft_id);
+
+CREATE TABLE IF NOT EXISTS seen_papers (
+  arxiv_id TEXT PRIMARY KEY,   -- natural dedup key, survives rowid reuse
+  title TEXT NOT NULL,
+  discovered_via TEXT NOT NULL CHECK(discovered_via IN ('saved_query','author_watch','recommend')),
+  source_detail TEXT,
+  relevance REAL,
+  status TEXT NOT NULL DEFAULT 'discovered' CHECK(status IN
+    ('discovered','filtered_low_relevance','drafted_unsendable','queued_for_message','messaged','sent','rejected')),
+  draft_id INTEGER REFERENCES drafts(id),
+  reason TEXT,
+  first_seen_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_seen_status ON seen_papers(status);

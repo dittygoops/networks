@@ -587,12 +587,16 @@ git commit -m "Add watchlist config with auto-derived defaults and mute support"
 ### Task 4: Saved-query discovery source
 
 **Files:**
+- Create: `outreach/src/discovery/sources/arxivQuery.ts` (shared arXiv feed helper)
 - Create: `outreach/src/discovery/sources/savedQuery.ts`
 - Test: `outreach/test/savedQuerySource.test.ts`
 
 **Interfaces:**
-- Consumes: `Candidate`, `DiscoverySource` from `../types.js`; `FetchFn` from `../../openalex/client.js`
-- Produces: `parseArxivSearchFeed(xml): Candidate[]` (partial, caller sets source fields); `createSavedQuerySource(queries, opts): DiscoverySource`
+- Consumes: `Candidate`, `DiscoverySource`, `DiscoveredVia` from `../types.js`
+- Produces (from `arxivQuery.ts`): `parseSearchFeed(xml)`, `sleep(ms)`, `ArxivQueryOptions`, `queryArxivFeed(prefix, terms, via, label, opts): Promise<Candidate[]>`
+- Produces (from `savedQuery.ts`): `createSavedQuerySource(queries, opts): DiscoverySource`
+
+**Why a shared helper:** the saved-query and author-watch sources differ only by the arXiv search prefix (`all:` vs `au:`) and the `sourceDetail` label. Task 5 builds author-watch on this same helper, so the sequential-with-delay loop, the per-term try/catch, and the feed parsing exist once.
 
 **Context:** arXiv's search API returns the same Atom format the existing `parseArxivAtom` handles, but for multiple entries. Etiquette is roughly one request per three seconds, so queries run sequentially with a delay.
 
@@ -665,18 +669,18 @@ describe('savedQuery source', () => {
 Run: `cd outreach && npx vitest run test/savedQuerySource.test.ts`
 Expected: FAIL, cannot resolve `../src/discovery/sources/savedQuery.js`
 
-- [ ] **Step 3: Write the implementation**
+- [ ] **Step 3: Write the shared arXiv feed helper**
 
-Create `outreach/src/discovery/sources/savedQuery.ts`:
+Create `outreach/src/discovery/sources/arxivQuery.ts`:
 
 ```typescript
-// Saved-query source: runs each derived or configured query against the arXiv
-// search API. Queries run sequentially with a delay (arXiv etiquette is roughly
-// one request per three seconds).
+// Shared arXiv query machinery. The saved-query and author-watch sources differ
+// only by search prefix and label, so the sequential-with-delay loop, the
+// per-term isolation, and the Atom parsing live here once.
 import { XMLParser } from 'fast-xml-parser';
-import type { Candidate, DiscoverySource } from '../types.js';
+import type { Candidate, DiscoveredVia } from '../types.js';
 
-export interface SavedQueryOptions {
+export interface ArxivQueryOptions {
   fetchFn?: typeof fetch;
   maxResults?: number;
   delayMs?: number;
@@ -699,7 +703,6 @@ function clean(s: unknown): string {
   return String(s ?? '').replace(/\s+/g, ' ').trim();
 }
 
-// Exported for reuse by the recommend source.
 export function parseSearchFeed(xml: string): Array<{ arxivId: string; title: string; abstract: string }> {
   const feed = parser.parse(xml)?.feed;
   return asArray<AtomEntry>(feed?.entry)
@@ -710,55 +713,77 @@ export function parseSearchFeed(xml: string): Array<{ arxivId: string; title: st
     .filter((x): x is { arxivId: string; title: string; abstract: string } => x !== null);
 }
 
-const sleep = (ms: number) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
+// arXiv etiquette is roughly one request per three seconds, so terms run
+// sequentially with a delay between them.
+export const sleep = (ms: number) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
 
-export function createSavedQuerySource(queries: string[], opts: SavedQueryOptions = {}): DiscoverySource {
+export async function queryArxivFeed(
+  prefix: 'all' | 'au',
+  terms: string[],
+  via: DiscoveredVia,
+  label: (term: string) => string,
+  opts: ArxivQueryOptions = {},
+): Promise<Candidate[]> {
   const fetchFn = opts.fetchFn ?? fetch;
   const maxResults = opts.maxResults ?? 20;
   const delayMs = opts.delayMs ?? 3000;
 
+  const out: Candidate[] = [];
+  for (let i = 0; i < terms.length; i++) {
+    const term = terms[i];
+    if (i > 0) await sleep(delayMs);
+    try {
+      const url =
+        `http://export.arxiv.org/api/query?search_query=${prefix}:${encodeURIComponent(`"${term}"`)}` +
+        `&sortBy=submittedDate&sortOrder=descending&max_results=${maxResults}`;
+      const res = await fetchFn(url);
+      if (!res.ok) continue; // one bad term must not sink the rest
+      for (const e of parseSearchFeed(await res.text())) {
+        out.push({
+          arxivId: e.arxivId,
+          title: e.title,
+          abstract: e.abstract,
+          discoveredVia: via,
+          sourceDetail: label(term),
+        });
+      }
+    } catch {
+      continue;
+    }
+  }
+  return out;
+}
+```
+
+- [ ] **Step 4: Write the saved-query source**
+
+Create `outreach/src/discovery/sources/savedQuery.ts`:
+
+```typescript
+// Saved-query source: runs each derived or configured query against arXiv.
+import type { DiscoverySource } from '../types.js';
+import { queryArxivFeed, type ArxivQueryOptions } from './arxivQuery.js';
+
+export type SavedQueryOptions = ArxivQueryOptions;
+
+export function createSavedQuerySource(queries: string[], opts: SavedQueryOptions = {}): DiscoverySource {
   return {
     name: 'saved_query',
-    async fetch(): Promise<Candidate[]> {
-      const out: Candidate[] = [];
-      for (let i = 0; i < queries.length; i++) {
-        const q = queries[i];
-        if (i > 0) await sleep(delayMs);
-        try {
-          const url =
-            `http://export.arxiv.org/api/query?search_query=all:${encodeURIComponent(`"${q}"`)}` +
-            `&sortBy=submittedDate&sortOrder=descending&max_results=${maxResults}`;
-          const res = await fetchFn(url);
-          if (!res.ok) continue; // one bad query must not sink the rest
-          for (const e of parseSearchFeed(await res.text())) {
-            out.push({
-              arxivId: e.arxivId,
-              title: e.title,
-              abstract: e.abstract,
-              discoveredVia: 'saved_query',
-              sourceDetail: `query: ${q}`,
-            });
-          }
-        } catch {
-          continue;
-        }
-      }
-      return out;
-    },
+    fetch: () => queryArxivFeed('all', queries, 'saved_query', (q) => `query: ${q}`, opts),
   };
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [ ] **Step 5: Run tests to verify they pass**
 
 Run: `cd outreach && npx vitest run test/savedQuerySource.test.ts && npm run typecheck`
 Expected: 4 passed, typecheck clean
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add outreach/src/discovery/sources/savedQuery.ts outreach/test/savedQuerySource.test.ts
-git commit -m "Add saved-query arXiv discovery source"
+git add outreach/src/discovery/sources/arxivQuery.ts outreach/src/discovery/sources/savedQuery.ts outreach/test/savedQuerySource.test.ts
+git commit -m "Add shared arXiv feed helper and saved-query discovery source"
 ```
 
 ---
@@ -772,7 +797,7 @@ git commit -m "Add saved-query arXiv discovery source"
 - Test: `outreach/test/otherSources.test.ts`
 
 **Interfaces:**
-- Consumes: `parseSearchFeed` from `./savedQuery.js`; `DB` from `../../db/db.js`
+- Consumes: `queryArxivFeed`, `sleep`, `ArxivQueryOptions` from `./arxivQuery.js` (Task 4); `DB` from `../../db/db.js`
 - Produces: `deriveWatchAuthors(db): string[]`, `deriveSeedPapers(db): string[]`, `createAuthorWatchSource(authors, opts): DiscoverySource`, `createRecommendSource(seeds, opts): DiscoverySource`
 
 - [ ] **Step 1: Write the failing test**
@@ -878,55 +903,20 @@ Create `outreach/src/discovery/sources/authorWatch.ts`:
 // Author-watch source: checks a watchlist of researchers for new postings.
 // Auto derives from people already in the database, extended by config.
 import type { DB } from '../../db/db.js';
-import type { Candidate, DiscoverySource } from '../types.js';
-import { parseSearchFeed } from './savedQuery.js';
+import type { DiscoverySource } from '../types.js';
+import { queryArxivFeed, type ArxivQueryOptions } from './arxivQuery.js';
 
-export interface AuthorWatchOptions {
-  fetchFn?: typeof fetch;
-  maxResults?: number;
-  delayMs?: number;
-}
+export type AuthorWatchOptions = ArxivQueryOptions;
 
 export function deriveWatchAuthors(db: DB): string[] {
   const rows = db.prepare('SELECT DISTINCT name FROM people WHERE name IS NOT NULL').all() as Array<{ name: string }>;
   return rows.map((r) => r.name).filter(Boolean);
 }
 
-const sleep = (ms: number) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
-
 export function createAuthorWatchSource(authors: string[], opts: AuthorWatchOptions = {}): DiscoverySource {
-  const fetchFn = opts.fetchFn ?? fetch;
-  const maxResults = opts.maxResults ?? 10;
-  const delayMs = opts.delayMs ?? 3000;
-
   return {
     name: 'author_watch',
-    async fetch(): Promise<Candidate[]> {
-      const out: Candidate[] = [];
-      for (let i = 0; i < authors.length; i++) {
-        const a = authors[i];
-        if (i > 0) await sleep(delayMs);
-        try {
-          const url =
-            `http://export.arxiv.org/api/query?search_query=au:${encodeURIComponent(`"${a}"`)}` +
-            `&sortBy=submittedDate&sortOrder=descending&max_results=${maxResults}`;
-          const res = await fetchFn(url);
-          if (!res.ok) continue;
-          for (const e of parseSearchFeed(await res.text())) {
-            out.push({
-              arxivId: e.arxivId,
-              title: e.title,
-              abstract: e.abstract,
-              discoveredVia: 'author_watch',
-              sourceDetail: `author: ${a}`,
-            });
-          }
-        } catch {
-          continue;
-        }
-      }
-      return out;
-    },
+    fetch: () => queryArxivFeed('au', authors, 'author_watch', (a) => `author: ${a}`, { maxResults: 10, ...opts }),
   };
 }
 ```
@@ -940,12 +930,10 @@ Create `outreach/src/discovery/sources/recommend.ts`:
 // recommendations API. Seeds auto derive from papers already drafted against.
 import type { DB } from '../../db/db.js';
 import type { Candidate, DiscoverySource } from '../types.js';
+import { sleep, type ArxivQueryOptions } from './arxivQuery.js';
 
-export interface RecommendOptions {
-  fetchFn?: typeof fetch;
-  maxResults?: number;
-  delayMs?: number;
-}
+// Semantic Scholar, not arXiv, but the same pacing and isolation apply.
+export type RecommendOptions = ArxivQueryOptions;
 
 interface S2Recommendation {
   paper?: { externalIds?: { ArXiv?: string }; title?: string; abstract?: string };
@@ -957,8 +945,6 @@ export function deriveSeedPapers(db: DB): string[] {
     .all() as Array<{ id: string }>;
   return rows.map((r) => r.id).filter(Boolean);
 }
-
-const sleep = (ms: number) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
 
 export function createRecommendSource(seeds: string[], opts: RecommendOptions = {}): DiscoverySource {
   const fetchFn = opts.fetchFn ?? fetch;
