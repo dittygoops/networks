@@ -3,6 +3,7 @@ import {
   detectIdentityCollision,
   COLLISION_MIN_COLLABORATORS,
   COLLISION_MIN_INSTITUTIONS,
+  COLLISION_CORROBORATING_INSTITUTIONS,
   type OntologyFact,
 } from '../src/pipeline/research.js';
 
@@ -52,8 +53,20 @@ describe('detectIdentityCollision', () => {
     expect(verdict.suspected).toBe(false);
   });
 
-  test('flags on collaborators alone, even with few institutions', () => {
-    const facts = collaboratorFacts(COLLISION_MIN_COLLABORATORS);
+  // A long collaborator list on its own is productivity, not a merged identity.
+  // Real case from a live run: Yuejiang Liu, 218 collaborators across only 4
+  // institutions, is one person. Flagging them silently drops someone worth
+  // contacting, so collaborators need institutional spread to corroborate.
+  test('does NOT flag a prolific researcher at few institutions', () => {
+    const facts = [...collaboratorFacts(COLLISION_MIN_COLLABORATORS + 50), ...institutionFacts(4)];
+    expect(detectIdentityCollision(facts).suspected).toBe(false);
+  });
+
+  test('flags many collaborators when institutions also spread', () => {
+    const facts = [
+      ...collaboratorFacts(COLLISION_MIN_COLLABORATORS),
+      ...institutionFacts(COLLISION_CORROBORATING_INSTITUTIONS),
+    ];
     expect(detectIdentityCollision(facts).suspected).toBe(true);
   });
 

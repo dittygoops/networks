@@ -127,22 +127,30 @@ export function factsFromOpenAlex(candidate: OpenAlexCandidate, raw: OpenAlexAut
   return facts;
 }
 
-// Thresholds are calibrated against the pilot database: the 4 legitimate
-// profiles on file have 11, 23, 25, and 16 total facts (single-digit to low
-// double-digit collaborator/institution counts). The one confirmed collision
-// ("Wenwen Zhang", several unrelated people merged under one OpenAlex id) has
-// 330 total facts: 176 distinct collaborators and 136 distinct institutions.
-// A real, prolific senior researcher can legitimately have dozens of
-// collaborators over a career, so these thresholds are set comfortably above
-// that, not just above the legitimate profiles on file: 80 collaborators
-// (roughly 3-4x the busiest legitimate profile's whole fact count) and 40
-// institutions (a real career move count is a handful; 40 distinct
-// institutions is only plausible if OpenAlex has merged several people's
-// affiliation histories). Both sit far below the 176/136 seen in the
-// confirmed collision, leaving headroom without being so tight that a
-// genuinely prolific, well-connected professor gets wrongly flagged.
-export const COLLISION_MIN_COLLABORATORS = 80;
+// Recalibrated against a real 25 paper run, which produced 24 mined profiles.
+// The first cut used "80 collaborators OR 40 institutions" and flagged 8 of 25,
+// including two people who are plainly a single researcher.
+//
+// The run showed INSTITUTION COUNT is the discriminating signal, not
+// collaborator count. One human works at a handful of institutions over a
+// career; a large collaborator list is just productivity. Observed:
+//
+//   Yitong Zhu     834 collab / 165 inst  AI + nuclear physics       merged
+//   Zhuo Li        185 collab / 128 inst  AI + mathematics           merged
+//   Yifan Liu      125 collab / 121 inst  biochem + nanotech         merged
+//   Zhizhong Wang   88 collab /  74 inst  CS + internal medicine     merged
+//   Viet Nguyen     75 collab /  49 inst  AI + data mining           merged
+//   Yuejiang Liu   218 collab /   4 inst  AI/ML only                 ONE PERSON
+//   Zhiying Du      80 collab /   8 inst  AI/CV only                 ONE PERSON
+//
+// So institutions alone flags a merge. Collaborators only corroborate, and
+// only when institutions are also elevated, which keeps prolific-but-single
+// researchers (4 or 8 institutions) out of the net. Blocking them is not a
+// safe default: it silently drops people worth contacting.
 export const COLLISION_MIN_INSTITUTIONS = 40;
+export const COLLISION_MIN_COLLABORATORS = 200;
+// Collaborators only count as evidence alongside this much institutional spread.
+export const COLLISION_CORROBORATING_INSTITUTIONS = 20;
 
 export interface IdentityCollisionVerdict {
   suspected: boolean;
@@ -160,7 +168,10 @@ export function detectIdentityCollision(facts: OntologyFact[]): IdentityCollisio
     if (f.facet === 'trajectory' && f.key === 'institution') institutions.add(f.value.trim().toLowerCase());
   }
 
-  const suspected = collaborators.size >= COLLISION_MIN_COLLABORATORS || institutions.size >= COLLISION_MIN_INSTITUTIONS;
+  const suspected =
+    institutions.size >= COLLISION_MIN_INSTITUTIONS ||
+    (collaborators.size >= COLLISION_MIN_COLLABORATORS &&
+      institutions.size >= COLLISION_CORROBORATING_INSTITUTIONS);
   if (!suspected) return { suspected: false };
 
   return {
