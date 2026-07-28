@@ -18,6 +18,7 @@ function makeSender(): Sender {
 }
 import { processPaper } from './pipeline/orchestrate.js';
 import { generateDraft } from './pipeline/draft.js';
+import { buildSenderFacts } from './pipeline/credibility.js';
 import { buildSelfOntology } from './pipeline/persona.js';
 import { extractPdfText } from './pipeline/pdf.js';
 import { createTavilyClient } from './search/tavily.js';
@@ -41,6 +42,7 @@ async function readDocument(path: string): Promise<{ label: string; text: string
 }
 
 const DB_PATH = process.env.OUTREACH_DB ?? 'data/outreach.db';
+
 
 // Dev only (D9): seed Aditya's self ontology from the fixture until the persona
 // subsystem exists. Runs once, when the self ontology is empty.
@@ -141,6 +143,11 @@ async function cmdLoop(argv: string[]): Promise<void> {
           hooks: r.hooks,
           intent: 'seeking direction',
           senderName: 'Aditya Gupta',
+          // Credibility is a separate job from the hook. Without these the
+          // drafter has only the hook list to mine for a credential, which is
+          // how a real draft came to open "I used Claude in my Content Farm
+          // project": true, but table stakes, and unrelated to the ask.
+          senderFacts: buildSenderFacts(db),
         }),
         sender: makeSender(),
         senderEmail: process.env.SENDER_EMAIL ?? 'apgupta3@asu.edu',
