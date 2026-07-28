@@ -40,10 +40,17 @@ export interface ListenDeps {
   maxCycles?: number;
 }
 
-// A window this long is, in practice, "never times out on its own": any
-// return from captureReplies within it means the underlying stream ended or
-// errored, not that the deadline was hit.
-const EFFECTIVELY_FOREVER_MS = 1000 * 60 * 60 * 24 * 365;
+// The longest delay Node's timers accept. A larger value silently overflows
+// the 32-bit signed field and is clamped to 1ms, which turned this loop into a
+// hot reconnect spin: captureReplies returned immediately, the loop read that
+// as "the stream died", rebuilt the client, and repeated. Observed 4 rebuilds
+// in 45 seconds against the live service before this was caught.
+const MAX_TIMER_MS = 2_147_483_647;
+
+// A window this long is, in practice, "never times out on its own" (about 24
+// days): any return from captureReplies within it means the underlying stream
+// ended or errored, not that the deadline was hit.
+const EFFECTIVELY_FOREVER_MS = MAX_TIMER_MS;
 const DEFAULT_MAX_CONSECUTIVE_FAILURES = 30;
 const BASE_BACKOFF_MS = 5_000;
 const MAX_BACKOFF_MS = 5 * 60_000;
@@ -62,7 +69,9 @@ export async function runListenLoop(deps: ListenDeps): Promise<void> {
   const exit = deps.exit ?? ((code: number) => process.exit(code));
   const backoffMs = deps.backoffMs ?? defaultBackoffMs;
   const maxFailures = deps.maxConsecutiveFailures ?? DEFAULT_MAX_CONSECUTIVE_FAILURES;
-  const windowMs = deps.windowMs ?? EFFECTIVELY_FOREVER_MS;
+  // Clamped, not just defaulted: any caller passing a longer window would hit
+  // the same silent overflow-to-1ms hot loop described at MAX_TIMER_MS.
+  const windowMs = Math.min(deps.windowMs ?? EFFECTIVELY_FOREVER_MS, MAX_TIMER_MS);
 
   // The reply-handling deps are rebuilt each cycle with whatever channel is
   // currently live; db/sender/senderEmail never change across reconnects.

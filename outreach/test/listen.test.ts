@@ -198,3 +198,35 @@ describe('runListenLoop', () => {
     expect(notices).toEqual(['sending is broken']);
   });
 });
+
+describe('runListenLoop timer safety', () => {
+  // Regression: a window longer than Node's 32-bit timer limit is silently
+  // clamped to 1ms, so captureReplies returns instantly, the loop reads that
+  // as a dead stream, and rebuilds forever. This span hit the live service.
+  it('never asks captureReplies for a window Node timers cannot represent', async () => {
+    const MAX_TIMER_MS = 2_147_483_647;
+    const windows: number[] = [];
+    const channel: ApprovalChannel = {
+      sendDraftMessage: async () => {},
+      notify: async () => {},
+      captureReplies: async (ms: number) => {
+        windows.push(ms);
+        return [] as InboundReply[];
+      },
+      close: async () => {},
+    };
+    await runListenLoop({
+      db: openDb(':memory:'),
+      connect: async () => channel,
+      sender: { send: async () => ({ sentId: 'x' }) },
+      senderEmail: 'a@b.c',
+      windowMs: 1000 * 60 * 60 * 24 * 365, // one year, overflows the timer field
+      maxCycles: 2,
+      sleep: async () => {},
+      exit: () => {},
+      log: () => {},
+    } as never);
+    expect(windows.length).toBeGreaterThan(0);
+    for (const w of windows) expect(w).toBeLessThanOrEqual(MAX_TIMER_MS);
+  });
+});
