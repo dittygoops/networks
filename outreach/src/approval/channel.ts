@@ -25,7 +25,15 @@ export type ParsedReply =
 export interface ApprovalChannel {
   sendDraftMessage(msg: OutboundDraftMessage): Promise<void>;
   notify(text: string): Promise<void>;
+  // Batch semantics: collect for a bounded window, then return everything at
+  // once. Right for the daily run, wrong for a daemon, since nothing is handed
+  // back until the window closes.
   captureReplies(windowMs: number): Promise<InboundReply[]>;
+  // Push semantics: invoke onReply as each message arrives, and resolve only
+  // when the underlying stream ends. This is what a long-lived listener needs.
+  // A real approval sat unprocessed in captureReplies' array because the
+  // daemon was waiting on a 24 day window to expire before seeing it.
+  streamReplies(onReply: (reply: InboundReply) => Promise<void>): Promise<void>;
   close?(): Promise<void>;
 }
 
@@ -86,6 +94,11 @@ export function createStubChannel(): StubChannel {
       const out = pending;
       pending = [];
       return out;
+    },
+    async streamReplies(onReply: (reply: InboundReply) => Promise<void>) {
+      const batch = pending;
+      pending = [];
+      for (const r of batch) await onReply(r);
     },
   };
 }

@@ -63,6 +63,27 @@ async function defaultConnect(opts: PhotonOptions): Promise<{ app: PhotonApp; dm
   return { app: app as unknown as PhotonApp, dm };
 }
 
+
+// Single decode for both captureReplies (batch) and streamReplies (push), so
+// the allowlist and the content check cannot drift between the two paths.
+// Returns null for anything not actionable, always logging why: the incident
+// that motivated the listener was undiagnosable because these were silent.
+// A non-approver's number and message text are attacker-controlled content on
+// a possibly shared line, so neither is ever logged.
+function decodeReply(value: [unknown, RawMessage], approverPhone: string): InboundReply | null {
+  const [, message] = value;
+  if (message.sender?.id !== approverPhone) {
+    console.log('photonChannel: inbound message from a non-approver, ignoring');
+    return null;
+  }
+  if (message.content?.type !== 'text' || !message.content.text) {
+    console.log(`photonChannel: inbound message from approver has unreadable content (type ${message.content?.type ?? 'unknown'}), ignoring`);
+    return null;
+  }
+  console.log(`photonChannel: inbound message from approver accepted (id ${message.id})`);
+  return { text: message.content.text, messageId: message.id };
+}
+
 export async function createPhotonChannel(
   opts: PhotonOptions,
   connect: PhotonConnectFn = defaultConnect,
@@ -90,17 +111,8 @@ export async function createPhotonChannel(
       // is attacker-controlled content that may end up in a shared log, so
       // neither is ever logged, only the fact that it happened.
       const acceptIfAllowed = (value: [unknown, RawMessage]) => {
-        const [, message] = value;
-        if (message.sender?.id !== opts.approverPhone) {
-          console.log('photonChannel: inbound message from a non-approver, ignoring');
-          return;
-        }
-        if (message.content?.type !== 'text' || !message.content.text) {
-          console.log(`photonChannel: inbound message from approver has unreadable content (type ${message.content?.type ?? 'unknown'}), ignoring`);
-          return;
-        }
-        console.log(`photonChannel: inbound message from approver accepted (id ${message.id})`);
-        out.push({ text: message.content.text, messageId: message.id });
+        const reply = decodeReply(value, opts.approverPhone);
+        if (reply) out.push(reply);
       };
 
       // Holds the in-flight iterator.next() promise across loop iterations so
@@ -143,6 +155,33 @@ export async function createPhotonChannel(
       }
       return out;
     },
+
+    // Push counterpart to captureReplies, for `outreach listen`. Same decode
+    // and same allowlist (decodeReply below is the single implementation, so
+    // the two paths cannot drift), but each accepted reply is handed to the
+    // caller immediately instead of being held until a window expires.
+    // Resolves when the stream ends or errors, which the caller treats as a
+    // signal to rebuild the client.
+    async streamReplies(onReply: (reply: InboundReply) => Promise<void>): Promise<void> {
+      try {
+        for await (const value of app.messages) {
+          const reply = decodeReply(value as [unknown, RawMessage], opts.approverPhone);
+          if (!reply) continue;
+          try {
+            await onReply(reply);
+          } catch (err) {
+            // One bad reply must not tear down the stream: an unattended
+            // listener that dies on a single malformed approval is worse
+            // than one that logs and keeps listening.
+            console.warn(`streamReplies: handler error, continuing: ${String(err)}`);
+          }
+        }
+        console.log('streamReplies: message stream ended');
+      } catch (err) {
+        console.warn(`streamReplies: message stream error: ${String(err)}`);
+      }
+    },
+
     async close() {
       await app.stop();
     },

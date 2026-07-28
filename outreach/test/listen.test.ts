@@ -53,6 +53,14 @@ function scriptedChannel(script: (Array<InboundReply> | 'throw')[]) {
       if (step === 'throw' || step === undefined) throw new Error('stream broke');
       return step;
     },
+    // Push counterpart: each scripted step is one session. Delivering the
+    // step's replies one at a time and then resolving mirrors the real
+    // streamReplies, which returns only when the stream ends.
+    async streamReplies(onReply) {
+      const step = script[call++];
+      if (step === 'throw' || step === undefined) throw new Error('stream broke');
+      for (const r of step) await onReply(r);
+    },
     async close() {
       closeCount++;
     },
@@ -199,19 +207,25 @@ describe('runListenLoop', () => {
   });
 });
 
-describe('runListenLoop timer safety', () => {
-  // Regression: a window longer than Node's 32-bit timer limit is silently
-  // clamped to 1ms, so captureReplies returns instantly, the loop reads that
-  // as a dead stream, and rebuilds forever. This span hit the live service.
-  it('never asks captureReplies for a window Node timers cannot represent', async () => {
-    const MAX_TIMER_MS = 2_147_483_647;
-    const windows: number[] = [];
+describe('runListenLoop delivery semantics', () => {
+  // Regression for a real production failure: the daemon used captureReplies,
+  // which only returns when its window expires. An approver's "d8 y" was
+  // accepted by the transport and then sat unprocessed in memory behind a 24
+  // day window. A listener must consume replies by push, never by batch.
+  it('consumes replies via streamReplies and never calls the batch window API', async () => {
+    let captureCalls = 0;
+    let streamCalls = 0;
+    const delivered: string[] = [];
     const channel: ApprovalChannel = {
       sendDraftMessage: async () => {},
       notify: async () => {},
-      captureReplies: async (ms: number) => {
-        windows.push(ms);
+      captureReplies: async () => {
+        captureCalls++;
         return [] as InboundReply[];
+      },
+      streamReplies: async (onReply) => {
+        streamCalls++;
+        await onReply({ text: 'hello', messageId: 'm1' });
       },
       close: async () => {},
     };
@@ -220,13 +234,12 @@ describe('runListenLoop timer safety', () => {
       connect: async () => channel,
       sender: { send: async () => ({ sentId: 'x' }) },
       senderEmail: 'a@b.c',
-      windowMs: 1000 * 60 * 60 * 24 * 365, // one year, overflows the timer field
-      maxCycles: 2,
-      sleep: async () => {},
+      maxCycles: 1,
+      sleep: noopSleep,
       exit: () => {},
-      log: () => {},
-    } as never);
-    expect(windows.length).toBeGreaterThan(0);
-    for (const w of windows) expect(w).toBeLessThanOrEqual(MAX_TIMER_MS);
+      log: (m: string) => delivered.push(m),
+    });
+    expect(streamCalls).toBe(1);
+    expect(captureCalls).toBe(0);
   });
 });

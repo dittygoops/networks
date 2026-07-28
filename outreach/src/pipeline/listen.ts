@@ -26,10 +26,6 @@ export interface ListenDeps {
   // Sent once, right after the first successful connect, e.g. to warn Aditya
   // that email sending is broken (R5) without ever blocking the receive side.
   startupNotice?: string;
-  // How long a single captureReplies session is allowed to run before it is
-  // treated as "ended" even with no error. Defaults to effectively forever;
-  // tests set this small to keep runs fast.
-  windowMs?: number;
   maxConsecutiveFailures?: number;
   backoffMs?: (failures: number) => number;
   sleep?: (ms: number) => Promise<void>;
@@ -40,17 +36,6 @@ export interface ListenDeps {
   maxCycles?: number;
 }
 
-// The longest delay Node's timers accept. A larger value silently overflows
-// the 32-bit signed field and is clamped to 1ms, which turned this loop into a
-// hot reconnect spin: captureReplies returned immediately, the loop read that
-// as "the stream died", rebuilt the client, and repeated. Observed 4 rebuilds
-// in 45 seconds against the live service before this was caught.
-const MAX_TIMER_MS = 2_147_483_647;
-
-// A window this long is, in practice, "never times out on its own" (about 24
-// days): any return from captureReplies within it means the underlying stream
-// ended or errored, not that the deadline was hit.
-const EFFECTIVELY_FOREVER_MS = MAX_TIMER_MS;
 const DEFAULT_MAX_CONSECUTIVE_FAILURES = 30;
 const BASE_BACKOFF_MS = 5_000;
 const MAX_BACKOFF_MS = 5 * 60_000;
@@ -69,9 +54,6 @@ export async function runListenLoop(deps: ListenDeps): Promise<void> {
   const exit = deps.exit ?? ((code: number) => process.exit(code));
   const backoffMs = deps.backoffMs ?? defaultBackoffMs;
   const maxFailures = deps.maxConsecutiveFailures ?? DEFAULT_MAX_CONSECUTIVE_FAILURES;
-  // Clamped, not just defaulted: any caller passing a longer window would hit
-  // the same silent overflow-to-1ms hot loop described at MAX_TIMER_MS.
-  const windowMs = Math.min(deps.windowMs ?? EFFECTIVELY_FOREVER_MS, MAX_TIMER_MS);
 
   // The reply-handling deps are rebuilt each cycle with whatever channel is
   // currently live; db/sender/senderEmail never change across reconnects.
@@ -125,28 +107,31 @@ export async function runListenLoop(deps: ListenDeps): Promise<void> {
       }
     }
 
-    let replies: InboundReply[] = [];
+    // Push, not batch. captureReplies only returns when its window expires,
+    // so a daemon using it would hold a real approval in memory unprocessed
+    // (observed: an accepted "d8 y" sat unhandled behind a 24 day window).
+    // streamReplies hands each reply over as it arrives and resolves only
+    // when the stream ends, which is the signal to rebuild the client.
+    const liveChannel = channel;
     let sessionOk = true;
     try {
-      replies = await channel.captureReplies(windowMs);
+      await channel.streamReplies(async (reply) => {
+        try {
+          await handleReply(replyDepsFor(liveChannel), { dryRun: false }, summary, reply);
+        } catch (e) {
+          // One malformed or unlucky reply must never take the listener down.
+          log(`listen: reply handling failed: ${String(e)}`);
+        }
+      });
     } catch (e) {
       sessionOk = false;
-      log(`listen: captureReplies failed: ${String(e)}`);
+      log(`listen: streamReplies failed: ${String(e)}`);
     }
 
-    const liveChannel = channel;
-    for (const reply of replies) {
-      try {
-        await handleReply(replyDepsFor(liveChannel), { dryRun: false }, summary, reply);
-      } catch (e) {
-        // One malformed or unlucky reply must never take the listener down:
-        // there is no next batch run to pick anything up later, this process
-        // IS the only consumer.
-        log(`listen: reply "${reply.text}" failed to process: ${String(e)}`);
-      }
-    }
-
-    if (sessionOk && replies.length > 0) {
+    // A session that ran cleanly counts as healthy even if it delivered no
+    // replies: a quiet night is the normal case for a listener, and treating
+    // silence as failure would burn the retry budget and exit for no reason.
+    if (sessionOk) {
       consecutiveFailures = 0;
     } else {
       consecutiveFailures++;
@@ -161,7 +146,7 @@ export async function runListenLoop(deps: ListenDeps): Promise<void> {
     // The session that just returned (whether it delivered replies, errored,
     // or ended cleanly) is over. Re-iterating a dead stream on the same
     // client reconnects nothing, so close it and rebuild fresh next cycle
-    // rather than looping back into channel.captureReplies on this one.
+    // rather than looping back into channel.streamReplies on this one.
     const finishedChannel = channel;
     channel = undefined;
     try {
