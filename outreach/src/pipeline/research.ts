@@ -642,22 +642,25 @@ export function pageIsAboutPerson(page: WebPage, personName: string): boolean {
 
 // URL-only sibling of pageIsAboutPerson, for callers (the Phase 2 purge
 // script) that have only a stored source_url and no re-fetchable title or
-// content. Checks whether the URL's final path segment (the profile slug,
-// e.g. "dr-jan-delcker" or "BernhardKerbl") carries the target's name, via
-// the same nameMatches local-part matcher used for email addresses. Returns
-// null (not false) when the URL has no path segment to judge at all (a bare
-// domain root), since that is "cannot evaluate", not "fails": guessing either
-// way would be fabrication, so the caller must treat null as its own case.
+// content. Checks whether ANY path segment of the URL (the profile slug, e.g.
+// "dr-jan-delcker" or "BernhardKerbl") carries the target's name, via the
+// same nameMatches local-part matcher used for email addresses. Every
+// segment is checked, not just the last, so a legitimate sub-page of a
+// person's own profile (e.g. "/profile/liviaq/publications") still matches
+// on its "liviaq" segment even though the last segment is just "publications".
+// Returns null (not false) when the URL has no path segment to judge at all
+// (a bare domain root), since that is "cannot evaluate", not "fails":
+// guessing either way would be fabrication, so the caller must treat null as
+// its own case.
 export function urlSlugMatchesPerson(url: string, personName: string): boolean | null {
-  let slug = '';
+  let segments: string[] = [];
   try {
-    const segments = new URL(url).pathname.split('/').filter(Boolean);
-    slug = segments.at(-1) ?? '';
+    segments = new URL(url).pathname.split('/').filter(Boolean);
   } catch {
     return null;
   }
-  if (!slug) return null;
-  return nameMatches(slug, personName);
+  if (segments.length === 0) return null;
+  return segments.some((seg) => nameMatches(seg, personName));
 }
 
 // ---------------------------------------------------------------------------
