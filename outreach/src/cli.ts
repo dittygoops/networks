@@ -25,6 +25,7 @@ import { createTavilyClient } from './search/tavily.js';
 import { createOpenRouterClient } from './llm/client.js';
 import type { OntologyFact } from './pipeline/research.js';
 import { runLoop } from './pipeline/loop.js';
+import { runListenLoop } from './pipeline/listen.js';
 import { loadConfig } from './discovery/config.js';
 import { createSavedQuerySource } from './discovery/sources/savedQuery.js';
 import { createAuthorWatchSource } from './discovery/sources/authorWatch.js';
@@ -167,6 +168,48 @@ async function cmdLoop(argv: string[]): Promise<void> {
   }
 }
 
+// `listen`: a long-running process that stays connected to Spectrum and acts
+// on approval replies as they arrive (R1). The batch `loop` command only
+// holds a connection open for ~20 seconds a day; Spectrum does not deliver
+// messages to a client that was disconnected when they were sent, so a reply
+// sent while the batch is not connected is lost for good. This is the fix.
+//
+// R5: createGmailApiSender() throws when its OAuth env vars are missing. If
+// that throw happened here unguarded, the process would die before it ever
+// connected to Spectrum, and under launchd's KeepAlive it would just die
+// again on every restart, never receiving anything. So the sender is
+// constructed defensively: a construction failure is caught, logged, and
+// replaced with a stand-in whose send() always fails; the receive side (and
+// decision recording) keeps working regardless, and Aditya is told once, on
+// connect, that sending needs to be fixed.
+async function cmdListen(): Promise<void> {
+  const db = openDb(DB_PATH);
+  const senderEmail = process.env.SENDER_EMAIL ?? 'apgupta3@asu.edu';
+
+  let sender: Sender;
+  let startupNotice = 'outreach listen: connected and watching for replies.';
+  try {
+    sender = makeSender();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(`listen: sender construction failed, sends will fail until fixed: ${msg}`);
+    startupNotice = `outreach listen: connected, but email sending is broken (${msg}). Approvals will be recorded but nothing will send until this is fixed.`;
+    sender = {
+      async send() {
+        throw new Error(`sender unavailable: ${msg}`);
+      },
+    };
+  }
+
+  await runListenLoop({
+    connect: () => createPhotonChannel(photonOptionsFromEnv()),
+    db,
+    sender,
+    senderEmail,
+    startupNotice,
+  });
+}
+
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
   if (command === 'persona') return runPersona(rest);
@@ -175,10 +218,13 @@ async function main(): Promise<void> {
     return;
   }
   if (command === 'loop') return cmdLoop(rest);
+  if (command === 'listen') return cmdListen();
 
   const arg = rest[0];
   if (command !== 'add' || !arg) {
-    console.error('usage: cli.ts add <arxiv-id>  |  cli.ts persona <doc-path...> [--answers <file.json>]  |  cli.ts loop [--dry-run]');
+    console.error(
+      'usage: cli.ts add <arxiv-id>  |  cli.ts persona <doc-path...> [--answers <file.json>]  |  cli.ts loop [--dry-run]  |  cli.ts listen',
+    );
     process.exit(1);
   }
   const tavilyKey = process.env.TAVILY_API_KEY;

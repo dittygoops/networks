@@ -17,20 +17,29 @@ import type { OrchestrateResult } from './orchestrate.js';
 import type { Sender } from '../sender/types.js';
 import type { LLMClient } from '../llm/client.js';
 
-export interface LoopDeps {
+// The subset of LoopDeps that acting on one reply actually needs. Split out
+// so `outreach listen` (src/pipeline/listen.ts) can call handleReply without
+// fabricating dummy discovery/drafting dependencies it will never use: one
+// implementation of "act on a reply" serves both the batch loop and the
+// persistent listener, so their never-email-twice and never-send-without-
+// approval invariants can never drift apart between the two callers.
+export interface ReplyDeps {
   db: DB;
   channel: ApprovalChannel;
+  sender: Sender;
+  senderEmail?: string; // OutboundEmail.from; defaults to SENDER_EMAIL
+}
+
+export interface LoopDeps extends ReplyDeps {
   config: LoopConfig;
   sources: DiscoverySource[];
   terms: string[];
   processPaper: (deps: unknown, arxivId: string) => Promise<OrchestrateResult>;
   generateDraft: (llm: LLMClient, input: DraftInput) => Promise<Draft>;
   buildDraftInput: (r: OrchestrateResult) => DraftInput;
-  sender: Sender;
   llm?: LLMClient;
   orchestrateDeps?: unknown;
   replyWindowMs?: number;
-  senderEmail?: string; // OutboundEmail.from; defaults to SENDER_EMAIL
 }
 
 export interface LoopOptions {
@@ -58,7 +67,12 @@ function draftExists(db: DB, draftId: number): boolean {
   return db.prepare('SELECT 1 FROM drafts WHERE id = ?').get(draftId) !== undefined;
 }
 
-async function handleReply(deps: LoopDeps, opts: LoopOptions, summary: LoopSummary, reply: { text: string }): Promise<void> {
+export async function handleReply(
+  deps: ReplyDeps,
+  opts: LoopOptions,
+  summary: LoopSummary,
+  reply: { text: string },
+): Promise<void> {
   const parsed = parseReply(reply.text);
   if (parsed.kind === 'unparseable') {
     await deps.channel.notify(`Could not read "${reply.text}". Reply like "d7 y" or "d7 n".`);

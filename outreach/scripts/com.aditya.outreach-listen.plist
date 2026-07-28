@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.aditya.outreach-listen</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>REPLACE_WITH_ABSOLUTE_PATH/outreach/node_modules/.bin/tsx</string>
+    <string>--env-file=.env</string>
+    <string>src/cli.ts</string>
+    <string>listen</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>REPLACE_WITH_ABSOLUTE_PATH/outreach</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>StandardOutPath</key>
+  <string>REPLACE_WITH_ABSOLUTE_PATH/outreach/data/listen.log</string>
+  <key>StandardErrorPath</key>
+  <string>REPLACE_WITH_ABSOLUTE_PATH/outreach/data/listen.err.log</string>
+</dict>
+</plist>

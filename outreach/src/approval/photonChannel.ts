@@ -33,7 +33,25 @@ export function formatDraftMessage(msg: OutboundDraftMessage): string {
   ].join('\n');
 }
 
-export async function createPhotonChannel(opts: PhotonOptions): Promise<ApprovalChannel> {
+export type RawMessage = { id: string; sender?: { id?: string }; content?: { type?: string; text?: string } };
+
+export interface PhotonApp {
+  messages: AsyncIterable<[unknown, RawMessage]>;
+  stop(): Promise<void>;
+}
+
+export interface PhotonDm {
+  send(content: string): Promise<unknown>;
+}
+
+export type PhotonConnectFn = (opts: PhotonOptions) => Promise<{ app: PhotonApp; dm: PhotonDm }>;
+
+// Real Spectrum connect. A separate function (rather than inline in
+// createPhotonChannel) so tests can inject a fake and never open a real gRPC
+// connection (R7), and so `outreach listen` can rebuild a fresh client after
+// a stream failure by calling createPhotonChannel again instead of
+// re-iterating a dead stream on the same client.
+async function defaultConnect(opts: PhotonOptions): Promise<{ app: PhotonApp; dm: PhotonDm }> {
   const app = await Spectrum({
     projectId: opts.projectId,
     projectSecret: opts.projectSecret,
@@ -42,6 +60,14 @@ export async function createPhotonChannel(opts: PhotonOptions): Promise<Approval
   const im = imessage(app);
   const approver = await im.user(opts.approverPhone);
   const dm = await im.space.create(approver);
+  return { app: app as unknown as PhotonApp, dm };
+}
+
+export async function createPhotonChannel(
+  opts: PhotonOptions,
+  connect: PhotonConnectFn = defaultConnect,
+): Promise<ApprovalChannel> {
+  const { app, dm } = await connect(opts);
 
   return {
     async sendDraftMessage(msg) {
@@ -50,17 +76,30 @@ export async function createPhotonChannel(opts: PhotonOptions): Promise<Approval
     async notify(text) {
       await dm.send(text);
     },
-    // Drains inbound for a bounded window, then returns. The loop is a batch
-    // job: replies that arrive later are picked up by the next run.
+    // Drains inbound for a bounded window, then returns. The batch loop uses
+    // a short window (a run is a batch job: replies that arrive later are
+    // picked up by the next run); `outreach listen` uses an effectively
+    // unbounded window so a return means the stream itself ended or errored.
     async captureReplies(windowMs: number): Promise<InboundReply[]> {
       const out: InboundReply[] = [];
       const deadline = Date.now() + windowMs;
       const iterator = app.messages[Symbol.asyncIterator]();
-      type RawMessage = { id: string; sender?: { id?: string }; content?: { type?: string; text?: string } };
+      // R3: every inbound message must produce a log line, including ignored
+      // ones, since the incident that motivated this listener was
+      // undiagnosable without one. A non-approver's number or message text
+      // is attacker-controlled content that may end up in a shared log, so
+      // neither is ever logged, only the fact that it happened.
       const acceptIfAllowed = (value: [unknown, RawMessage]) => {
         const [, message] = value;
-        if (message.sender?.id !== opts.approverPhone) return; // allowlist
-        if (message.content?.type !== 'text' || !message.content.text) return;
+        if (message.sender?.id !== opts.approverPhone) {
+          console.log('photonChannel: inbound message from a non-approver, ignoring');
+          return;
+        }
+        if (message.content?.type !== 'text' || !message.content.text) {
+          console.log(`photonChannel: inbound message from approver has unreadable content (type ${message.content?.type ?? 'unknown'}), ignoring`);
+          return;
+        }
+        console.log(`photonChannel: inbound message from approver accepted (id ${message.id})`);
         out.push({ text: message.content.text, messageId: message.id });
       };
 
