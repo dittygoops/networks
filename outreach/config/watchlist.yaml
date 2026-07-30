@@ -37,8 +37,21 @@ queries:
     - "Mirror-3DGS"
     - "Ref-Gaussian"
 
+# Papers from Aditya's own vault (~/Documents/Coding/new/learning/Papers).
+# These are the papers his research gaps are built ON, so they seed Semantic
+# Scholar recommendations and pull in their citation neighborhoods, including
+# the non-arXiv venues (Science, Nature, Chemical Senses) that arXiv keyword
+# search cannot reach. Resolved from note titles by arXiv title search.
+seeds:
+  add:
+    - "2506.04539"   # Olfactory Inertial Odometry (France 2025, UT Dallas)
+    - "2510.19660"   # Machine Olfaction and Embedded AI (Mershin 2025)
+    - "2202.09308"   # Indirect Optimal Control of Advection-Diffusion Fields (Berman 2022)
+    - "2604.09758"   # Heterogeneous Molecular Signatures of Human Odor Perception (Zanineli 2026)
+    - "2508.09217"   # Molecular Odor Taxonomies (Sajan 2025)
+
 gate:
   threshold: 0.6
   borderline_band: 0.1
   # Start conservative. Raise once a few real runs have landed on the phone.
-  max_messages_per_run: 3
+  max_messages_per_run: 10
