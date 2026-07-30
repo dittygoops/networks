@@ -6,6 +6,31 @@
 # olfaction is the active outreach thread as of 2026-07-26. Delete the mute
 # block to start chasing 3DGS again.
 queries:
+  # Field terminology, added 2026-07-29. The auto derived queries are the
+  # verbatim `value` of each exploring fact, which is how Aditya described a
+  # gap to himself, not how the field publishes. Measured yield on arXiv:
+  #
+  #   olfactory embedding space      0 results     electronic nose       20
+  #   paired sensor-POM examples     0 results     olfactory perception  19
+  #   BME688                         2 results     machine olfaction      9
+  #   learned embedding alignment    3 results     odor prediction        7
+  #   hierarchical mixture of experts  20          principal odor map     2
+  #
+  # So the only high yield auto query was the domain generic one (MoE), which
+  # is why every draft so far was a mixture of experts paper in robotics or
+  # emotion recognition. These terms are what the olfaction community actually
+  # writes. Adding them is what surfaces papers like arXiv 2510.19660,
+  # "Machine Olfaction and Embedded AI Are Shaping the New Global Sensing
+  # Industry", which this system never saw.
+  add:
+    - "machine olfaction"
+    - "electronic nose"
+    - "olfactory perception"
+    - "odor prediction"
+    - "principal odor map"
+    - "olfactory receptor"
+    - "gas sensor array"
+    - "odor classification"
   mute:
     - "gaussian splatting"
     - "3DGS"
