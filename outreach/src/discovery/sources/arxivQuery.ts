@@ -61,7 +61,7 @@ function arxivGate(delayMs: number): Promise<void> {
 }
 
 export async function queryArxivFeed(
-  prefix: 'all' | 'au',
+  prefix: 'all' | 'au' | 'ti',
   terms: string[],
   via: DiscoveredVia,
   label: (term: string) => string,

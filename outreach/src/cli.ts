@@ -30,7 +30,7 @@ import { loadConfig } from './discovery/config.js';
 import { strandedReport } from './discovery/seenLedger.js';
 import { createSavedQuerySource } from './discovery/sources/savedQuery.js';
 import { createAuthorWatchSource } from './discovery/sources/authorWatch.js';
-import { createRecommendSource } from './discovery/sources/recommend.js';
+import { createRecommendSource, resolveKeyPaperSeeds } from './discovery/sources/recommend.js';
 import { createStubChannel } from './approval/channel.js';
 import { createPhotonChannel, photonOptionsFromEnv } from './approval/photonChannel.js';
 
@@ -117,10 +117,18 @@ async function cmdLoop(argv: string[]): Promise<void> {
   if (!tavilyKey) throw new Error('TAVILY_API_KEY is not set');
   const tavily = createTavilyClient(tavilyKey);
 
+  // deriveSeedPapers (inside loadConfig) stays synchronous and only picks up
+  // key_paper facts that already contain an arXiv id. A bare-title key_paper
+  // fact needs a network title lookup, so that resolution happens here, after
+  // config load, and is merged into the seed list before the recommend
+  // source is built.
+  const titleResolvedSeeds = await resolveKeyPaperSeeds(db);
+  const seeds = [...new Set([...config.seeds, ...titleResolvedSeeds])];
+
   const sources = [
     createSavedQuerySource(config.queries),
     createAuthorWatchSource(config.authors),
-    createRecommendSource(config.seeds),
+    createRecommendSource(seeds),
   ];
 
   // A dry run must never touch the real iMessage thread.
