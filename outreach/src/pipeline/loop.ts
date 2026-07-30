@@ -1,15 +1,35 @@
 // One full outreach cycle, then exit. Order matters: approvals drain first so a
 // reply to yesterday's message is acted on before today's discovery adds more.
 // Spec: docs/superpowers/specs/2026-07-26-discovery-outreach-loop-design.md
+// Stranding fixes (resume, attempts, orphan adoption, the shared prior-thread
+// re-check): docs/spec-candidate-stranding.md.
 import type { DB } from '../db/db.js';
 import { getPerson } from '../db/db.js';
 import type { ApprovalChannel } from '../approval/channel.js';
 import { parseReply } from '../approval/channel.js';
-import { decide, markSendFailed, markSent, persistDraft, priorThreads, logEvent } from '../approval/ledger.js';
-import { parseShortId } from '../approval/ids.js';
+import {
+  decide,
+  markSendFailed,
+  markSent,
+  persistDraft,
+  priorThreads,
+  logEvent,
+  type PersistedDraft,
+} from '../approval/ledger.js';
+import { formatShortId, parseShortId } from '../approval/ids.js';
 import type { LoopConfig } from '../discovery/config.js';
 import { discoverAll } from '../discovery/index.js';
-import { filterUnseen, getQueued, recordDiscovered, setRelevance, setStatus } from '../discovery/seenLedger.js';
+import {
+  claimCandidate,
+  filterUnseen,
+  getExhausted,
+  getQueued,
+  getResumable,
+  recordDiscovered,
+  setRelevance,
+  setStatus,
+  type ResumableRow,
+} from '../discovery/seenLedger.js';
 import { gateCandidate } from '../discovery/relevanceGate.js';
 import type { Candidate, DiscoverySource } from '../discovery/types.js';
 import type { Draft, DraftInput } from './draft.js';
@@ -54,6 +74,10 @@ export interface LoopSummary {
   unsendable: number;
   messaged: number;
   queued: number;
+  // docs/spec-candidate-stranding.md (CS8.1).
+  resumed: number;
+  retryable: number;
+  stranded: number;
   errors: string[];
 }
 
@@ -214,16 +238,7 @@ async function processCandidate(
       return;
     }
 
-    let result: OrchestrateResult;
-    try {
-      result = await deps.processPaper(deps.orchestrateDeps, c.arxivId);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setStatus(deps.db, c.arxivId, 'drafted_unsendable', `pipeline failed: ${msg}`);
-      summary.unsendable++;
-      summary.errors.push(`${c.arxivId}: ${msg}`);
-      return;
-    }
+    const result = await deps.processPaper(deps.orchestrateDeps, c.arxivId);
 
     if (!result.personId) {
       setStatus(deps.db, c.arxivId, 'drafted_unsendable', 'identity unconfirmed');
@@ -260,24 +275,357 @@ async function processCandidate(
       return;
     }
 
-    const persisted = persistDraft(deps.db, {
-      personId: result.personId,
-      paperArxivId: result.arxivId,
-      paperTitle: result.paperTitle,
-      intent: input.intent,
-      draftInput: input,
-      draft,
-      contextJson: { discoveredVia: c.discoveredVia, sourceDetail: c.sourceDetail, relevance: verdict.score },
-    });
-    setStatus(deps.db, c.arxivId, 'discovered', verdict.reason, persisted.draftId);
+    // CS4.3: persistDraft and the ledger pointer are written atomically, so no
+    // crash can leave a draft that seen_papers does not reference.
+    const persisted = deps.db.transaction((): PersistedDraft => {
+      const p = persistDraft(deps.db, {
+        personId: result.personId as number,
+        paperArxivId: result.arxivId,
+        paperTitle: result.paperTitle,
+        intent: input.intent,
+        draftInput: input,
+        draft,
+        contextJson: { discoveredVia: c.discoveredVia, sourceDetail: c.sourceDetail, relevance: verdict.score },
+      });
+      setStatus(deps.db, c.arxivId, 'discovered', verdict.reason, p.draftId);
+      return p;
+    })();
+
     await emit(deps, opts, summary, c, persisted.shortId, draft.subject, draft.body, result.email.email, result.target);
   } catch (e) {
-    // gateCandidate or generateDraft (or anything else unexpected) threw. One
-    // bad candidate must never sink the whole run (F1: survive partial failure).
+    // CS3.5: a thrown error is retryable, never terminal. Only a *returned*
+    // verdict above (filtered, no email, no hook, prior thread, ungrounded) is
+    // terminal on attempt one; those are decisions the pipeline made
+    // successfully, not failures to make one. attempts was already
+    // incremented by claimCandidate before this call started, so the row is
+    // picked up again by the next run's resume step and eventually abandoned
+    // by the exhaustion sweep (CS3.4) rather than retried forever.
     const msg = e instanceof Error ? e.message : String(e);
-    setStatus(deps.db, c.arxivId, 'drafted_unsendable', `pipeline error: ${msg}`);
-    summary.unsendable++;
+    const row = deps.db.prepare('SELECT attempts FROM seen_papers WHERE arxiv_id = ?').get(c.arxivId) as
+      | { attempts: number }
+      | undefined;
+    const attempt = row?.attempts ?? 1;
+    setStatus(deps.db, c.arxivId, 'discovered', `attempt ${attempt} failed: ${msg}`);
+    summary.retryable++;
     summary.errors.push(`${c.arxivId}: ${msg}`);
+  }
+}
+
+export interface SendableDraft {
+  draftId: number;
+  shortId: string;
+  personId: number;
+  subject: string;
+  body: string;
+}
+
+type SendableLookup =
+  | { kind: 'ok'; draft: SendableDraft }
+  | { kind: 'prior_thread'; draft: SendableDraft; priorShortId: string }
+  | { kind: 'decided_out_of_band'; draftId: number; status: string }
+  | { kind: 'not_grounded'; draftId: number }
+  | { kind: 'no_email'; draftId: number }
+  | { kind: 'dangling'; draftId: number | null };
+
+// CS5. The one draft-loading query, shared by the queued flush and the resume
+// step so the two cannot drift. It also folds in the mandatory
+// never-email-twice re-check (correction C1 on docs/spec-candidate-stranding.md):
+// the spec as written only put that check on the resume path, which left the
+// flush emitting a queued draft, sometimes a day or more old, with no
+// prior-thread check at all. Putting it here means both callers get it for
+// free and can never independently forget it.
+export function loadSendableDraft(db: DB, arxivId: string): SendableLookup {
+  const row = db
+    .prepare(
+      `SELECT s.draft_id AS draftId, d.status AS draftStatus, d.person_id AS personId,
+              d.sendable_revision_id AS sendableRevisionId, d.short_id AS shortId,
+              r.subject AS subject, r.body AS body
+       FROM seen_papers s
+       LEFT JOIN drafts d ON d.id = s.draft_id
+       LEFT JOIN revisions r ON r.id = d.sendable_revision_id
+       WHERE s.arxiv_id = ?`,
+    )
+    .get(arxivId) as
+    | {
+        draftId: number | null;
+        draftStatus: string | null;
+        personId: number | null;
+        sendableRevisionId: number | null;
+        shortId: string | null;
+        subject: string | null;
+        body: string | null;
+      }
+    | undefined;
+
+  if (!row || row.draftId == null || row.draftStatus == null) {
+    // Dangling draft_id (points at a draft row that does not exist), or no
+    // draft_id at all. Only reachable by manual SQL or a very old crash.
+    return { kind: 'dangling', draftId: row?.draftId ?? null };
+  }
+  if (row.draftStatus !== 'awaiting_approval') {
+    // 'sent', 'sent (stubbed)', 'approved', or 'skipped': decided out of band
+    // by a human, `outreach listen`, or a concurrent `outreach add --force`.
+    return { kind: 'decided_out_of_band', draftId: row.draftId, status: row.draftStatus };
+  }
+  if (row.sendableRevisionId == null) {
+    return { kind: 'not_grounded', draftId: row.draftId };
+  }
+  const person = getPerson(db, row.personId as number);
+  if (!person?.email) {
+    // Correction C2: give this an explicit, recorded resolution rather than
+    // the bare `if (!person?.email) continue;` the spec left in place, which
+    // is the same silent-drop class this whole spec exists to remove.
+    return { kind: 'no_email', draftId: row.draftId };
+  }
+  const draft: SendableDraft = {
+    draftId: row.draftId,
+    shortId: row.shortId as string,
+    personId: row.personId as number,
+    subject: row.subject as string,
+    body: row.body as string,
+  };
+  // Correction C1: the mandatory pre-emit priorThreads re-check, in the
+  // shared path so both the flush and the resume step get it. excludeDraftId
+  // is this row's own draft, so it cannot match (and refuse) itself.
+  const prior = priorThreads(db, draft.personId, draft.draftId);
+  if (prior.length > 0) {
+    return { kind: 'prior_thread', draft, priorShortId: prior[0]?.shortId ?? '' };
+  }
+  return { kind: 'ok', draft };
+}
+
+// Applies loadSendableDraft's resolution: returns the draft to emit, or
+// writes the appropriate resting/terminal status and returns null. This is
+// CS5.3's table, extended with the no-email case (C2) and with the
+// never-email-twice re-check baked in (C1). A dry run must never call
+// `decide` (no draft may be retired during a rehearsal), so those calls are
+// skipped, and the recorded reason says so.
+function resolveSendableDraft(
+  db: DB,
+  arxivId: string,
+  summary: LoopSummary,
+  dryRun: boolean,
+): SendableDraft | null {
+  const lookup = loadSendableDraft(db, arxivId);
+  switch (lookup.kind) {
+    case 'ok':
+      return lookup.draft;
+
+    case 'prior_thread': {
+      let note = `own draft ${formatShortId(lookup.draft.draftId)} not retired (dry run)`;
+      if (!dryRun) {
+        const decision = decide(
+          db,
+          lookup.draft.draftId,
+          'skip',
+          'cli',
+          `loop: superseded by prior thread ${lookup.priorShortId}`,
+        );
+        note = decision.applied
+          ? `own draft ${formatShortId(lookup.draft.draftId)} skipped`
+          : `own draft ${formatShortId(lookup.draft.draftId)} already ${decision.existing.action} via ${decision.existing.via}`;
+      }
+      setStatus(db, arxivId, 'drafted_unsendable', `prior thread exists (${lookup.priorShortId}), ${note}`);
+      summary.unsendable++;
+      return null;
+    }
+
+    case 'decided_out_of_band': {
+      if (lookup.status === 'skipped') {
+        setStatus(db, arxivId, 'drafted_unsendable', `draft ${formatShortId(lookup.draftId)} was skipped out of band`);
+        summary.unsendable++;
+      } else {
+        // sent, sent (stubbed), or approved: not terminal on purpose. The
+        // audit trail past this point belongs to docs/spec-status-audit-trail.md.
+        setStatus(db, arxivId, 'messaged', `draft ${formatShortId(lookup.draftId)} already approved out of band`);
+      }
+      return null;
+    }
+
+    case 'not_grounded': {
+      let note = `not retired (dry run)`;
+      if (!dryRun) {
+        const decision = decide(db, lookup.draftId, 'skip', 'cli', 'loop: draft has no grounded revision');
+        note = decision.applied ? 'draft skipped' : `already ${decision.existing.action} via ${decision.existing.via}`;
+      }
+      setStatus(
+        db,
+        arxivId,
+        'drafted_unsendable',
+        `draft ${formatShortId(lookup.draftId)} has no grounded revision, ${note}`,
+      );
+      summary.unsendable++;
+      return null;
+    }
+
+    case 'no_email': {
+      let note = `not retired (dry run)`;
+      if (!dryRun) {
+        const decision = decide(db, lookup.draftId, 'skip', 'cli', 'loop: no email on record');
+        note = decision.applied ? 'draft skipped' : `already ${decision.existing.action} via ${decision.existing.via}`;
+      }
+      setStatus(
+        db,
+        arxivId,
+        'drafted_unsendable',
+        `no email on record for draft ${formatShortId(lookup.draftId)}, ${note}`,
+      );
+      summary.unsendable++;
+      return null;
+    }
+
+    case 'dangling': {
+      // Ambiguity resolves toward doing nothing: leave the row resting rather
+      // than guessing. Only reachable by manual SQL.
+      setStatus(
+        db,
+        arxivId,
+        'discovered',
+        `draft_id ${lookup.draftId != null ? formatShortId(lookup.draftId) : '(none)'} does not exist`,
+      );
+      return null;
+    }
+  }
+}
+
+// CS6.1/CS6.2. Adoptable orphans for one paper: a drafts row for that arxiv id,
+// at awaiting_approval, that no seen_papers row already points at. Restricted
+// to drafts whose person has a resolved email (correction C2): `outreach add`
+// deliberately parks a draft with NO email at awaiting_approval as a
+// manual-lookup queue, and that shape must never be adopted as if it were a
+// candidate the loop can message, since the loop can never resolve an email
+// for it either.
+function findAdoptableOrphans(db: DB, arxivId: string): number[] {
+  return (
+    db
+      .prepare(
+        `SELECT d.id AS id
+         FROM drafts d
+         JOIN people p ON p.id = d.person_id
+         WHERE d.paper_arxiv_id = ?
+           AND d.status = 'awaiting_approval'
+           AND p.email IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM seen_papers s WHERE s.draft_id = d.id)
+         ORDER BY d.id`,
+      )
+      .all(arxivId) as { id: number }[]
+  ).map((r) => r.id);
+}
+
+function candidateFromResumable(row: ResumableRow): Candidate {
+  return {
+    arxivId: row.arxivId,
+    title: row.title,
+    discoveredVia: row.discoveredVia,
+    sourceDetail: row.sourceDetail ?? '',
+    abstract: row.abstract ?? undefined,
+  };
+}
+
+// CS4.1: a resumed row that already has a draft is emitted, never re-drafted.
+// Loads it through the shared path (which carries the CS4.2 prior-thread
+// re-check) and, if it is still sendable, emits it.
+async function emitExistingDraft(
+  deps: LoopDeps,
+  opts: LoopOptions,
+  summary: LoopSummary,
+  arxivId: string,
+  candidate: Candidate,
+): Promise<void> {
+  const draft = resolveSendableDraft(deps.db, arxivId, summary, opts.dryRun);
+  if (!draft) return;
+  const person = getPerson(deps.db, draft.personId);
+  if (!person?.email) return; // resolveSendableDraft already handles this; defensive only
+  await emit(deps, opts, summary, candidate, draft.shortId, draft.subject, draft.body, person.email, person.name);
+}
+
+// CS1/CS3/CS4/CS6. Resumes rows stuck at 'discovered', bounded by
+// max_resume_per_run and max_resume_attempts so a large backlog cannot starve
+// fresh discovery and nothing retries a poison candidate forever. Runs in
+// dry-run mode too (CS7.5): it drafts and parks, but per correction C4 it does
+// not consume the attempt budget, never calls `decide`, and never runs the
+// exhaustion sweep, so a rehearsal cannot push real work toward abandonment.
+async function resumeStranded(deps: LoopDeps, opts: LoopOptions, summary: LoopSummary): Promise<void> {
+  const maxAttempts = deps.config.gate.maxResumeAttempts;
+  const rows = getResumable(deps.db, deps.config.gate.maxResumePerRun, maxAttempts);
+
+  for (const row of rows) {
+    // Correction C4: a dry run must not consume the attempt budget. Three
+    // rehearsal dry runs must not push every resumable row to the abandon
+    // threshold.
+    if (!opts.dryRun) claimCandidate(deps.db, row.arxivId);
+    summary.resumed++;
+    const candidate = candidateFromResumable(row);
+
+    if (row.draftId != null) {
+      // CS4.1: never re-draft a row that already has one.
+      await emitExistingDraft(deps, opts, summary, row.arxivId, candidate);
+      continue;
+    }
+
+    const orphanIds = findAdoptableOrphans(deps.db, row.arxivId);
+    if (orphanIds.length > 1) {
+      // CS6.2: ambiguous. Send neither, guess nothing, leave both drafts as
+      // they are, and make the state loud (CS8) rather than silent.
+      setStatus(
+        deps.db,
+        row.arxivId,
+        'drafted_unsendable',
+        `ambiguous orphan drafts (${orphanIds.map((id) => formatShortId(id)).join(', ')}): see outreach stranded`,
+      );
+      summary.unsendable++;
+      summary.stranded++;
+      continue;
+    }
+    if (orphanIds.length === 1) {
+      // CS6.1: adopt the single unambiguous orphan, then proceed exactly as
+      // CS4.1/CS4.2 require: load it through the shared path, re-check
+      // priorThreads, and emit.
+      const draftId = orphanIds[0]!;
+      setStatus(deps.db, row.arxivId, 'discovered', `adopted orphan draft ${formatShortId(draftId)}`, draftId);
+      await emitExistingDraft(deps, opts, summary, row.arxivId, candidate);
+      continue;
+    }
+
+    // No draft yet and no orphan to adopt: process exactly like a fresh
+    // candidate, reusing the one drafting code path (CS1).
+    await processCandidate(deps, opts, summary, candidate);
+  }
+
+  // CS3.4 exhaustion sweep. getExhausted runs unconditionally so a dry run
+  // still reports the backlog that would be abandoned by a real run (CS7.5),
+  // but the sweep's writes (which retire drafts and mark rows terminal) never
+  // run in a dry run.
+  const exhausted = getExhausted(deps.db, maxAttempts);
+  if (opts.dryRun) {
+    summary.stranded += exhausted.length;
+    return;
+  }
+  for (const row of exhausted) {
+    if (row.draftId != null) {
+      // The row owns a real draft. Marking it terminal without retiring the
+      // draft first would leave that draft at awaiting_approval forever,
+      // where priorThreads matches it, making the person permanently
+      // uncontactable while the ledger reports a thread that was never sent
+      // (the 1.4 failure this whole spec exists to close). Retire the draft
+      // first, then the row, as one unit.
+      const decision = decide(deps.db, row.draftId, 'skip', 'cli', `loop: abandoned after ${row.attempts} attempts`);
+      const draftNote = decision.applied
+        ? `draft ${formatShortId(row.draftId)} skipped`
+        : `draft ${formatShortId(row.draftId)} already ${decision.existing.action} via ${decision.existing.via}`;
+      setStatus(deps.db, row.arxivId, 'drafted_unsendable', `abandoned after ${row.attempts} attempts, ${draftNote}`);
+    } else {
+      // Nothing was created for this candidate; abandoning it costs only the
+      // candidate.
+      setStatus(
+        deps.db,
+        row.arxivId,
+        'drafted_unsendable',
+        `abandoned after ${row.attempts} attempts: ${row.reason ?? 'unknown'}`,
+      );
+    }
+    summary.unsendable++;
+    summary.stranded++;
   }
 }
 
@@ -329,6 +677,9 @@ export async function runLoop(deps: LoopDeps, opts: LoopOptions): Promise<LoopSu
     unsendable: 0,
     messaged: 0,
     queued: 0,
+    resumed: 0,
+    retryable: 0,
+    stranded: 0,
     errors: [],
   };
 
@@ -352,22 +703,15 @@ export async function runLoop(deps: LoopDeps, opts: LoopOptions): Promise<LoopSu
     if (!opts.dryRun) {
       for (const q of getQueued(deps.db, deps.config.gate.maxMessagesPerRun)) {
         if (summary.messaged >= deps.config.gate.maxMessagesPerRun) break;
-        const row = deps.db
-          .prepare(
-            `SELECT d.short_id AS shortId, d.person_id AS personId, r.subject AS subject, r.body AS body
-             FROM seen_papers s JOIN drafts d ON d.id = s.draft_id
-             JOIN revisions r ON r.id = d.sendable_revision_id
-             WHERE s.arxiv_id = ?`,
-          )
-          .get(q.arxivId) as { shortId: string; personId: number; subject: string; body: string } | undefined;
-        if (!row) continue;
-        const person = getPerson(deps.db, row.personId);
-        if (!person?.email) continue;
+        const draft = resolveSendableDraft(deps.db, q.arxivId, summary, opts.dryRun);
+        if (!draft) continue;
+        const person = getPerson(deps.db, draft.personId);
+        if (!person?.email) continue; // resolveSendableDraft already excluded this; defensive only
         try {
           await deps.channel.sendDraftMessage({
-            shortId: row.shortId,
-            subject: row.subject,
-            body: row.body,
+            shortId: draft.shortId,
+            subject: draft.subject,
+            body: draft.body,
             to: person.email,
             personName: person.name,
           });
@@ -382,6 +726,16 @@ export async function runLoop(deps: LoopDeps, opts: LoopOptions): Promise<LoopSu
       }
     }
 
+    // CS1.1: resume discovered rows before discovering anything fresh, same
+    // reason queued work goes out ahead of new work. Failure-isolated (CS7.6)
+    // so a resume failure never prevents discovery (F1).
+    try {
+      await resumeStranded(deps, opts, summary);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      summary.errors.push(`resume failed: ${msg}`);
+    }
+
     const discovered = await discoverAll(deps.sources);
     summary.errors.push(...discovered.errors);
 
@@ -390,6 +744,7 @@ export async function runLoop(deps: LoopDeps, opts: LoopOptions): Promise<LoopSu
     for (const c of fresh) recordDiscovered(deps.db, c);
 
     for (const c of fresh) {
+      if (!opts.dryRun) claimCandidate(deps.db, c.arxivId);
       await processCandidate(deps, opts, summary, c);
     }
   } catch (e) {
@@ -401,7 +756,10 @@ export async function runLoop(deps: LoopDeps, opts: LoopOptions): Promise<LoopSu
   } finally {
     const line =
       `outreach loop${opts.dryRun ? ' (dry run)' : ''}: seen ${summary.seen}, filtered ${summary.filtered}, ` +
-      `unsendable ${summary.unsendable}, messaged ${summary.messaged}, queued ${summary.queued}, sent ${summary.sent}` +
+      `unsendable ${summary.unsendable}, messaged ${summary.messaged}, queued ${summary.queued}, sent ${summary.sent}, ` +
+      `resumed ${summary.resumed}` +
+      (summary.retryable ? `, retryable ${summary.retryable}` : '') +
+      (summary.stranded ? `, stranded ${summary.stranded}` : '') +
       (summary.errors.length ? `, errors: ${summary.errors.join(' | ')}` : '');
     try {
       await deps.channel.notify(line);

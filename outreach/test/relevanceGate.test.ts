@@ -4,7 +4,7 @@ import type { Candidate } from '../src/discovery/types.js';
 import type { LLMClient } from '../src/llm/client.js';
 
 const TERMS = ['olfactory embedding space', 'principal odor map', 'gas sensor array'];
-const GATE = { threshold: 0.6, borderlineBand: 0.1, maxMessagesPerRun: 3 };
+const GATE = { threshold: 0.6, borderlineBand: 0.1, maxMessagesPerRun: 3, maxResumePerRun: 10, maxResumeAttempts: 3 };
 
 const cand = (title: string, abstract = ''): Candidate => ({
   arxivId: '2601.00001',

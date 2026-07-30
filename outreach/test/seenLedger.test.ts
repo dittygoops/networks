@@ -47,13 +47,18 @@ describe('seenLedger', () => {
     expect(row.reason).toContain('below threshold');
   });
 
-  it('getQueued returns queued_for_message rows ordered by relevance descending', () => {
+  // CS7.3 (docs/spec-candidate-stranding.md): every row here already cleared
+  // the relevance gate, so relevance has already done its job. Ordering by it
+  // again would starve a resumed row (which scores lower without a fresh
+  // abstract, CS1.3) behind every fresh arrival forever, so the queue is
+  // age-first instead. This replaces the old relevance-descending assertion.
+  it('getQueued returns queued_for_message rows ordered oldest first', () => {
     const db = openDb(':memory:');
     for (const [id, rel] of [['2601.00001', 0.7], ['2601.00002', 0.95], ['2601.00003', 0.8]] as const) {
       recordDiscovered(db, c(id));
       db.prepare('UPDATE seen_papers SET relevance = ? WHERE arxiv_id = ?').run(rel, id);
       setStatus(db, id, 'queued_for_message');
     }
-    expect(getQueued(db, 2).map((r) => r.arxivId)).toEqual(['2601.00002', '2601.00003']);
+    expect(getQueued(db, 2).map((r) => r.arxivId)).toEqual(['2601.00001', '2601.00002']);
   });
 });

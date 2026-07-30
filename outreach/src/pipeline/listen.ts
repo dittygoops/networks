@@ -45,7 +45,19 @@ function defaultBackoffMs(failures: number): number {
 }
 
 function freshSummary(): LoopSummary {
-  return { dryRun: false, sent: 0, seen: 0, filtered: 0, unsendable: 0, messaged: 0, queued: 0, errors: [] };
+  return {
+    dryRun: false,
+    sent: 0,
+    seen: 0,
+    filtered: 0,
+    unsendable: 0,
+    messaged: 0,
+    queued: 0,
+    resumed: 0,
+    retryable: 0,
+    stranded: 0,
+    errors: [],
+  };
 }
 
 export async function runListenLoop(deps: ListenDeps): Promise<void> {

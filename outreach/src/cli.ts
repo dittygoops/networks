@@ -27,6 +27,7 @@ import type { OntologyFact } from './pipeline/research.js';
 import { runLoop } from './pipeline/loop.js';
 import { runListenLoop } from './pipeline/listen.js';
 import { loadConfig } from './discovery/config.js';
+import { strandedReport } from './discovery/seenLedger.js';
 import { createSavedQuerySource } from './discovery/sources/savedQuery.js';
 import { createAuthorWatchSource } from './discovery/sources/authorWatch.js';
 import { createRecommendSource } from './discovery/sources/recommend.js';
@@ -168,6 +169,33 @@ async function cmdLoop(argv: string[]): Promise<void> {
   }
 }
 
+// `stranded`: read-only operator surface (docs/spec-candidate-stranding.md,
+// CS8.2). Prints what the loop has parked and not messaged: rows still
+// resting at 'discovered', rows abandoned or marked ambiguous by the resume
+// step, and orphan awaiting_approval drafts the loop never adopted. Writes
+// nothing and needs no API keys; the remedy for everything it prints is an
+// existing human action (a `dX n`/`dX y` reply, or `outreach add` on a paper).
+function cmdStranded(): void {
+  const db = openDb(DB_PATH);
+  const config = loadConfig(db);
+  const report = strandedReport(db, config.gate.maxResumeAttempts);
+
+  console.log(`discovered, resting (${report.discovered.length}):`);
+  for (const r of report.discovered) {
+    console.log(`  ${r.arxivId}  attempts ${r.attempts}  since ${r.firstSeenAt}  ${r.reason ?? '(no reason yet)'}`);
+  }
+
+  console.log(`\nabandoned or ambiguous (${report.terminalStranded.length}):`);
+  for (const r of report.terminalStranded) {
+    console.log(`  ${r.arxivId}  ${r.status}  draft ${r.draftId ?? '(none)'}  ${r.reason ?? ''}`);
+  }
+
+  console.log(`\norphan awaiting_approval drafts (${report.orphanDrafts.length}):`);
+  for (const r of report.orphanDrafts) {
+    console.log(`  ${r.shortId}  ${r.personName} (person ${r.personId})  paper ${r.paperArxivId ?? '(none)'}`);
+  }
+}
+
 // `listen`: a long-running process that stays connected to Spectrum and acts
 // on approval replies as they arrive (R1). The batch `loop` command only
 // holds a connection open for ~20 seconds a day; Spectrum does not deliver
@@ -219,11 +247,15 @@ async function main(): Promise<void> {
   }
   if (command === 'loop') return cmdLoop(rest);
   if (command === 'listen') return cmdListen();
+  if (command === 'stranded') {
+    cmdStranded();
+    return;
+  }
 
   const arg = rest[0];
   if (command !== 'add' || !arg) {
     console.error(
-      'usage: cli.ts add <arxiv-id>  |  cli.ts persona <doc-path...> [--answers <file.json>]  |  cli.ts loop [--dry-run]  |  cli.ts listen',
+      'usage: cli.ts add <arxiv-id>  |  cli.ts persona <doc-path...> [--answers <file.json>]  |  cli.ts loop [--dry-run]  |  cli.ts listen  |  cli.ts stranded',
     );
     process.exit(1);
   }

@@ -11,6 +11,11 @@ export interface GateConfig {
   threshold: number;
   borderlineBand: number;
   maxMessagesPerRun: number;
+  // docs/spec-candidate-stranding.md: bounds the resume step's per-run and
+  // per-row work so a large backlog cannot starve fresh discovery (CS7.4) and
+  // so nothing retries a poison candidate forever (CS3.3).
+  maxResumePerRun: number;
+  maxResumeAttempts: number;
 }
 
 export interface LoopConfig {
@@ -24,10 +29,22 @@ interface RawFile {
   queries?: { add?: string[]; mute?: string[] };
   authors?: { add?: string[] };
   seeds?: { add?: string[] };
-  gate?: { threshold?: number; borderline_band?: number; max_messages_per_run?: number };
+  gate?: {
+    threshold?: number;
+    borderline_band?: number;
+    max_messages_per_run?: number;
+    max_resume_per_run?: number;
+    max_resume_attempts?: number;
+  };
 }
 
-const DEFAULT_GATE: GateConfig = { threshold: 0.6, borderlineBand: 0.1, maxMessagesPerRun: 3 };
+const DEFAULT_GATE: GateConfig = {
+  threshold: 0.6,
+  borderlineBand: 0.1,
+  maxMessagesPerRun: 3,
+  maxResumePerRun: 10,
+  maxResumeAttempts: 3,
+};
 
 // An absent file is the normal zero-config path, so it stays quiet. A file that
 // exists but cannot be read or parsed is reported: silently ignoring it would
@@ -72,6 +89,8 @@ export function loadConfig(db: DB, path = 'config/watchlist.yaml'): LoopConfig {
       threshold: raw.gate?.threshold ?? DEFAULT_GATE.threshold,
       borderlineBand: raw.gate?.borderline_band ?? DEFAULT_GATE.borderlineBand,
       maxMessagesPerRun: raw.gate?.max_messages_per_run ?? DEFAULT_GATE.maxMessagesPerRun,
+      maxResumePerRun: raw.gate?.max_resume_per_run ?? DEFAULT_GATE.maxResumePerRun,
+      maxResumeAttempts: raw.gate?.max_resume_attempts ?? DEFAULT_GATE.maxResumeAttempts,
     },
   };
 }

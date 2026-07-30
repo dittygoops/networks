@@ -17,7 +17,22 @@ export function openDb(path: string): DB {
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
   db.exec(readFileSync(schemaPath, 'utf8'));
+  migrateSeenPapers(db);
   return db;
+}
+
+// schema.sql is applied with CREATE TABLE IF NOT EXISTS, which is a no-op on
+// an existing database, so an edit to the CREATE TABLE body (the attempts and
+// abstract columns added for docs/spec-candidate-stranding.md) never reaches
+// a live file. This guarded ALTER is the only way those columns land on a
+// database created before they existed; it is idempotent, so it is safe to
+// run on every open.
+function migrateSeenPapers(db: DB): void {
+  const cols = new Set(
+    (db.prepare('PRAGMA table_info(seen_papers)').all() as { name: string }[]).map((c) => c.name),
+  );
+  if (!cols.has('attempts')) db.exec('ALTER TABLE seen_papers ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0');
+  if (!cols.has('abstract')) db.exec('ALTER TABLE seen_papers ADD COLUMN abstract TEXT');
 }
 
 export interface PersonInput {

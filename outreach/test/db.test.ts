@@ -1,4 +1,8 @@
 import { describe, expect, test } from 'vitest';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import Database from 'better-sqlite3';
 import { openDb, upsertPerson, saveFacts, getFacts, getPerson } from '../src/db/db.js';
 import type { OntologyFact } from '../src/pipeline/research.js';
 
@@ -85,5 +89,53 @@ describe('saveFacts / getFacts (D11 replace strategy)', () => {
     saveFacts(db, a, [fact({ value: 'A fact v2' })]);
     expect(getFacts(db, b)).toHaveLength(1);
     expect(getFacts(db, b)[0]?.value).toBe('B fact');
+  });
+});
+
+// docs/spec-candidate-stranding.md, CS10.1: schema.sql's CREATE TABLE body is
+// a no-op on an existing database (CREATE TABLE IF NOT EXISTS), so the
+// attempts and abstract columns it added can only reach a database created
+// before they existed via a guarded ALTER in openDb.
+describe('openDb migration (CS10.1)', () => {
+  test('adds attempts and abstract to a seen_papers table created before they existed', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'outreach-migrate-'));
+    const path = join(dir, 'old.db');
+
+    // Build a pre-migration seen_papers, standing in for the live database
+    // created before this spec (no attempts, no abstract).
+    const old = new Database(path);
+    old.exec(`
+      CREATE TABLE seen_papers (
+        arxiv_id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        discovered_via TEXT NOT NULL,
+        source_detail TEXT,
+        relevance REAL,
+        status TEXT NOT NULL DEFAULT 'discovered',
+        draft_id INTEGER,
+        reason TEXT,
+        first_seen_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now'))
+      );
+    `);
+    old.prepare(
+      `INSERT INTO seen_papers (arxiv_id, title, discovered_via) VALUES ('2601.00001', 'Pre-migration row', 'saved_query')`,
+    ).run();
+    old.close();
+
+    const db = openDb(path);
+    const cols = (db.prepare('PRAGMA table_info(seen_papers)').all() as { name: string }[]).map((c) => c.name);
+    expect(cols).toContain('attempts');
+    expect(cols).toContain('abstract');
+    const row = db.prepare("SELECT attempts, abstract FROM seen_papers WHERE arxiv_id = '2601.00001'").get() as {
+      attempts: number;
+      abstract: string | null;
+    };
+    expect(row.attempts).toBe(0);
+    expect(row.abstract).toBeNull();
+
+    // Idempotent: reopening (which re-applies schema.sql and the migration
+    // guard) must not throw a duplicate-column error.
+    expect(() => openDb(path)).not.toThrow();
   });
 });

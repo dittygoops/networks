@@ -7,7 +7,7 @@ import type { Candidate, DiscoverySource } from '../src/discovery/types.js';
 import type { Draft, DraftInput } from '../src/pipeline/draft.js';
 import type { OrchestrateResult } from '../src/pipeline/orchestrate.js';
 
-const GATE = { threshold: 0.6, borderlineBand: 0.1, maxMessagesPerRun: 3 };
+const GATE = { threshold: 0.6, borderlineBand: 0.1, maxMessagesPerRun: 3, maxResumePerRun: 10, maxResumeAttempts: 3 };
 
 const cand = (arxivId: string, title: string): Candidate => ({
   arxivId,
@@ -257,7 +257,12 @@ describe('runLoop approvals', () => {
     expect(row.status).toBe('skipped');
   });
 
-  it('marks a candidate unsendable and keeps the run going when gateCandidate throws', async () => {
+  // CS3.5 (docs/spec-candidate-stranding.md): a thrown error is retryable, not
+  // terminal. This test used to assert 'drafted_unsendable'; the whole point
+  // of the stranding fix is that a transient generateDraft blip must not
+  // permanently drop the candidate, so it now stays 'discovered' for the next
+  // run's resume step to pick up.
+  it('leaves a candidate retryable, and keeps the run going, when generateDraft throws', async () => {
     const db = openDb(':memory:');
     const pid = upsertPerson(db, { name: 'Someone', email: 'someone@uni.edu' });
     const { deps, channel } = baseDeps(db, {
@@ -267,13 +272,16 @@ describe('runLoop approvals', () => {
     const original = deps.generateDraft as ReturnType<typeof vi.fn>;
     original.mockRejectedValueOnce(new Error('llm outage'));
     const summary = await runLoop(deps, { dryRun: false });
-    expect(summary.unsendable).toBe(1);
+    expect(summary.retryable).toBe(1);
+    expect(summary.unsendable).toBe(0);
     expect(summary.errors.some((e) => e.includes('llm outage'))).toBe(true);
-    const row = db.prepare('SELECT status, reason FROM seen_papers WHERE arxiv_id = ?').get('2601.00020') as {
+    const row = db.prepare('SELECT status, reason, attempts FROM seen_papers WHERE arxiv_id = ?').get('2601.00020') as {
       status: string;
       reason: string;
+      attempts: number;
     };
-    expect(row.status).toBe('drafted_unsendable');
+    expect(row.status).toBe('discovered');
+    expect(row.attempts).toBe(1);
     expect(row.reason).toContain('llm outage');
     expect(channel.notices.length).toBeGreaterThan(0);
     expect(channel.notices[channel.notices.length - 1]).toContain('errors:');
@@ -293,13 +301,13 @@ describe('runLoop approvals', () => {
       generateDraft,
     });
     const summary = await runLoop(deps, { dryRun: false });
-    expect(summary.unsendable).toBe(1);
+    expect(summary.retryable).toBe(1);
     expect(summary.messaged).toBe(1);
     const rows = db.prepare('SELECT arxiv_id AS arxivId, status FROM seen_papers ORDER BY arxiv_id').all() as {
       arxivId: string;
       status: string;
     }[];
-    expect(rows.find((r) => r.arxivId === '2601.00021')?.status).toBe('drafted_unsendable');
+    expect(rows.find((r) => r.arxivId === '2601.00021')?.status).toBe('discovered');
     expect(rows.find((r) => r.arxivId === '2601.00022')?.status).toBe('messaged');
   });
 

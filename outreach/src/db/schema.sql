@@ -107,8 +107,16 @@ CREATE TABLE IF NOT EXISTS seen_papers (
     ('discovered','filtered_low_relevance','drafted_unsendable','queued_for_message','messaged','sent','rejected')),
   draft_id INTEGER REFERENCES drafts(id),
   reason TEXT,
+  -- Bounds how many times the resume step will retry a row stuck at
+  -- 'discovered' (docs/spec-candidate-stranding.md, CS3). Guarded ALTER in
+  -- db.ts covers a database created before this column existed.
+  attempts INTEGER NOT NULL DEFAULT 0,
+  -- The gate scores title plus abstract; a resumed row reconstructed without
+  -- one would score lower than it did fresh (CS1.3). Guarded ALTER in db.ts.
+  abstract TEXT,
   first_seen_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_seen_status ON seen_papers(status);
+CREATE INDEX IF NOT EXISTS idx_seen_resume ON seen_papers(status, first_seen_at);
