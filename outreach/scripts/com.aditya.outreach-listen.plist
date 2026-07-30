@@ -4,13 +4,24 @@
 <dict>
   <key>Label</key>
   <string>com.aditya.outreach-listen</string>
+  <!-- Absolute node, invoking tsx's real entry directly. The node_modules/.bin
+       shim starts with "#!/usr/bin/env node", and launchd's PATH does not
+       include Homebrew, so launchd could not resolve node and the job failed
+       with exit 127 and no PID. Verified working under `env -i`. Change
+       REPLACE_WITH_NODE_PATH if node moves (`which node`). -->
   <key>ProgramArguments</key>
   <array>
-    <string>REPLACE_WITH_ABSOLUTE_PATH/outreach/node_modules/.bin/tsx</string>
+    <string>REPLACE_WITH_NODE_PATH</string>
+    <string>REPLACE_WITH_ABSOLUTE_PATH/outreach/node_modules/tsx/dist/cli.mjs</string>
     <string>--env-file=.env</string>
     <string>src/cli.ts</string>
     <string>listen</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
   <key>WorkingDirectory</key>
   <string>REPLACE_WITH_ABSOLUTE_PATH/outreach</string>
   <key>RunAtLoad</key>
