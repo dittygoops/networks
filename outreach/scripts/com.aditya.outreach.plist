@@ -4,12 +4,28 @@
 <dict>
   <key>Label</key>
   <string>com.aditya.outreach</string>
+  <!-- Absolute node, invoking tsx's real entry directly, and no login shell.
+       The previous form was `/bin/zsh -lc "cd ... && npx tsx ..."`, which has
+       two failure modes launchd actually hit on the sibling listener job:
+       node_modules/.bin/tsx begins with "#!/usr/bin/env node" and launchd's
+       PATH excludes Homebrew (exit 127, no PID), and `npx` can pause to
+       install a missing package. WorkingDirectory replaces the `cd`.
+       Change REPLACE_WITH_NODE_PATH if node moves (`which node`). -->
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/zsh</string>
-    <string>-lc</string>
-    <string>cd REPLACE_WITH_ABSOLUTE_PATH/outreach &amp;&amp; npx tsx --env-file=.env src/cli.ts loop</string>
+    <string>REPLACE_WITH_NODE_PATH</string>
+    <string>REPLACE_WITH_ABSOLUTE_PATH/outreach/node_modules/tsx/dist/cli.mjs</string>
+    <string>--env-file=.env</string>
+    <string>src/cli.ts</string>
+    <string>loop</string>
   </array>
+  <key>WorkingDirectory</key>
+  <string>REPLACE_WITH_ABSOLUTE_PATH/outreach</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
   <key>StartCalendarInterval</key>
   <dict>
     <key>Hour</key>
@@ -17,10 +33,16 @@
     <key>Minute</key>
     <integer>0</integer>
   </dict>
+  <!-- Logs are owner-only: they carry draft subjects and recipient addresses. -->
+  <key>Umask</key>
+  <integer>63</integer>
   <key>StandardOutPath</key>
   <string>REPLACE_WITH_ABSOLUTE_PATH/outreach/data/loop.log</string>
   <key>StandardErrorPath</key>
   <string>REPLACE_WITH_ABSOLUTE_PATH/outreach/data/loop.err.log</string>
+  <!-- Deliberately false: loading this must not fire an immediate real run
+       that discovers papers, spends LLM budget, and texts drafts. It waits
+       for the scheduled 09:00. -->
   <key>RunAtLoad</key>
   <false/>
 </dict>
