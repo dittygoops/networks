@@ -99,8 +99,17 @@ function mapIntersections(raw: RawIntersection[], self: StoredFact[], person: St
   for (const r of raw) {
     const si = parseIndex(r.self, 's', self.length);
     const pi = parseIndex(r.person, 'p', person.length);
-    const strength = typeof r.strength === 'number' && Number.isFinite(r.strength) ? r.strength : 0;
-    if (si === null || pi === null || strength < MIN_STRENGTH) continue;
+    // D5: the model proposes strength, it does not get to invent the scale.
+    // rankHook makes strength dominate (tier only breaks ties), so an
+    // unclamped 5 would outrank a deterministic 0.95 exact-entity match and
+    // become the line a real email opens on, and that path is reachable from
+    // an injected abstract. A value outside [0, 1] means the model ignored the
+    // rubric for this row, so the row is malformed and dropped, which is
+    // exactly how relevanceGate.ts treats an out-of-range judge score.
+    const strength = typeof r.strength === 'number' && Number.isFinite(r.strength) ? r.strength : null;
+    if (si === null || pi === null || strength === null) continue;
+    if (strength < 0 || strength > 1) continue;
+    if (strength < MIN_STRENGTH) continue;
     const s = self[si]!;
     const p = person[pi]!;
     out.push({

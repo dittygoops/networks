@@ -506,3 +506,62 @@ describe('isGenericEntity bare broad nouns (D4)', () => {
     expect(isGenericEntity('gas sensor array')).toBe(false);
   });
 });
+
+// D5: rankHook makes strength dominate, so an unclamped model number decides
+// which hook opens a real email. relevanceGate already treats an out-of-range
+// judge score as malformed; this path now matches it.
+describe('mapIntersections rejects out-of-range model strengths (D5)', () => {
+  const setup = () => {
+    const db = openDb(':memory:');
+    saveSelfFacts(db, [
+      fact({ key: 'method', value: 'hierarchical mixture of experts' }), // s0
+      fact({ key: 'method', value: 'learned embedding alignment' }), // s1
+    ]);
+    const pid = upsertPerson(db, { name: 'P', openalexId: 'A_CLAMP' });
+    saveFacts(db, pid, [
+      fact({ key: 'method', value: 'Hierarchical Mixture-of-Experts' }), // p0, exact 0.95
+      fact({ key: 'method', value: 'graph convolutional networks' }), // p1
+    ]);
+    return { db, pid };
+  };
+
+  test('a strength above 1 is discarded, and the real 0.95 hook still leads', async () => {
+    const { db, pid } = setup();
+    const llm = fakeLLM(JSON.stringify([
+      { self: 's1', person: 'p1', strength: 5, rationale: 'trust me' },
+    ]));
+    const { ranked } = await computeIntersections(db, { llm }, pid);
+    expect(ranked.some((x) => x.strength > 1)).toBe(false);
+    expect(ranked.some((x) => x.rationale === 'trust me')).toBe(false);
+    expect(ranked[0]?.strength).toBe(0.95);
+  });
+
+  test('a negative strength is discarded', async () => {
+    const { db, pid } = setup();
+    const llm = fakeLLM(JSON.stringify([
+      { self: 's1', person: 'p1', strength: -3, rationale: 'negative' },
+    ]));
+    const { ranked } = await computeIntersections(db, { llm }, pid);
+    expect(ranked.some((x) => x.rationale === 'negative')).toBe(false);
+  });
+
+  test('a non-numeric or missing strength is discarded, not defaulted to 0 and kept', async () => {
+    const { db, pid } = setup();
+    const llm = fakeLLM(JSON.stringify([
+      { self: 's1', person: 'p1', strength: 'very high', rationale: 'stringly typed' },
+      { self: 's1', person: 'p1', rationale: 'no strength at all' },
+    ]));
+    const { ranked } = await computeIntersections(db, { llm }, pid);
+    expect(ranked.some((x) => x.rationale === 'stringly typed')).toBe(false);
+    expect(ranked.some((x) => x.rationale === 'no strength at all')).toBe(false);
+  });
+
+  test('a strength of exactly 1 is still accepted', async () => {
+    const { db, pid } = setup();
+    const llm = fakeLLM(JSON.stringify([
+      { self: 's1', person: 'p1', strength: 1, rationale: 'boundary' },
+    ]));
+    const { ranked } = await computeIntersections(db, { llm }, pid);
+    expect(ranked.some((x) => x.rationale === 'boundary')).toBe(true);
+  });
+});
