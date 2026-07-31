@@ -330,7 +330,12 @@ describe('runLoop approvals', () => {
     expect(row.reason).toContain('imessage down');
   });
 
-  it('retries an approved-but-unsent draft on the next run', async () => {
+  // Was "retries an approved-but-unsent draft on the next run". That behavior
+  // was defect D1: an approved draft whose send outcome is unknown must never
+  // be re-sent automatically, because a send that timed out after Gmail
+  // accepted it is indistinguishable from one Gmail never received.
+  // docs/superpowers/plans/2026-07-29-send-path-safety.md.
+  it('never auto-sends an approved-but-unsent draft, and reports it once', async () => {
     const db = openDb(':memory:');
     const pid = upsertPerson(db, { name: 'Someone', email: 'someone@uni.edu' });
     const p = persistDraft(db, {
@@ -343,12 +348,24 @@ describe('runLoop approvals', () => {
       contextJson: {},
     });
     db.prepare("UPDATE drafts SET status = 'approved' WHERE id = ?").run(p.draftId);
-    const { deps } = baseDeps(db);
-    const summary = await runLoop(deps, { dryRun: false });
-    expect(deps.sender.send).toHaveBeenCalledTimes(1);
-    expect(summary.sent).toBe(1);
+    const { deps, channel } = baseDeps(db);
+
+    const first = await runLoop(deps, { dryRun: false });
+    expect(deps.sender.send).not.toHaveBeenCalled();
+    expect(first.sent).toBe(0);
+    expect(first.stalled).toBe(1);
+    expect(channel.notices.join(' ')).toContain(p.shortId);
+
+    // The second run must not text the same stall again.
+    const noticesAfterFirst = channel.notices.length;
+    const second = await runLoop(deps, { dryRun: false });
+    expect(deps.sender.send).not.toHaveBeenCalled();
+    expect(second.stalled).toBe(0);
+    // Only the end-of-run summary line was added.
+    expect(channel.notices.length).toBe(noticesAfterFirst + 1);
+
     const row = db.prepare('SELECT status FROM drafts WHERE id = ?').get(p.draftId) as { status: string };
-    expect(row.status).toBe('sent');
+    expect(row.status).toBe('approved');
   });
 
   it('does not retry an approved-but-unsent draft under dry run', async () => {

@@ -83,6 +83,10 @@ export interface LoopSummary {
   resumed: number;
   retryable: number;
   stranded: number;
+  // Approved drafts that have not gone out, reported by this run (D5).
+  // Optional so listen.ts's LoopSummary literal still compiles; this plan does
+  // not own that file.
+  stalled?: number;
   errors: string[];
 }
 
@@ -729,38 +733,26 @@ async function resumeStranded(deps: LoopDeps, opts: LoopOptions, summary: LoopSu
 // happened; this never promotes anything into that status) whose previous
 // send attempt failed. markSendFailed leaves a draft 'approved' precisely so
 // this step can heal it; without this nothing ever retried it (Fix 3).
-async function retryApprovedUnsent(deps: LoopDeps, summary: LoopSummary): Promise<void> {
-  const rows = deps.db
-    .prepare(
-      `SELECT d.id AS draftId, d.short_id AS shortId, d.person_id AS personId, r.subject AS subject, r.body AS body
-       FROM drafts d JOIN revisions r ON r.id = d.sendable_revision_id
-       WHERE d.status = 'approved' AND d.sendable_revision_id IS NOT NULL`,
-    )
-    .all() as { draftId: number; shortId: string; personId: number; subject: string; body: string }[];
-
-  for (const row of rows) {
-    const person = getPerson(deps.db, row.personId);
-    if (!person?.email) {
-      await deps.channel.notify(`${row.shortId} has no email on record.`);
-      continue;
-    }
-    try {
-      const { sentId } = await deps.sender.send({
-        to: person.email,
-        from: deps.senderEmail ?? process.env.SENDER_EMAIL ?? 'apgupta3@asu.edu',
-        subject: row.subject,
-        body: row.body,
-        draftShortId: row.shortId,
-      });
-      markSent(deps.db, row.draftId, sentId);
-      summary.sent++;
-      await deps.channel.notify(`${row.shortId} sent to ${person.email}.`);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      markSendFailed(deps.db, row.draftId, msg);
-      summary.errors.push(`${row.shortId}: retry send failed: ${msg}`);
-      await deps.channel.notify(`${row.shortId} failed to send: ${msg}`);
-    }
+// D1/D5. What used to be retryApprovedUnsent. It no longer sends: an approved
+// draft whose send outcome is unknown can never be safely re-sent from inside
+// the process (there is no idempotency key on the Gmail send, so a timeout
+// after acceptance looks exactly like a failure before it). It reports instead,
+// at most once per attempt count, so a draft approved against a permanently bad
+// address does not text Aditya the same failure every morning forever.
+//
+// Recovery is a human act, by design. See
+// docs/superpowers/plans/2026-07-29-send-path-safety.md, "Re-arming".
+async function reportStalledApprovals(deps: LoopDeps, summary: LoopSummary): Promise<void> {
+  for (const row of stalledApprovals(deps.db)) {
+    if (stallAlreadyReported(deps.db, row.draftId, row.attempts)) continue;
+    const detail =
+      row.attemptedAt === null
+        ? `approved but never attempted. Reply "${row.shortId} y" again to send it.`
+        : `one send attempt recorded at ${row.attemptedAt}, never confirmed. Not retried automatically: ` +
+          `check the Gmail Sent folder for ${row.toEmail ?? 'the recipient'} before re-arming it.`;
+    markStallReported(deps.db, row.draftId, row.attempts);
+    summary.stalled = (summary.stalled ?? 0) + 1;
+    await deps.channel.notify(`${row.shortId} is approved and unsent: ${detail}`);
   }
 }
 
@@ -776,22 +768,23 @@ export async function runLoop(deps: LoopDeps, opts: LoopOptions): Promise<LoopSu
     resumed: 0,
     retryable: 0,
     stranded: 0,
+    stalled: 0,
     errors: [],
   };
 
   try {
     await drainApprovals(deps, opts, summary);
 
-    // Retry approved-but-unsent drafts before anything else (F3): the user's
-    // approval already happened, so a transient send failure must heal here,
-    // not wait on a step that only runs for newly discovered/queued work.
-    // Never runs in a dry run: a dry run must send nothing.
+    // D1: an approved-but-unsent draft is reported, never re-sent. The user's
+    // approval already happened, but a second send of a cold email cannot be
+    // taken back, and nothing here can tell a failed send from a delivered one.
+    // Never runs in a dry run: a dry run writes nothing and texts nothing.
     if (!opts.dryRun) {
       try {
-        await retryApprovedUnsent(deps, summary);
+        await reportStalledApprovals(deps, summary);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        summary.errors.push(`retry approved unsent failed: ${msg}`);
+        summary.errors.push(`stalled approval report failed: ${msg}`);
       }
     }
 
@@ -856,6 +849,7 @@ export async function runLoop(deps: LoopDeps, opts: LoopOptions): Promise<LoopSu
       `resumed ${summary.resumed}` +
       (summary.retryable ? `, retryable ${summary.retryable}` : '') +
       (summary.stranded ? `, stranded ${summary.stranded}` : '') +
+      (summary.stalled ? `, stalled approvals ${summary.stalled}` : '') +
       (summary.errors.length ? `, errors: ${summary.errors.join(' | ')}` : '');
     try {
       await deps.channel.notify(line);
