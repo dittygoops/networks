@@ -136,6 +136,23 @@ export const GENERIC_ENTITIES: readonly string[] = [
   'jupyter', 'numpy', 'pandas',
   // geographic and organizational generics
   'united states', 'usa', 'china', 'europe', 'university', 'institute', 'laboratory',
+  // Bare one-word nouns. OpenAlex research-area concepts are frequently a
+  // single common word, and a single common word shared between two people is
+  // not common ground: "both: Robot" and "both: Obstacle" are true and say
+  // nothing. This list was drawn from the concepts actually observed on mined
+  // profiles in the live database, so it is enumeration and it does NOT
+  // generalize: a bare noun not listed here still gets through, which is why
+  // the structural demotion below (single-token containment scores 0.60, not
+  // 0.85) is the primary defense and this list is the secondary one. Terms
+  // central to the project's actual domain (olfaction, odor, olfactory) are
+  // deliberately absent: for this target population they ARE discriminating,
+  // and removing them would have deleted the only hook three real people had.
+  'robot', 'robotics', 'obstacle', 'sensor', 'sensors', 'simulation',
+  'algorithm', 'optimization', 'network', 'networks', 'model', 'models',
+  'system', 'systems', 'data', 'software', 'hardware', 'computation',
+  'computing', 'internet', 'cloud', 'database', 'statistics', 'physics',
+  'chemistry', 'biology', 'medicine', 'psychology', 'economics', 'education',
+  'management', 'nature',
 ];
 
 const GENERIC_SET = new Set(GENERIC_ENTITIES.map(normEntity));
@@ -158,9 +175,24 @@ const isSpecificHook = (h: Intersection): boolean =>
 // shared with discovery/relevanceGate.ts. They diverged once and that cost a
 // live bad hook on two real people; one implementation is the fix.
 
-// Deterministic entity overlap: same normalized value (0.95), or one clearly
-// contains the other at word boundaries (0.85), e.g. "gaussian splatting" in
-// "3d gaussian splatting". This is the reliable core of intersection scoring,
+const CONTAINMENT_MIN_LEN = 5; // the shorter side must carry some information
+const EXACT_STRENGTH = 0.95;
+const CONTAINMENT_STRENGTH = 0.85;
+// A single shared TOKEN is a much weaker signal than a shared phrase, but it
+// is not always noise: an OpenAlex research area of "olfaction" against a self
+// fact about olfaction research is the actual reason for the outreach, and in
+// the live database that shape was the ONLY hook three real people had. So it
+// is demoted rather than deleted: below every phrase-level match, above
+// STRONG_HOOK so it can still carry a draft when it is genuinely all there is.
+// The complementary defense is GENERIC_ENTITIES above, which removes the bare
+// nouns ("Robot", "Obstacle") that make this shape vacuous.
+const SINGLE_TOKEN_CONTAINMENT_STRENGTH = 0.6;
+
+const tokenCount = (s: string): number => (s ? s.split(' ').length : 0);
+
+// Deterministic entity overlap: same normalized value (0.95), one phrase
+// containing another at word boundaries (0.85), or one bare token contained in
+// the other (0.60). This is the reliable core of intersection scoring,
 // independent of the LLM.
 function entityMatches(self: StoredFact[], person: StoredFact[]): Intersection[] {
   const out: Intersection[] = [];
@@ -171,8 +203,15 @@ function entityMatches(self: StoredFact[], person: StoredFact[]): Intersection[]
       const np = normEntity(p.value);
       if (np.length < 3) continue;
       let strength = 0;
-      if (ns === np) strength = 0.95;
-      else if (Math.min(ns.length, np.length) >= 5 && (containsWholeWords(ns, np) || containsWholeWords(np, ns))) strength = 0.85;
+      if (ns === np) {
+        strength = EXACT_STRENGTH;
+      } else if (
+        Math.min(ns.length, np.length) >= CONTAINMENT_MIN_LEN &&
+        (containsWholeWords(ns, np) || containsWholeWords(np, ns))
+      ) {
+        const shorterTokens = ns.length <= np.length ? tokenCount(ns) : tokenCount(np);
+        strength = shorterTokens >= 2 ? CONTAINMENT_STRENGTH : SINGLE_TOKEN_CONTAINMENT_STRENGTH;
+      }
       if (!strength) continue;
       out.push({
         selfFactId: s.id,

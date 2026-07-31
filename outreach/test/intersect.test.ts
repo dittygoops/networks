@@ -404,3 +404,105 @@ describe('regression: the real bad-draft case (vacuous hooks dropped, MoE hook l
     expect(ranked.some((x) => x.personValue === 'Computer science')).toBe(false);
   });
 });
+
+// D4: an OpenAlex research-area concept is frequently ONE common word, and the
+// containment rule awarded it 0.85, above STRONG_HOOK, so "both: Robot" could
+// deterministically become the line a real email opens on. Two changes:
+// single-token containment now scores 0.60 (structural, generalizes), and
+// bare broad nouns joined GENERIC_ENTITIES (lexical, does not generalize).
+describe('entityMatches single-token containment (D4)', () => {
+  test('a bare generic noun contained in a longer self value is dropped entirely', async () => {
+    const db = openDb(':memory:');
+    saveSelfFacts(db, [fact({ key: 'project', value: 'Obstacle Detection Evaluation Pipeline' })]);
+    const pid = upsertPerson(db, { name: 'Yanbaihui Liu', openalexId: 'A_OBSTACLE' });
+    saveFacts(db, pid, [fact({ key: 'research_area', value: 'Obstacle' })]);
+
+    const { ranked, noStrongHook } = await computeIntersections(db, { llm: fakeLLM('[]') }, pid);
+    expect(ranked.some((x) => x.personValue === 'Obstacle')).toBe(false);
+    expect(noStrongHook).toBe(true);
+  });
+
+  test('"Robot" against "robot manipulation" no longer produces a deterministic 0.85 hook', async () => {
+    const db = openDb(':memory:');
+    saveSelfFacts(db, [fact({ key: 'research_area', value: 'robot manipulation' })]);
+    const pid = upsertPerson(db, { name: 'P', openalexId: 'A_ROBOT' });
+    saveFacts(db, pid, [fact({ key: 'research_area', value: 'Robot' })]);
+
+    const { ranked } = await computeIntersections(db, { llm: fakeLLM('[]') }, pid);
+    expect(ranked.some((x) => x.personValue === 'Robot')).toBe(false);
+  });
+
+  // The live-data counterweight. Six of the seven containment hooks in the
+  // last snapshot with hooks were this shape, and for three people it was the
+  // ONLY hook. A rule that deletes them trades a false-accept problem for a
+  // silent recall collapse on exactly the population Aditya is writing to.
+  test('a specific single-token research area still produces a usable hook, at reduced strength', async () => {
+    const db = openDb(':memory:');
+    saveSelfFacts(db, [
+      fact({
+        key: 'research_area',
+        value: 'just looking to connect and get more direction for future olfaction / smell research',
+      }),
+    ]);
+    const pid = upsertPerson(db, { name: 'Gary Tom', openalexId: 'A_OLF' });
+    saveFacts(db, pid, [fact({ key: 'research_area', value: 'olfaction' })]);
+
+    const { ranked, noStrongHook } = await computeIntersections(db, { llm: fakeLLM('[]') }, pid);
+    const hook = ranked.find((x) => x.personValue === 'olfaction');
+    expect(hook).toBeDefined();
+    expect(hook?.strength).toBe(0.6);
+    expect(noStrongHook).toBe(false); // still above STRONG_HOOK, still draftable
+  });
+
+  test('a multi-token containment keeps its 0.85, and outranks a single-token one', async () => {
+    const db = openDb(':memory:');
+    saveSelfFacts(db, [
+      fact({ key: 'method', value: 'gaussian splatting' }),
+      fact({ key: 'research_area', value: 'olfaction research' }),
+    ]);
+    const pid = upsertPerson(db, { name: 'P', openalexId: 'A_MIX' });
+    saveFacts(db, pid, [
+      fact({ key: 'method', value: '3D gaussian splatting for dynamic scenes' }),
+      fact({ key: 'research_area', value: 'olfaction' }),
+    ]);
+
+    const { ranked } = await computeIntersections(db, { llm: fakeLLM('[]') }, pid);
+    const multi = ranked.find((x) => x.selfValue === 'gaussian splatting');
+    const single = ranked.find((x) => x.personValue === 'olfaction');
+    expect(multi?.strength).toBe(0.85);
+    expect(single?.strength).toBe(0.6);
+    expect(ranked.indexOf(multi!)).toBeLessThan(ranked.indexOf(single!));
+  });
+
+  test('exact equality is untouched at 0.95 even for a single token', async () => {
+    const db = openDb(':memory:');
+    saveSelfFacts(db, [fact({ key: 'research_area', value: 'olfaction' })]);
+    const pid = upsertPerson(db, { name: 'P', openalexId: 'A_EXACT' });
+    saveFacts(db, pid, [fact({ key: 'research_area', value: 'Olfaction' })]);
+
+    const { ranked } = await computeIntersections(db, { llm: fakeLLM('[]') }, pid);
+    expect(ranked[0]?.strength).toBe(0.95);
+  });
+});
+
+describe('isGenericEntity bare broad nouns (D4)', () => {
+  test('flags bare one-word OpenAlex concepts that say nothing about a person', () => {
+    expect(isGenericEntity('Robot')).toBe(true);
+    expect(isGenericEntity('Obstacle')).toBe(true);
+    expect(isGenericEntity('Sensor')).toBe(true);
+    expect(isGenericEntity('Chemistry')).toBe(true);
+  });
+
+  test('does not flag the domain terms this project is actually about', () => {
+    expect(isGenericEntity('olfaction')).toBe(false);
+    expect(isGenericEntity('odor')).toBe(false);
+    expect(isGenericEntity('olfactory perception')).toBe(false);
+  });
+
+  test('still matches the whole value only: a compound containing a bare noun survives', () => {
+    expect(isGenericEntity('robot manipulation')).toBe(false);
+    expect(isGenericEntity('robotic olfaction')).toBe(false);
+    expect(isGenericEntity('obstacle detection evaluation pipeline')).toBe(false);
+    expect(isGenericEntity('gas sensor array')).toBe(false);
+  });
+});
