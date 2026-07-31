@@ -114,14 +114,176 @@ export function decide(
   return txn();
 }
 
+// D7: the UPDATE and the audit record are one unit. A crash between them would
+// lose the only durable record of an irreversible email.
 export function markSent(db: DB, draftId: number, sentId: string): void {
-  db.prepare("UPDATE drafts SET status = 'sent' WHERE id = ?").run(draftId);
-  logEvent(db, draftId, 'sent', { sentId });
+  const txn = db.transaction((): void => {
+    db.prepare("UPDATE drafts SET status = 'sent' WHERE id = ?").run(draftId);
+    logEvent(db, draftId, 'sent', { sentId });
+  });
+  txn();
 }
 
+// The draft stays 'approved' and, critically, the send claim stays in place.
+// Nothing automatic retries it (D1: retryApprovedUnsent is gone). A failure and
+// a timeout are indistinguishable from here, and only one of them is safe to
+// repeat, so a human decides. See docs/superpowers/plans/2026-07-29-send-path-safety.md.
 export function markSendFailed(db: DB, draftId: number, error: string): void {
-  // Stays 'approved': healed by retrying the send later (AL4 status semantics).
-  logEvent(db, draftId, 'send_failed', { error });
+  const txn = db.transaction((): void => {
+    const row = db.prepare('SELECT send_attempts AS attempts FROM drafts WHERE id = ?').get(draftId) as
+      | { attempts: number }
+      | undefined;
+    logEvent(db, draftId, 'send_failed', { error, attempt: row?.attempts ?? null });
+  });
+  txn();
+}
+
+export type ApprovedSendLookup =
+  | { kind: 'ok'; draftId: number; shortId: string; toEmail: string; subject: string; body: string }
+  | { kind: 'unknown_draft' }
+  | { kind: 'not_approved'; status: string }
+  | { kind: 'already_attempted'; attempts: number; attemptedAt: string }
+  | { kind: 'not_grounded' }
+  | { kind: 'no_snapshot' }
+  | { kind: 'recipient_changed'; snapshot: string; current: string | null };
+
+// Read-only. Answers "should this send happen, and with exactly what payload",
+// so the caller can refuse for a bad payload BEFORE claiming the one and only
+// send attempt. Everything it returns comes from frozen state: the subject and
+// body from revisions, the recipient from drafts.to_email.
+export function loadApprovedSend(db: DB, draftId: number): ApprovedSendLookup {
+  const row = db
+    .prepare(
+      `SELECT d.short_id AS shortId, d.status AS status, d.to_email AS toEmail,
+              d.send_attempts AS attempts, d.send_attempted_at AS attemptedAt,
+              d.sendable_revision_id AS revisionId,
+              p.email AS currentEmail, r.subject AS subject, r.body AS body
+         FROM drafts d
+         JOIN people p ON p.id = d.person_id
+         LEFT JOIN revisions r ON r.id = d.sendable_revision_id
+        WHERE d.id = ?`,
+    )
+    .get(draftId) as
+    | {
+        shortId: string;
+        status: string;
+        toEmail: string | null;
+        attempts: number;
+        attemptedAt: string | null;
+        revisionId: number | null;
+        currentEmail: string | null;
+        subject: string | null;
+        body: string | null;
+      }
+    | undefined;
+
+  if (!row) return { kind: 'unknown_draft' };
+  if (row.status !== 'approved') return { kind: 'not_approved', status: row.status };
+  if (row.attemptedAt !== null) {
+    return { kind: 'already_attempted', attempts: row.attempts, attemptedAt: row.attemptedAt };
+  }
+  if (row.revisionId === null || row.body === null) return { kind: 'not_grounded' };
+  if (!row.toEmail) return { kind: 'no_snapshot' };
+  // D2. Refuse rather than choose. Sending to the snapshot mails an address the
+  // system now believes is wrong; sending to the current address mails one no
+  // human approved. Both act under ambiguity, so do neither and ask.
+  if (row.toEmail !== row.currentEmail) {
+    return { kind: 'recipient_changed', snapshot: row.toEmail, current: row.currentEmail };
+  }
+  return {
+    kind: 'ok',
+    draftId,
+    shortId: row.shortId,
+    toEmail: row.toEmail,
+    subject: row.subject ?? '',
+    body: row.body,
+  };
+}
+
+export type SendClaim = { ok: true; attempt: number } | { ok: false; reason: string };
+
+// D1. The at-most-once mechanism. One conditional UPDATE, inside a transaction,
+// committed BEFORE the caller touches the network. Exactly one caller can see
+// changes === 1, in this process or in the other one: SQLite serializes writers
+// and the WHERE clause carries the whole precondition, so there is no
+// read-then-write gap to lose. Everyone else refuses.
+//
+// The claim is never released by a failure. A send that times out after Gmail
+// accepted the message looks identical to one Gmail never saw (there is no
+// idempotency key on gmail.users.messages.send), and re-sending the second is
+// harmless while re-sending the first is an unrecoverable second cold email to
+// a stranger. So a claimed draft waits for a human.
+export function beginSendAttempt(db: DB, draftId: number): SendClaim {
+  const txn = db.transaction((): SendClaim => {
+    const res = db
+      .prepare(
+        `UPDATE drafts
+            SET send_attempted_at = datetime('now'), send_attempts = send_attempts + 1
+          WHERE id = ? AND status = 'approved' AND send_attempted_at IS NULL`,
+      )
+      .run(draftId);
+    if (res.changes === 0) {
+      const row = db
+        .prepare(
+          'SELECT status, send_attempts AS attempts, send_attempted_at AS attemptedAt FROM drafts WHERE id = ?',
+        )
+        .get(draftId) as { status: string; attempts: number; attemptedAt: string | null } | undefined;
+      if (!row) return { ok: false, reason: 'draft does not exist' };
+      if (row.attemptedAt !== null) {
+        return {
+          ok: false,
+          reason: `a send attempt was already recorded at ${row.attemptedAt} (attempt ${row.attempts})`,
+        };
+      }
+      return { ok: false, reason: `draft is ${row.status}, not approved` };
+    }
+    const after = db.prepare('SELECT send_attempts AS attempts FROM drafts WHERE id = ?').get(draftId) as {
+      attempts: number;
+    };
+    logEvent(db, draftId, 'send_attempted', { attempt: after.attempts });
+    return { ok: true, attempt: after.attempts };
+  });
+  return txn();
+}
+
+export interface StalledApproval {
+  draftId: number;
+  shortId: string;
+  attempts: number;
+  attemptedAt: string | null;
+  toEmail: string | null;
+}
+
+// D5. Every draft resting at 'approved' is, by definition, an approved email
+// that has not gone out. Reported, never auto-sent.
+export function stalledApprovals(db: DB): StalledApproval[] {
+  return db
+    .prepare(
+      `SELECT id AS draftId, short_id AS shortId, send_attempts AS attempts,
+              send_attempted_at AS attemptedAt, to_email AS toEmail
+         FROM drafts WHERE status = 'approved' ORDER BY id`,
+    )
+    .all() as StalledApproval[];
+}
+
+// Bounded reporting: keyed on the attempt count, so one stall produces exactly
+// one text, and a human re-arm (which leads to a new attempt number) produces
+// exactly one more. Without this, a draft approved against a permanently bad
+// address texts Aditya the same failure every single morning forever.
+export function stallAlreadyReported(db: DB, draftId: number, attempts: number): boolean {
+  return (
+    db
+      .prepare(
+        `SELECT 1 FROM draft_events
+          WHERE draft_id = ? AND type = 'stall_reported'
+            AND json_extract(detail_json, '$.attempts') = ?`,
+      )
+      .get(draftId, attempts) !== undefined
+  );
+}
+
+export function markStallReported(db: DB, draftId: number, attempts: number): void {
+  logEvent(db, draftId, 'stall_reported', { attempts });
 }
 
 export interface PriorThread {
