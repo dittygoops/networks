@@ -7,14 +7,41 @@
 // bioRxiv, which arXiv search cannot reach, so seeding this path from the
 // key papers is the main route to that non-arXiv work.
 import type { DB } from '../../db/db.js';
-import type { Candidate, DiscoverySource } from '../types.js';
+import type { Candidate, DiscoverySource, SourceResult } from '../types.js';
 import { queryArxivFeed, sleep, type ArxivQueryOptions } from './arxivQuery.js';
 
-// Semantic Scholar, not arXiv, but the same pacing and isolation apply.
-export type RecommendOptions = ArxivQueryOptions;
+// D4. What is actually shared with arxivQuery.ts, and what deliberately is
+// not. Shared: `sleep`, and the same one-request-per-few-seconds courtesy, and
+// (since this file was corrected) the same failure contract, a SourceResult
+// carrying errors rather than a swallowed catch. NOT shared: `arxivGate`, the
+// process-wide chain that serialises requests to export.arxiv.org. Semantic
+// Scholar is a different host with a different rate limit, and routing it
+// through the arXiv gate would make the two sources contend for one another's
+// pacing budget for no reason.
+export interface RecommendOptions {
+  fetchFn?: typeof fetch;
+  // D5. Recommendations requested per seed paper. This is NOT the same unit as
+  // ArxivQueryOptions.maxResults ("arXiv results per query"), which is why this
+  // type is no longer an empty alias of it: the alias read as though the two
+  // meant the same thing.
+  maxResultsPerSeed?: number;
+  delayMs?: number;
+}
 
-interface S2Recommendation {
-  paper?: { externalIds?: { ArXiv?: string }; title?: string; abstract?: string };
+// D1. The verified shape of one element of `recommendedPapers`, checked live
+// against GET /recommendations/v1/papers/forpaper/arXiv:2506.02373 on
+// 2026-07-30. The endpoint returns
+//   {"recommendedPapers": [ {paperId, title, abstract, externalIds} ]}
+// so the paper objects ARE the array elements. There is no `paper` wrapper and
+// no `data` key. The previous code read `rec.paper?.externalIds?.ArXiv`, which
+// was undefined for every element, so `if (!arxivId) continue` fired every
+// time and this source returned zero every day since it was written. Because
+// it returned [] rather than failing, discoverAll recorded no error and the
+// dead source was indistinguishable from a quiet day.
+interface S2Paper {
+  externalIds?: { ArXiv?: string } | null;
+  title?: string;
+  abstract?: string | null;
 }
 
 // Matches a modern arXiv id (YYMM.NNNNN, optionally "arXiv:" prefixed and
@@ -78,19 +105,29 @@ export async function resolveKeyPaperSeeds(db: DB, opts: ArxivQueryOptions = {})
     const target = normalizeTitle(value);
     if (!target) continue;
 
-    let candidates: Candidate[];
+    let found: Candidate[];
     try {
-      candidates = await queryArxivFeed('ti', [value], 'recommend', () => 'key_paper title lookup', {
+      const res = await queryArxivFeed('ti', [value], 'recommend', () => 'key_paper title lookup', {
         ...opts,
         maxResults: opts.maxResults ?? 5,
       });
+      // queryArxivFeed no longer throws for an upstream failure, so its errors
+      // arrive here as data. Seed resolution is best effort and a failure to
+      // resolve one key_paper title must not fail the run, so these are warned
+      // and the fact is skipped, exactly as the old catch did.
+      for (const err of res.errors) {
+        console.warn(`key_paper title lookup failed for ${JSON.stringify(value)}: ${err}`);
+      }
+      found = res.candidates;
     } catch (e) {
+      // Defensive only: nothing in queryArxivFeed throws for an expected
+      // upstream failure any more. A throw here is a bug, not a 429.
       const msg = e instanceof Error ? e.message : String(e);
       console.warn(`key_paper title lookup failed for ${JSON.stringify(value)}: ${msg}`);
       continue;
     }
 
-    const match = candidates.find((c) => normalizeTitle(c.title) === target);
+    const match = found.find((c) => normalizeTitle(c.title) === target);
     if (match) {
       out.push(match.arxivId);
     } else {
@@ -104,13 +141,15 @@ export async function resolveKeyPaperSeeds(db: DB, opts: ArxivQueryOptions = {})
 
 export function createRecommendSource(seeds: string[], opts: RecommendOptions = {}): DiscoverySource {
   const fetchFn = opts.fetchFn ?? fetch;
-  const maxResults = opts.maxResults ?? 10;
+  const maxResultsPerSeed = opts.maxResultsPerSeed ?? 10;
   const delayMs = opts.delayMs ?? 3000;
 
   return {
     name: 'recommend',
-    async fetch(): Promise<Candidate[]> {
-      const out: Candidate[] = [];
+    async fetch(): Promise<SourceResult> {
+      const candidates: Candidate[] = [];
+      const failures: string[] = [];
+
       for (let i = 0; i < seeds.length; i++) {
         const s = seeds[i];
         if (s === undefined) continue;
@@ -118,26 +157,51 @@ export function createRecommendSource(seeds: string[], opts: RecommendOptions = 
         try {
           const url =
             `https://api.semanticscholar.org/recommendations/v1/papers/forpaper/arXiv:${encodeURIComponent(s)}` +
-            `?fields=title,abstract,externalIds&limit=${maxResults}`;
+            `?fields=title,abstract,externalIds&limit=${maxResultsPerSeed}`;
           const res = await fetchFn(url);
-          if (!res.ok) continue;
-          const body = (await res.json()) as { recommendedPapers?: S2Recommendation[]; data?: S2Recommendation[] };
-          for (const rec of body.recommendedPapers ?? body.data ?? []) {
-            const arxivId = rec.paper?.externalIds?.ArXiv;
-            if (!arxivId) continue; // the pipeline is arXiv only
-            out.push({
-              arxivId,
-              title: rec.paper?.title ?? '',
-              abstract: rec.paper?.abstract ?? undefined,
+          if (!res.ok) {
+            // Semantic Scholar rate limits aggressively without an API key, so
+            // a 429 here is the expected failure mode, not an exotic one. It
+            // used to hit a bare `continue` and vanish.
+            failures.push(`${s}: HTTP ${res.status}`);
+            console.warn(`Semantic Scholar recommendations failed for seed ${s}: HTTP ${res.status}`);
+            continue;
+          }
+          const body = (await res.json()) as { recommendedPapers?: S2Paper[] | null };
+          for (const rec of body.recommendedPapers ?? []) {
+            const arxivId = rec.externalIds?.ArXiv;
+            // The pipeline is arXiv only. Verified live: many recommendations
+            // carry only a DOI, and dropping those is correct and is NOT a
+            // failure, so nothing is pushed to `failures` here.
+            if (!arxivId) continue;
+            candidates.push({
+              // seen_papers keys on an unversioned id, and parseSearchFeed
+              // strips the suffix too, so the two paths agree on the key.
+              arxivId: arxivId.replace(/v\d+$/, ''),
+              title: rec.title ?? '',
+              abstract: rec.abstract ?? undefined,
               discoveredVia: 'recommend',
               sourceDetail: `seed: ${s}`,
             });
           }
-        } catch {
-          continue;
+        } catch (e) {
+          // Covers a network throw and a res.json() parse failure. Both used
+          // to hit a bare `catch { continue; }`.
+          const msg = e instanceof Error ? e.message : String(e);
+          failures.push(`${s}: ${msg}`);
+          console.warn(`Semantic Scholar recommendations failed for seed ${s}: ${msg}`);
         }
       }
-      return out;
+
+      if (failures.length === 0) return { candidates, errors: [] };
+
+      // Same contract as queryArxivFeed (D4): one headline per source, total
+      // distinguished from partial in the first word, first failure quoted.
+      const total = failures.length === seeds.length;
+      const headline = total
+        ? `all ${seeds.length} Semantic Scholar seeds failed (${failures[0] ?? 'unknown'})`
+        : `${failures.length} of ${seeds.length} Semantic Scholar seeds failed (${failures[0] ?? 'unknown'})`;
+      return { candidates, errors: [headline] };
     },
   };
 }
