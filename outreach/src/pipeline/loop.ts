@@ -8,12 +8,17 @@ import { getPerson } from '../db/db.js';
 import type { ApprovalChannel } from '../approval/channel.js';
 import { parseReply } from '../approval/channel.js';
 import {
+  beginSendAttempt,
   decide,
+  loadApprovedSend,
   markSendFailed,
   markSent,
+  markStallReported,
   persistDraft,
   priorThreads,
   logEvent,
+  stallAlreadyReported,
+  stalledApprovals,
   type PersistedDraft,
 } from '../approval/ledger.js';
 import { formatShortId, parseShortId } from '../approval/ids.js';
@@ -34,7 +39,7 @@ import { gateCandidate } from '../discovery/relevanceGate.js';
 import type { Candidate, DiscoverySource } from '../discovery/types.js';
 import type { Draft, DraftInput } from './draft.js';
 import type { OrchestrateResult } from './orchestrate.js';
-import type { Sender } from '../sender/types.js';
+import { assertSafeOutbound, type Sender } from '../sender/types.js';
 import type { LLMClient } from '../llm/client.js';
 
 // The subset of LoopDeps that acting on one reply actually needs. Split out
@@ -91,6 +96,112 @@ function draftExists(db: DB, draftId: number): boolean {
   return db.prepare('SELECT 1 FROM drafts WHERE id = ?').get(draftId) !== undefined;
 }
 
+// D6: the one and only place that turns an approval into a real email. Both
+// callers of handleReply (the batch loop and the listener daemon) reach it,
+// and after D1 nothing else in the system sends at all, so the
+// never-send-without-approval accounting exists exactly once.
+async function performApprovedSend(
+  deps: ReplyDeps,
+  summary: LoopSummary,
+  draftId: number,
+  shortId: string,
+): Promise<void> {
+  // Phase 0, read-only. Refusing here costs nothing: no claim is consumed, so
+  // a human can fix the cause and re-approve by texting "dN y" again.
+  const lookup = loadApprovedSend(deps.db, draftId);
+  switch (lookup.kind) {
+    case 'ok':
+      break;
+    case 'unknown_draft':
+      await deps.channel.notify(`No draft found for ${shortId}. Ignoring that reply.`);
+      return;
+    case 'not_approved':
+      // A repeat 'y' on a draft that already went out lands here (status is
+      // 'sent' or 'sent (stubbed)', not 'approved'): say "already" plainly so
+      // the human reading the reply is not left wondering if it went through.
+      await deps.channel.notify(
+        lookup.status.startsWith('sent')
+          ? `${shortId} was already ${lookup.status}. Nothing sent again.`
+          : `${shortId} is ${lookup.status}, not approved. Nothing sent.`,
+      );
+      return;
+    case 'already_attempted':
+      // D1. The ambiguous case: Gmail may or may not have delivered it. Never
+      // guess, and never let a text message resolve it.
+      logEvent(deps.db, draftId, 'send_refused', { reason: 'already_attempted', attempts: lookup.attempts });
+      await deps.channel.notify(
+        `${shortId}: a send attempt was already recorded at ${lookup.attemptedAt} and never confirmed. ` +
+          `Nothing sent. Check the Gmail Sent folder before re-arming it by hand.`,
+      );
+      return;
+    case 'not_grounded':
+      await deps.channel.notify(`${shortId} has no grounded revision to send.`);
+      return;
+    case 'no_snapshot':
+      await deps.channel.notify(`${shortId} has no recipient address on record. Nothing sent.`);
+      return;
+    case 'recipient_changed':
+      // D2. Refuse, do not choose. Neither address can be sent to safely.
+      logEvent(deps.db, draftId, 'send_refused', {
+        reason: 'recipient_changed',
+        snapshot: lookup.snapshot,
+        current: lookup.current,
+      });
+      await deps.channel.notify(
+        `${shortId}: the address changed since you approved it (approved ${lookup.snapshot}, ` +
+          `now ${lookup.current ?? 'none'}). Nothing sent.`,
+      );
+      return;
+  }
+
+  const outbound = {
+    to: lookup.toEmail,
+    from: deps.senderEmail ?? process.env.SENDER_EMAIL ?? 'apgupta3@asu.edu',
+    subject: lookup.subject,
+    body: lookup.body,
+    draftShortId: shortId,
+  };
+
+  // D3. Validate before claiming, so a poisoned subject does not burn the one
+  // and only send attempt. The senders validate again, which is the backstop
+  // that also covers `outreach add`.
+  try {
+    assertSafeOutbound(outbound);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    logEvent(deps.db, draftId, 'send_refused', { reason: 'unsafe_outbound', error: msg });
+    summary.errors.push(`${shortId}: ${msg}`);
+    await deps.channel.notify(`${shortId} refused as unsafe: ${msg}`);
+    return;
+  }
+
+  // Phase 1, the claim. Synchronous and committed before the await below, so a
+  // concurrent process (the 09:00 batch versus the listener) loses this race
+  // instead of sending a second copy.
+  const claim = beginSendAttempt(deps.db, draftId);
+  if (!claim.ok) {
+    await deps.channel.notify(`${shortId} not sent: ${claim.reason}.`);
+    return;
+  }
+
+  // Phase 2, the network. From here on, a failure is NOT retried automatically:
+  // a timeout after Gmail accepted the message is indistinguishable from a
+  // message Gmail never saw, and only one of those is safe to repeat.
+  try {
+    const { sentId } = await deps.sender.send(outbound);
+    markSent(deps.db, draftId, sentId);
+    summary.sent++;
+    await deps.channel.notify(`${shortId} sent to ${outbound.to}.`);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    markSendFailed(deps.db, draftId, msg);
+    summary.errors.push(`${shortId}: send failed: ${msg}`);
+    await deps.channel.notify(
+      `${shortId} failed to send: ${msg}. Not retried automatically; check the Gmail Sent folder.`,
+    );
+  }
+}
+
 export async function handleReply(
   deps: ReplyDeps,
   opts: LoopOptions,
@@ -112,8 +223,21 @@ export async function handleReply(
 
   if (parsed.kind === 'unsupported') {
     // Edits are F5 territory (docs/spec-imessage-approval-loop.md).
-    logEvent(deps.db, draftId, 'edit_reply_unsupported', { text: reply.text });
+    if (!opts.dryRun) logEvent(deps.db, draftId, 'edit_reply_unsupported', { text: reply.text });
     await deps.channel.notify(`Edits are not yet supported for ${parsed.shortId}. Reply "y" to send or "n" to skip.`);
+    return;
+  }
+
+  // D4. The dry-run check comes BEFORE any mutation. `decide` is first-write-
+  // wins on UNIQUE(draft_id), so recording a decision during a rehearsal
+  // permanently consumes the one and only decision slot for that draft. This is
+  // the same rule resolveSendableDraft states below ("A dry run must never call
+  // decide"); it now holds in the code rather than being held by the stub
+  // channel happening to yield no replies.
+  if (opts.dryRun) {
+    await deps.channel.notify(
+      `${parsed.shortId}: dry run, nothing recorded and nothing sent (would ${parsed.kind}).`,
+    );
     return;
   }
 
@@ -127,46 +251,18 @@ export async function handleReply(
 
   const res = decide(deps.db, draftId, 'send', 'imessage');
   if (!res.applied) {
-    await deps.channel.notify(`${parsed.shortId} was already ${res.existing.action}.`);
-    return;
+    if (res.existing.action !== 'send') {
+      await deps.channel.notify(`${parsed.shortId} was already ${res.existing.action}.`);
+      return;
+    }
+    // A repeat approval of a draft already decided 'send'. This is the re-arm
+    // button for the common failure (a refusal or a crash before the claim):
+    // it is an explicit human approval, and performApprovedSend still refuses
+    // if a claim exists or the draft has already gone out, so it can never
+    // become a second send.
+    logEvent(deps.db, draftId, 're_approval', { via: 'imessage' });
   }
-  if (opts.dryRun) {
-    await deps.channel.notify(`${parsed.shortId} approved (dry run, nothing sent).`);
-    return;
-  }
-
-  const row = deps.db
-    .prepare(
-      `SELECT d.person_id AS personId, r.subject AS subject, r.body AS body
-       FROM drafts d JOIN revisions r ON r.id = d.sendable_revision_id
-       WHERE d.id = ?`,
-    )
-    .get(draftId) as { personId: number; subject: string; body: string } | undefined;
-  if (!row) {
-    await deps.channel.notify(`${parsed.shortId} has no grounded revision to send.`);
-    return;
-  }
-  const person = getPerson(deps.db, row.personId);
-  if (!person?.email) {
-    await deps.channel.notify(`${parsed.shortId} has no email on record.`);
-    return;
-  }
-  try {
-    const { sentId } = await deps.sender.send({
-      to: person.email,
-      from: deps.senderEmail ?? process.env.SENDER_EMAIL ?? 'apgupta3@asu.edu',
-      subject: row.subject,
-      body: row.body,
-      draftShortId: parsed.shortId,
-    });
-    markSent(deps.db, draftId, sentId);
-    summary.sent++;
-    await deps.channel.notify(`${parsed.shortId} sent to ${person.email}.`);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    markSendFailed(deps.db, draftId, msg);
-    await deps.channel.notify(`${parsed.shortId} failed to send: ${msg}`);
-  }
+  await performApprovedSend(deps, summary, draftId, parsed.shortId);
 }
 
 async function drainApprovals(deps: LoopDeps, opts: LoopOptions, summary: LoopSummary): Promise<void> {
