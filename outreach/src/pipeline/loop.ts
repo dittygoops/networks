@@ -79,6 +79,10 @@ export interface LoopSummary {
   unsendable: number;
   messaged: number;
   queued: number;
+  // D3. Candidates a dry run would have texted. Deliberately not `messaged`
+  // and deliberately not `queued`: nothing was messaged, and nothing was
+  // queued, because a dry run must not arm a later run. Always 0 in a real run.
+  wouldMessage: number;
   // docs/spec-candidate-stranding.md (CS8.1).
   resumed: number;
   retryable: number;
@@ -301,13 +305,24 @@ async function emit(
   to: string,
   personName: string,
 ): Promise<void> {
-  if (summary.messaged >= deps.config.gate.maxMessagesPerRun) {
-    setStatus(deps.db, c.arxivId, 'queued_for_message', 'deferred by max_messages_per_run');
-    summary.queued++;
+  // D3. Checked BEFORE the cap, because the cap branch below also writes
+  // 'queued_for_message', which is the flush queue: the next real run drains
+  // it, texts the draft, and a "y" there sends a real irreversible email. A
+  // dry run that arms a later run is not a dry run, over budget or under it.
+  //
+  // 'discovered' is the correct resting place instead. It means "recorded, not
+  // yet resolved", which is exactly true, and it has one reader, the resume
+  // step (docs/spec-candidate-stranding.md CS1), which is bounded by
+  // max_resume_per_run and max_resume_attempts and is reported in
+  // summary.resumed and by `outreach stranded`. So the work is deferred to a
+  // real run rather than lost, and it is deferred visibly.
+  if (opts.dryRun) {
+    setStatus(deps.db, c.arxivId, 'discovered', 'dry run: would message, nothing sent or queued');
+    summary.wouldMessage++;
     return;
   }
-  if (opts.dryRun) {
-    setStatus(deps.db, c.arxivId, 'queued_for_message', 'dry run, not messaged');
+  if (summary.messaged >= deps.config.gate.maxMessagesPerRun) {
+    setStatus(deps.db, c.arxivId, 'queued_for_message', 'deferred by max_messages_per_run');
     summary.queued++;
     return;
   }
@@ -364,6 +379,29 @@ async function processCandidate(
     if (prior.length > 0) {
       setStatus(deps.db, c.arxivId, 'drafted_unsendable', `prior thread exists (${prior[0]?.shortId ?? ''})`);
       summary.unsendable++;
+      return;
+    }
+
+    // D3. A dry run may persist observation, never obligation.
+    //
+    // Everything above this line is observation: the gate verdict, the people
+    // and facts processPaper upserted (idempotent, and true regardless of
+    // dry-run mode), and the terminal verdicts the pipeline genuinely reached.
+    // A draft is an obligation. persistDraft writes a real drafts row at
+    // awaiting_approval, priorThreads matches that status, and the row then
+    // blocks this person from EVERY future candidate until a human replies
+    // "dX n". The abandonment sweep cannot clear it either: it only retires
+    // drafts owned by a row that exhausted its attempts, and a dry run
+    // deliberately does not consume attempts (CS7.5, correction C4), so a
+    // rehearsal artifact sits there indefinitely.
+    //
+    // So the rehearsal stops here, having answered the question it is actually
+    // asked ("how many candidates would become drafts, and why not the rest"),
+    // and leaves the row resting at 'discovered' for a real run to draft. That
+    // also keeps the draft-generation LLM spend out of a rehearsal.
+    if (opts.dryRun) {
+      setStatus(deps.db, c.arxivId, 'discovered', 'dry run: sendable, draft deferred to a real run');
+      summary.wouldMessage++;
       return;
     }
 
@@ -765,6 +803,7 @@ export async function runLoop(deps: LoopDeps, opts: LoopOptions): Promise<LoopSu
     unsendable: 0,
     messaged: 0,
     queued: 0,
+    wouldMessage: 0,
     resumed: 0,
     retryable: 0,
     stranded: 0,
@@ -847,6 +886,11 @@ export async function runLoop(deps: LoopDeps, opts: LoopOptions): Promise<LoopSu
       `outreach loop${opts.dryRun ? ' (dry run)' : ''}: seen ${summary.seen}, filtered ${summary.filtered}, ` +
       `unsendable ${summary.unsendable}, messaged ${summary.messaged}, queued ${summary.queued}, sent ${summary.sent}, ` +
       `resumed ${summary.resumed}` +
+      // Only meaningful in a dry run, where messaged and queued are both 0 by
+      // construction. Named "would message" rather than "messaged" because the
+      // per-run cap is not simulated in a dry run, so this can exceed
+      // max_messages_per_run; a real run applies the cap and defers the rest.
+      (opts.dryRun ? `, would message ${summary.wouldMessage}` : '') +
       (summary.retryable ? `, retryable ${summary.retryable}` : '') +
       (summary.stranded ? `, stranded ${summary.stranded}` : '') +
       (summary.stalled ? `, stalled approvals ${summary.stalled}` : '') +

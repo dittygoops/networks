@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { openDb, upsertPerson } from '../src/db/db.js';
 import { runLoop } from '../src/pipeline/loop.js';
 import { createStubChannel } from '../src/approval/channel.js';
-import { persistDraft } from '../src/approval/ledger.js';
+import { persistDraft, priorThreads } from '../src/approval/ledger.js';
+import { recordDiscovered } from '../src/discovery/seenLedger.js';
 import type { Candidate, DiscoverySource } from '../src/discovery/types.js';
 import type { Draft, DraftInput } from '../src/pipeline/draft.js';
 import type { OrchestrateResult } from '../src/pipeline/orchestrate.js';
@@ -164,6 +165,116 @@ describe('runLoop discovery', () => {
     expect(channel.sent).toHaveLength(0);
     expect(deps.sender.send).not.toHaveBeenCalled();
     expect(summary.dryRun).toBe(true);
+  });
+
+  // D3. The guards that already existed stopped a dry run SENDING during the
+  // run. They did not stop it arming the next one: emit wrote
+  // queued_for_message, the next real run's flush drained that row and texted
+  // the draft, and a "y" there sends a real irreversible email.
+  it('dry run leaves no row a later real run would flush and text', async () => {
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'Someone', email: 'someone@uni.edu' });
+    const { deps } = baseDeps(db, {
+      sources: [source([cand('2601.00030', 'Olfactory Embedding Space Sensors')])],
+      processPaper: vi.fn().mockResolvedValue(resolvedResult('2601.00030', pid)),
+    });
+    const summary = await runLoop(deps, { dryRun: true });
+
+    const row = db.prepare('SELECT status, reason FROM seen_papers WHERE arxiv_id = ?').get('2601.00030') as {
+      status: string;
+      reason: string;
+    };
+    expect(row.status).toBe('discovered');
+    expect(row.reason).toContain('dry run');
+    expect(summary.queued).toBe(0);
+    expect(summary.wouldMessage).toBe(1);
+
+    const queued = db
+      .prepare("SELECT COUNT(*) AS n FROM seen_papers WHERE status = 'queued_for_message'")
+      .get() as { n: number };
+    expect(queued.n).toBe(0);
+  });
+
+  // D3. A dry-run draft is a real drafts row at awaiting_approval, which
+  // priorThreads matches, so it permanently blocks that person from every
+  // future candidate until a human replies "dX n". The abandonment sweep
+  // cannot clear it either, because a dry run does not consume attempts.
+  it('dry run creates no draft, so it cannot block a person forever', async () => {
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'Someone', email: 'someone@uni.edu' });
+    const { deps } = baseDeps(db, {
+      sources: [source([cand('2601.00031', 'Olfactory Embedding Space Sensors')])],
+      processPaper: vi.fn().mockResolvedValue(resolvedResult('2601.00031', pid)),
+    });
+    await runLoop(deps, { dryRun: true });
+
+    expect(deps.generateDraft).not.toHaveBeenCalled();
+    const drafts = db.prepare('SELECT COUNT(*) AS n FROM drafts').get() as { n: number };
+    expect(drafts.n).toBe(0);
+    expect(priorThreads(db, pid)).toEqual([]);
+  });
+
+  // The work is deferred, not lost. 'discovered' is a resting state with
+  // exactly one reader, the resume step (docs/spec-candidate-stranding.md CS1),
+  // so the next real run drafts and messages it for real.
+  it('a real run after a dry run picks the candidate up and messages it', async () => {
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'Someone', email: 'someone@uni.edu' });
+    const paper = cand('2601.00032', 'Olfactory Embedding Space Sensors');
+    const processPaper = vi.fn().mockResolvedValue(resolvedResult('2601.00032', pid));
+
+    const dry = baseDeps(db, { sources: [source([paper])], processPaper });
+    await runLoop(dry.deps, { dryRun: true });
+    expect(dry.channel.sent).toHaveLength(0);
+
+    // The real run's source returns nothing: the candidate must come back
+    // through the resume path, not through rediscovery.
+    const real = baseDeps(db, { sources: [source([])], processPaper });
+    const summary = await runLoop(real.deps, { dryRun: false });
+
+    expect(summary.resumed).toBe(1);
+    expect(real.channel.sent).toHaveLength(1);
+    const row = db.prepare('SELECT status FROM seen_papers WHERE arxiv_id = ?').get('2601.00032') as {
+      status: string;
+    };
+    expect(row.status).toBe('messaged');
+  });
+
+  // The cap branch in emit also writes queued_for_message, so the dry-run
+  // check has to come BEFORE it or a dry run that goes over budget arms a real
+  // run by the other door.
+  it('dry run over the message cap still queues nothing', async () => {
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'Someone', email: 'someone@uni.edu' });
+    const p = persistDraft(db, {
+      personId: pid,
+      paperArxivId: '2601.00033',
+      paperTitle: 'Capped',
+      intent: 'seeking direction',
+      draftInput,
+      draft: groundedDraft,
+      contextJson: {},
+    });
+    recordDiscovered(db, cand('2601.00033', 'Capped'));
+    db.prepare('UPDATE seen_papers SET draft_id = ? WHERE arxiv_id = ?').run(p.draftId, '2601.00033');
+
+    const { deps, channel } = baseDeps(db, {
+      sources: [source([])],
+      config: {
+        queries: ['olfactory embedding space'],
+        authors: [],
+        seeds: [],
+        gate: { ...GATE, maxMessagesPerRun: 0 },
+      },
+    });
+    const summary = await runLoop(deps, { dryRun: true });
+
+    expect(channel.sent).toHaveLength(0);
+    expect(summary.queued).toBe(0);
+    const row = db.prepare('SELECT status FROM seen_papers WHERE arxiv_id = ?').get('2601.00033') as {
+      status: string;
+    };
+    expect(row.status).toBe('discovered');
   });
 
   it('skips a person who already has a thread', async () => {

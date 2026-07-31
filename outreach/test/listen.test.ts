@@ -456,6 +456,7 @@ describe('listener summary honesty', () => {
       unsendable: 0,
       messaged: 0,
       queued: 0,
+      wouldMessage: 0,
       resumed: 0,
       retryable: 0,
       stranded: 0,
