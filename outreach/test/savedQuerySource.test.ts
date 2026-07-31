@@ -24,20 +24,21 @@ describe('savedQuery source', () => {
     const src = createSavedQuerySource(['olfactory embedding'], { fetchFn: fetchFn as unknown as typeof fetch, delayMs: 0 });
     const got = await src.fetch();
     expect(src.name).toBe('saved_query');
-    expect(got).toHaveLength(2);
-    expect(got[0]).toMatchObject({
+    expect(got.errors).toEqual([]);
+    expect(got.candidates).toHaveLength(2);
+    expect(got.candidates[0]).toMatchObject({
       arxivId: '2601.00001',
       title: 'Olfactory Embeddings for Sensor Arrays',
       discoveredVia: 'saved_query',
       sourceDetail: 'query: olfactory embedding',
     });
-    expect(got[0]!.abstract).toContain('odor space');
+    expect(got.candidates[0]!.abstract).toContain('odor space');
   });
 
-  it('handles an empty feed without throwing', async () => {
+  it('handles an empty feed without throwing and reports no error', async () => {
     const fetchFn = vi.fn().mockResolvedValue(new Response(EMPTY, { status: 200 }));
     const src = createSavedQuerySource(['nothing'], { fetchFn: fetchFn as unknown as typeof fetch, delayMs: 0 });
-    expect(await src.fetch()).toEqual([]);
+    expect(await src.fetch()).toEqual({ candidates: [], errors: [] });
   });
 
   it('skips a query that errors and still returns results from the others', async () => {
@@ -47,8 +48,8 @@ describe('savedQuery source', () => {
       .mockResolvedValueOnce(new Response(FEED, { status: 200 }));
     const src = createSavedQuerySource(['bad', 'good'], { fetchFn: fetchFn as unknown as typeof fetch, delayMs: 0 });
     const got = await src.fetch();
-    expect(got).toHaveLength(2);
-    for (const candidate of got) {
+    expect(got.candidates).toHaveLength(2);
+    for (const candidate of got.candidates) {
       expect(candidate.sourceDetail).toBe('query: good');
     }
   });
@@ -56,7 +57,7 @@ describe('savedQuery source', () => {
   it('makes no requests when there are no queries', async () => {
     const fetchFn = vi.fn();
     const src = createSavedQuerySource([], { fetchFn: fetchFn as unknown as typeof fetch, delayMs: 0 });
-    expect(await src.fetch()).toEqual([]);
+    expect(await src.fetch()).toEqual({ candidates: [], errors: [] });
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
@@ -128,36 +129,65 @@ describe('parseSearchFeed', () => {
   });
 });
 
-describe('savedQuery total failure reporting', () => {
+// D2. Partial failure is now the LIKELY failure mode, not the exotic one:
+// there are 25 configured queries, so "9 of them were rate limited" is a
+// normal bad day and it used to reach console.warn and nowhere else. The run
+// then reported success with a near-empty candidate list.
+describe('savedQuery failure reporting', () => {
   const FEED_OK = `<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
   <entry><id>http://arxiv.org/abs/2601.00009v1</id><title>Fine</title><summary>ok</summary></entry>
 </feed>`;
 
-  it('throws when every query fails, rather than reporting an empty quiet day', async () => {
+  it('reports a total wipeout as an error rather than an empty quiet day', async () => {
     const fetchFn = vi.fn().mockResolvedValue(new Response('', { status: 429 }));
     const src = createSavedQuerySource(['a', 'b', 'c'], {
       fetchFn: fetchFn as unknown as typeof fetch,
       delayMs: 0,
     });
-    await expect(src.fetch()).rejects.toThrow('all 3 arXiv all queries failed');
+    const got = await src.fetch();
+    expect(got.candidates).toEqual([]);
+    expect(got.errors).toHaveLength(1);
+    expect(got.errors[0]).toContain('all 3 arXiv all queries failed');
+    expect(got.errors[0]).toContain('HTTP 429');
   });
 
-  it('does not throw when at least one query succeeds', async () => {
+  it('reports a partial failure and still returns what succeeded', async () => {
     const fetchFn = vi
       .fn()
       .mockResolvedValueOnce(new Response('', { status: 429 }))
+      .mockResolvedValueOnce(new Response('', { status: 503 }))
       .mockResolvedValueOnce(new Response(FEED_OK, { status: 200 }));
-    const src = createSavedQuerySource(['bad', 'good'], {
+    const src = createSavedQuerySource(['bad1', 'bad2', 'good'], {
       fetchFn: fetchFn as unknown as typeof fetch,
       delayMs: 0,
     });
-    expect(await src.fetch()).toHaveLength(1);
+    const got = await src.fetch();
+    expect(got.candidates).toHaveLength(1);
+    expect(got.errors).toHaveLength(1);
+    expect(got.errors[0]).toContain('2 of 3 arXiv all queries failed');
+  });
+
+  it('reports a network throw the same way as a bad status', async () => {
+    const fetchFn = vi.fn().mockRejectedValue(new Error('ECONNRESET'));
+    const src = createSavedQuerySource(['a'], { fetchFn: fetchFn as unknown as typeof fetch, delayMs: 0 });
+    const got = await src.fetch();
+    expect(got.errors).toHaveLength(1);
+    expect(got.errors[0]).toContain('ECONNRESET');
+  });
+
+  it('collapses many failures into one summary line, so the texted summary stays readable', async () => {
+    const fetchFn = vi.fn().mockResolvedValue(new Response('', { status: 429 }));
+    const terms = Array.from({ length: 25 }, (_, i) => `term ${i}`);
+    const src = createSavedQuerySource(terms, { fetchFn: fetchFn as unknown as typeof fetch, delayMs: 0 });
+    const got = await src.fetch();
+    expect(got.errors).toHaveLength(1);
+    expect(got.errors[0]).toContain('all 25 arXiv all queries failed');
   });
 
   it('an empty query list is not a failure', async () => {
     const fetchFn = vi.fn();
     const src = createSavedQuerySource([], { fetchFn: fetchFn as unknown as typeof fetch, delayMs: 0 });
-    expect(await src.fetch()).toEqual([]);
+    expect(await src.fetch()).toEqual({ candidates: [], errors: [] });
   });
 });

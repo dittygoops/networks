@@ -18,9 +18,19 @@ export interface Candidate {
   abstract?: string;
 }
 
-// One discovery source. Implementations must never throw for expected upstream
-// failures; the orchestrator isolates them, but sources should degrade first.
+// What one source returns for one run. `errors` is how a source says
+// "something upstream refused me", so a run that returned few or no candidates
+// because arXiv or Semantic Scholar was refusing can never be mistaken for a
+// quiet day in the summary the approver is texted. Sources report expected
+// upstream failures here and do not throw; discoverAll still isolates a throw,
+// but only as a backstop for a bug.
+export interface SourceResult {
+  candidates: Candidate[];
+  errors: string[];
+}
+
+// One discovery source.
 export interface DiscoverySource {
   readonly name: DiscoveredVia;
-  fetch(): Promise<Candidate[]>;
+  fetch(): Promise<SourceResult>;
 }

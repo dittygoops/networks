@@ -2,7 +2,7 @@
 // only by search prefix and label, so the sequential-with-delay loop, the
 // per-term isolation, and the Atom parsing live here once.
 import { XMLParser } from 'fast-xml-parser';
-import type { Candidate, DiscoveredVia } from '../types.js';
+import type { Candidate, DiscoveredVia, SourceResult } from '../types.js';
 
 export interface ArxivQueryOptions {
   fetchFn?: typeof fetch;
@@ -66,12 +66,12 @@ export async function queryArxivFeed(
   via: DiscoveredVia,
   label: (term: string) => string,
   opts: ArxivQueryOptions = {},
-): Promise<Candidate[]> {
+): Promise<SourceResult> {
   const fetchFn = opts.fetchFn ?? fetch;
   const maxResults = opts.maxResults ?? 20;
   const delayMs = opts.delayMs ?? 3000;
 
-  const out: Candidate[] = [];
+  const candidates: Candidate[] = [];
   const failures: string[] = [];
 
   for (const term of terms) {
@@ -88,7 +88,7 @@ export async function queryArxivFeed(
         continue;
       }
       for (const e of parseSearchFeed(await res.text())) {
-        out.push({
+        candidates.push({
           arxivId: e.arxivId,
           title: e.title,
           abstract: e.abstract,
@@ -103,12 +103,21 @@ export async function queryArxivFeed(
     }
   }
 
-  // A total wipeout is indistinguishable from a quiet day if we stay silent,
-  // and "seen 0" would read as "no new papers" when arXiv is actually refusing
-  // us. Throwing here routes it into discoverAll's per source error list, which
-  // reaches the run summary the approver is texted.
-  if (terms.length > 0 && failures.length === terms.length) {
-    throw new Error(`all ${terms.length} arXiv ${prefix} queries failed (${failures[0] ?? 'unknown'})`);
-  }
-  return out;
+  if (failures.length === 0) return { candidates, errors: [] };
+
+  // Both a total wipeout and a partial one have to reach the run summary. A
+  // wipeout is indistinguishable from a quiet day if we stay silent, and
+  // "seen 0" reads as "no new papers" when arXiv is actually refusing us. A
+  // partial failure is the same silent degradation one notch down, and with 25
+  // configured queries it is the LIKELY shape, not the exotic one: 9 of 10
+  // terms returning 429 used to report success with a near-empty list.
+  //
+  // One line, not one per term, because this string is texted to a phone
+  // through discoverAll and summary.errors. The per-term detail is already in
+  // the console.warn calls above, which launchd keeps in the run log.
+  const total = failures.length === terms.length;
+  const headline = total
+    ? `all ${terms.length} arXiv ${prefix} queries failed (${failures[0] ?? 'unknown'})`
+    : `${failures.length} of ${terms.length} arXiv ${prefix} queries failed (${failures[0] ?? 'unknown'})`;
+  return { candidates, errors: [headline] };
 }

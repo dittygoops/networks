@@ -4,8 +4,6 @@ import type { DB } from '../../db/db.js';
 import type { DiscoverySource } from '../types.js';
 import { queryArxivFeed, type ArxivQueryOptions } from './arxivQuery.js';
 
-export type AuthorWatchOptions = ArxivQueryOptions;
-
 // Watching every person ever inserted grows unboundedly and re-checks
 // researchers already looked at once and dismissed. The derived watchlist is
 // limited to people with a real thread (a draft that was sent or approved),
@@ -22,7 +20,7 @@ export function deriveWatchAuthors(db: DB): string[] {
   return rows.map((r) => r.name).filter(Boolean);
 }
 
-export function createAuthorWatchSource(authors: string[], opts: AuthorWatchOptions = {}): DiscoverySource {
+export function createAuthorWatchSource(authors: string[], opts: ArxivQueryOptions = {}): DiscoverySource {
   return {
     name: 'author_watch',
     fetch: () => queryArxivFeed('au', authors, 'author_watch', (a) => `author: ${a}`, { maxResults: 10, ...opts }),
