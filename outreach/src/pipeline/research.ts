@@ -4,7 +4,6 @@ import { parse } from 'tldts';
 import {
   classifyWebPage,
   hostMatches,
-  nameMatches,
   type PageFetcher,
   type PaperContext,
   type SearchClient,
@@ -20,6 +19,7 @@ import {
   PAPER_EXTRACT_SYSTEM,
   SUMMARY_SYSTEM,
 } from '../llm/prompts.js';
+import { occursInSource, personNameInText } from '../text/match.js';
 
 // Normalized OpenAlex author candidate (shape the client produces from raw API).
 export interface OpenAlexCandidate {
@@ -614,44 +614,48 @@ function safeClassify(page: WebPage, name: string): ReturnType<typeof classifyWe
 
 // D5b page-identity gate: the domain gate only proves the page is on a known
 // institution's site, not that the page is ABOUT the target person. A
-// colleague's profile on the same site (e.g. a lab-mate's staff page, another
+// colleague's profile on the same site (a lab-mate's staff page, another
 // student's directory entry) passes the domain gate cleanly, which is exactly
-// how a stranger's facts got attributed to the wrong recipient in production.
+// how a stranger's facts got attributed to the wrong recipient in production
+// (17 Arctic sea ice facts on one person, 10 facts about a colleague named
+// Jan Delcker on another).
 //
-// Be conservative: a page must show its OWN evidence of being about this
-// person, not merely mention them. Two sources of evidence, both reused
-// rather than reinvented:
-//   1. classifyWebPage's 'homepage' (or 'github_profile') classification,
-//      which already requires the person's name pattern to appear in the
-//      page's URL or title, not just its body.
-//   2. The page's leading heading line (its first non-blank line of content)
-//      carries the person's name, via the same local-part name matcher used
-//      for email addresses (nameMatches). This is deliberately NOT a scan of
-//      the whole body: a directory or lab-listing page legitimately mentions
-//      many people in its body, so "the name appears somewhere on the page"
-//      is not evidence the page is about them specifically; only a leading
-//      heading is.
-// A page about someone else entirely (a colleague sharing the institution
-// domain) matches neither and is rejected.
+// The gate takes evidence from three IDENTITY surfaces, never from the page
+// body: the leading heading line, the page title, and the URL path. Body text
+// is excluded on purpose, because a directory or lab-listing page legitimately
+// mentions many people in its body, so "the name appears somewhere on the
+// page" is not evidence the page is about them.
+//
+// All three surfaces use personNameInText (src/text/match.ts), which requires
+// the SURNAME as a complete token plus a nearby given name or initial. The
+// previous implementation used contacts.ts's nameMatches, which is substring
+// containment written for email local parts. Verified by execution, that made
+// the gate a NO-OP for short surnames: nameMatches('publications', 'Wei Li')
+// returned true, so any on-domain page passed for Li, He, Xu, Wu, Ye, or An.
+//
+// github_profile is still accepted on classification alone: a github.com page
+// is personal by construction, and in practice the domain gate never admits
+// one anyway (anchors are institutional).
 export function pageIsAboutPerson(page: WebPage, personName: string): boolean {
-  const cls = safeClassify(page, personName);
-  if (cls === 'homepage' || cls === 'github_profile') return true;
+  if (safeClassify(page, personName) === 'github_profile') return true;
   const heading = (page.content ?? '').split('\n').map((l) => l.trim()).find((l) => l.length > 0) ?? '';
-  return heading.length > 0 && nameMatches(heading, personName);
+  if (personNameInText(heading, personName)) return true;
+  if (personNameInText(page.title ?? '', personName)) return true;
+  return urlSlugMatchesPerson(page.url, personName) === true;
 }
 
-// URL-only sibling of pageIsAboutPerson, for callers (the Phase 2 purge
-// script) that have only a stored source_url and no re-fetchable title or
-// content. Checks whether ANY path segment of the URL (the profile slug, e.g.
-// "dr-jan-delcker" or "BernhardKerbl") carries the target's name, via the
-// same nameMatches local-part matcher used for email addresses. Every
-// segment is checked, not just the last, so a legitimate sub-page of a
-// person's own profile (e.g. "/profile/liviaq/publications") still matches
-// on its "liviaq" segment even though the last segment is just "publications".
-// Returns null (not false) when the URL has no path segment to judge at all
-// (a bare domain root), since that is "cannot evaluate", not "fails":
-// guessing either way would be fabrication, so the caller must treat null as
-// its own case.
+// URL-only sibling of pageIsAboutPerson, used by pageIsAboutPerson itself and
+// by the Phase 2 purge script, which has only a stored source_url and no
+// re-fetchable title or content. Checks whether ANY path segment carries the
+// target's name under the same strict rule (surname as a complete token, or a
+// concatenated slug form like "wli" / "BernhardKerbl"). Every segment is
+// checked, not just the last, so a sub-page of a person's own profile
+// ("/people/wli/publications") still matches on its "wli" segment.
+//
+// Returns null (not false) when the URL has no path segment to judge (a bare
+// domain root) or cannot be parsed, since that is "cannot evaluate", not
+// "fails". Guessing either way would be fabrication, so the caller must treat
+// null as its own case.
 export function urlSlugMatchesPerson(url: string, personName: string): boolean | null {
   let segments: string[] = [];
   try {
@@ -660,7 +664,7 @@ export function urlSlugMatchesPerson(url: string, personName: string): boolean |
     return null;
   }
   if (segments.length === 0) return null;
-  return segments.some((seg) => nameMatches(seg, personName));
+  return segments.some((seg) => personNameInText(seg, personName));
 }
 
 // ---------------------------------------------------------------------------
@@ -707,10 +711,13 @@ export function isPaperSourceUrl(url: string | undefined): boolean {
 // abs URL, regardless of what the model returned for those fields.
 export async function extractPaperFacts(llm: LLMClient, ctx: PaperFactContext): Promise<OntologyFact[]> {
   const user = buildPaperExtractUser(ctx);
+  // The untrusted span, exactly as the model saw it, is what every returned
+  // fact must be grounded in.
+  const sourceText = `${ctx.title}\n${ctx.abstract.slice(0, 4000)}`;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const raw = parseFacts(await llm.complete(PAPER_EXTRACT_SYSTEM, user));
-      if (raw) return normalizePaperFacts(raw, paperSourceUrl(ctx.arxivId));
+      if (raw) return normalizePaperFacts(raw, paperSourceUrl(ctx.arxivId), sourceText, ctx.arxivId);
     } catch {
       // LLM call itself threw (network/5xx/non-JSON body): count as a failed
       // attempt and retry once, then give up quietly.
@@ -719,21 +726,56 @@ export async function extractPaperFacts(llm: LLMClient, ctx: PaperFactContext): 
   return [];
 }
 
-function normalizePaperFacts(raw: RawFact[], sourceUrl: string): OntologyFact[] {
+// D2 injection gate. An arXiv title and abstract are ATTACKER-INFLUENCED text:
+// anyone can post to arXiv, and this text is fed to an LLM whose output is
+// persisted as an asserted fact ABOUT A NAMED REAL PERSON, then opens an
+// irreversible cold email. The drafter's grounding check compares the email
+// body to the hook, so it CONFIRMS an injected claim instead of catching it.
+//
+// The defense that does not trust the model: every fact value must occur,
+// token-wise, in the title plus abstract we actually supplied. A value the
+// paper does not contain cannot be a fact the paper supports, whether it came
+// from an injection, a hallucination, or the model's own world knowledge.
+// `detail` gets the same test, but failing it drops only the detail: the
+// entity is still real, the model just embroidered its context.
+//
+// Drops are LOGGED, never silent. A silent drop would hide both a prompt
+// regression (the model suddenly paraphrasing instead of quoting) and a live
+// injection attempt, and there would be nothing to notice.
+function normalizePaperFacts(
+  raw: RawFact[],
+  sourceUrl: string,
+  sourceText: string,
+  arxivId: string,
+): OntologyFact[] {
   const facts: OntologyFact[] = [];
+  const dropped: string[] = [];
   for (const rf of raw.slice(0, MAX_FACTS_PER_PAGE)) {
     if (!isFacet(rf.facet) || !rf.key || !rf.value) continue;
+    const value = String(rf.value).slice(0, MAX_VALUE_LEN);
+    if (!occursInSource(value, sourceText)) {
+      dropped.push(value);
+      continue;
+    }
+    const detail = rf.detail ? String(rf.detail).slice(0, 400) : undefined;
+    const groundedDetail = detail && occursInSource(detail, sourceText) ? detail : undefined;
+    if (detail && !groundedDetail) dropped.push(`(detail) ${detail}`);
     const confidence = Number.isFinite(rf.confidence) ? Math.max(0, Math.min(1, rf.confidence as number)) : 0.5;
     facts.push({
       facet: rf.facet,
       key: normalizeKey(rf.facet, String(rf.key).slice(0, MAX_VALUE_LEN)),
-      value: String(rf.value).slice(0, MAX_VALUE_LEN),
-      detail: rf.detail ? String(rf.detail).slice(0, 400) : undefined,
+      value,
+      detail: groundedDetail,
       stance: 'done', // the author's own published paper: this is completed work
       sourceUrl,
       confidence,
       tier: PAPER_TIER_CAP, // never 'A', see PAPER_TIER_CAP above
     });
+  }
+  if (dropped.length > 0) {
+    console.warn(
+      `[paper-facts] ${arxivId}: dropped ${dropped.length} ungrounded item(s): ${dropped.join(' | ')}`,
+    );
   }
   return facts;
 }
