@@ -63,10 +63,22 @@ function defaultBackoffMs(failures: number): number {
   return Math.min(BASE_BACKOFF_MS * 2 ** (failures - 1), MAX_BACKOFF_MS);
 }
 
-function freshSummary(): LoopSummary {
+// handleReply mutates exactly one field of the LoopSummary it is handed
+// (summary.sent++, loop.ts:163) and reads none of the others. The listener
+// runs no batch, so `seen`, `filtered`, `unsendable`, `messaged`, `queued`,
+// `resumed`, `retryable`, and `stranded` describe nothing that happens here,
+// and zeroing them produced an object that reads like a run report and is not
+// one. The same reasoning produced the ReplyDeps split: the listener does not
+// fabricate dependencies it does not use.
+//
+// The remaining fields exist only because handleReply's signature demands the
+// whole type, and that signature belongs to loop.ts, which this change does
+// not own. They are inert, and the "handleReply touches only the sent field"
+// test in test/listen.test.ts is what keeps them inert.
+function sendCounter(): LoopSummary {
   return {
     dryRun: false,
-    sent: 0,
+    sent: 0, // the only live field
     seen: 0,
     filtered: 0,
     unsendable: 0,
@@ -98,7 +110,9 @@ export async function runListenLoop(deps: ListenDeps): Promise<void> {
     senderEmail: deps.senderEmail,
   });
 
-  const summary = freshSummary();
+  // Cumulative for the life of the process, not per cycle: a reconnect is not
+  // a new day's work, and the count is what the log line below reports.
+  const totalsAsSummary = sendCounter();
   let channel: ApprovalChannel | undefined;
   let consecutiveFailures = 0;
   let cycles = 0;
@@ -155,7 +169,8 @@ export async function runListenLoop(deps: ListenDeps): Promise<void> {
       outcome = await channel.streamReplies(async (reply) => {
         repliesDelivered++;
         try {
-          await handleReply(replyDepsFor(liveChannel), { dryRun: false }, summary, reply);
+          await handleReply(replyDepsFor(liveChannel), { dryRun: false }, totalsAsSummary, reply);
+          log(`listen: reply handled, sends this process: ${totalsAsSummary.sent}`);
         } catch (e) {
           // One malformed or unlucky reply must never take the listener down.
           log(`listen: reply handling failed: ${String(e)}`);

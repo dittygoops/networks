@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { openDb, upsertPerson } from '../src/db/db.js';
 import { persistDraft } from '../src/approval/ledger.js';
 import { runListenLoop } from '../src/pipeline/listen.js';
+import { handleReply } from '../src/pipeline/loop.js';
+import type { LoopSummary } from '../src/pipeline/loop.js';
 import type { ApprovalChannel, InboundReply, OutboundDraftMessage, StreamOutcome } from '../src/approval/channel.js';
 import type { Draft, DraftInput } from '../src/pipeline/draft.js';
 
@@ -433,5 +435,72 @@ describe('runListenLoop hot-spin regression', () => {
     });
 
     expect(slept).toEqual([1_000, 1_000, 1_000]);
+  });
+});
+
+describe('listener summary honesty', () => {
+  // The listener has to hand handleReply a LoopSummary because that is the
+  // signature, but ten of its eleven fields describe a batch run that the
+  // listener never performs. This probe pins the claim that only `sent` is
+  // live. If handleReply ever starts reading or writing another field, this
+  // fails here rather than the listener silently feeding it a fabricated zero.
+  it('handleReply touches only the sent field of the summary it is given', async () => {
+    const db = openDb(':memory:');
+    const p = seedDraft(db);
+    const touched = new Set<string>();
+    const target: LoopSummary = {
+      dryRun: false,
+      sent: 0,
+      seen: 0,
+      filtered: 0,
+      unsendable: 0,
+      messaged: 0,
+      queued: 0,
+      resumed: 0,
+      retryable: 0,
+      stranded: 0,
+      errors: [],
+    };
+    const probe = new Proxy(target, {
+      get(t, k, r) {
+        if (typeof k === 'string') touched.add(k);
+        return Reflect.get(t, k, r);
+      },
+      set(t, k, v, r) {
+        if (typeof k === 'string') touched.add(k);
+        return Reflect.set(t, k, v, r);
+      },
+    });
+    const { channel } = scriptedChannel([[]]);
+    const reply: InboundReply = { text: `${p.shortId} y`, messageId: 'm1' };
+
+    await handleReply(
+      { db, channel, sender: { send: vi.fn().mockResolvedValue({ sentId: 'msg-1' }) }, senderEmail: 'a@b.c' },
+      { dryRun: false },
+      probe,
+      reply,
+    );
+
+    expect([...touched]).toEqual(['sent']);
+    expect(target.sent).toBe(1);
+  });
+
+  it('logs a cumulative send count so the one live field is observable', async () => {
+    const db = openDb(':memory:');
+    const p = seedDraft(db);
+    const { channel } = scriptedChannel([[{ text: `${p.shortId} y`, messageId: 'm1' }]]);
+    const logs: string[] = [];
+
+    await runListenLoop({
+      connect: async () => channel,
+      db,
+      sender: { send: vi.fn().mockResolvedValue({ sentId: 'msg-1' }) },
+      sleep: noopSleep,
+      exit: () => {},
+      log: (m) => logs.push(m),
+      maxCycles: 1,
+    });
+
+    expect(logs.some((l) => l.includes('sends this process: 1'))).toBe(true);
   });
 });
