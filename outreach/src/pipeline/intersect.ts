@@ -4,6 +4,7 @@ import { factRows, saveIntersections, type DB, type StoredFact } from '../db/db.
 import type { LLMClient } from '../llm/client.js';
 import { INTERSECT_SYSTEM, buildIntersectUser } from '../llm/prompts.js';
 import type { OntologyFact } from './research.js';
+import { containsWholeWords, normalizeForMatch as normEntity } from '../text/match.js';
 
 export class SelfOntologyMissingError extends Error {
   constructor() {
@@ -119,8 +120,6 @@ function mapIntersections(raw: RawIntersection[], self: StoredFact[], person: St
   return out.sort((a, b) => b.strength - a.strength).slice(0, MAX_INTERSECTIONS);
 }
 
-const normEntity = (s: string): string => s.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
-
 // Entities that can never on their own constitute a hook: they are too broad or
 // too common to be discriminating (everyone shares them, so they are not common
 // ground). This is what let "both are involved in computer science" and "both
@@ -155,24 +154,9 @@ export const isGenericEntity = (value: string): boolean => GENERIC_SET.has(normE
 const isSpecificHook = (h: Intersection): boolean =>
   !isGenericEntity(h.selfValue) && !isGenericEntity(h.personValue);
 
-// Whole-word containment: true when `needle`'s tokens appear as a CONTIGUOUS
-// run inside `haystack`'s tokens, at word boundaries. Plain raw substring
-// containment (`haystack.includes(needle)`) is wrong here: the normalized
-// string "heterogeneous molecular signatures of human odor perception"
-// CONTAINS the raw substring "nature" (inside "signatures"), which produced a
-// live bad hook ("both: Nature") built entirely on a spelling coincidence.
-// Tokenizing first and requiring a contiguous token match closes that hole
-// while still matching legitimate cases like "gaussian splatting" inside
-// "3d gaussian splatting".
-function containsWholeWords(haystack: string, needle: string): boolean {
-  const h = haystack.split(' ');
-  const n = needle.split(' ');
-  if (n.length === 0 || n.length > h.length) return false;
-  for (let i = 0; i <= h.length - n.length; i++) {
-    if (n.every((tok, j) => h[i + j] === tok)) return true;
-  }
-  return false;
-}
+// containsWholeWords and the entity normalizer now live in src/text/match.ts,
+// shared with discovery/relevanceGate.ts. They diverged once and that cost a
+// live bad hook on two real people; one implementation is the fix.
 
 // Deterministic entity overlap: same normalized value (0.95), or one clearly
 // contains the other at word boundaries (0.85), e.g. "gaussian splatting" in

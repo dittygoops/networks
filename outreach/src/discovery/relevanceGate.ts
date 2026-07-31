@@ -4,6 +4,7 @@
 import type { LLMClient } from '../llm/client.js';
 import type { GateConfig } from './config.js';
 import type { Candidate } from './types.js';
+import { containsWholeWords, normalizeForMatch } from '../text/match.js';
 
 export interface GateVerdict {
   keep: boolean;
@@ -11,8 +12,10 @@ export interface GateVerdict {
   reason: string;
 }
 
+// Normalized once per call: accent-folded, lowercased, punctuation collapsed,
+// so a hyphenated title still matches a spaced gap term.
 function haystack(c: Candidate): string {
-  return `${c.title} ${c.abstract ?? ''}`.toLowerCase();
+  return normalizeForMatch(`${c.title} ${c.abstract ?? ''}`);
 }
 
 export interface TermMatch {
@@ -32,9 +35,9 @@ export function bestTermMatch(c: Candidate, terms: string[]): TermMatch {
   let bestTerm: string | null = null;
   let bestExact = false;
   for (const term of terms) {
-    const t = term.toLowerCase().trim();
+    const t = normalizeForMatch(term);
     if (!t) continue;
-    if (hay.includes(t)) {
+    if (containsWholeWords(hay, t)) {
       if (!bestExact) {
         bestScore = 1;
         bestTerm = term;
@@ -45,7 +48,7 @@ export function bestTermMatch(c: Candidate, terms: string[]): TermMatch {
     if (bestExact) continue;
     const words = t.split(/\s+/).filter((w) => w.length > 3);
     if (!words.length) continue;
-    const matched = words.filter((w) => hay.includes(w)).length;
+    const matched = words.filter((w) => containsWholeWords(hay, w)).length;
     const fraction = matched / words.length;
     if (fraction > bestScore) {
       bestScore = fraction;
@@ -61,7 +64,10 @@ export function scoreOverlap(c: Candidate, terms: string[]): number {
 
 export function matchedTerms(c: Candidate, terms: string[]): string[] {
   const hay = haystack(c);
-  return terms.filter((t) => t.trim() && hay.includes(t.toLowerCase().trim()));
+  return terms.filter((t) => {
+    const n = normalizeForMatch(t);
+    return n.length > 0 && containsWholeWords(hay, n);
+  });
 }
 
 const JUDGE_SYSTEM = [

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { gateCandidate, scoreOverlap } from '../src/discovery/relevanceGate.js';
+import { bestTermMatch, gateCandidate, matchedTerms, scoreOverlap } from '../src/discovery/relevanceGate.js';
 import type { Candidate } from '../src/discovery/types.js';
 import type { LLMClient } from '../src/llm/client.js';
 
@@ -115,5 +115,39 @@ describe('gateCandidate judge score range check', () => {
     expect(v.score).toBeCloseTo(raw, 5);
     expect(v.score).not.toBe(-5);
     expect(v.reason).toContain('judge unavailable');
+  });
+});
+
+// The exact case intersect.ts already fixed, verified against relevanceGate:
+// "signatures" contains the raw substring "nature". intersect.ts learned this
+// the hard way (it was the only hook two real people had). relevanceGate must
+// not have to learn it again.
+describe('relevanceGate word-boundary regression (the shared "signatures contains nature" bug)', () => {
+  const ZANINELI = cand('Heterogeneous molecular signatures of human odor perception');
+
+  it('does not match the gap term "nature" inside "signatures"', () => {
+    const m = bestTermMatch(ZANINELI, ['nature']);
+    expect(m.score).toBe(0);
+    expect(m.term).toBe(null);
+    expect(m.exact).toBe(false);
+  });
+
+  it('does not keep the candidate on that coincidence', async () => {
+    const v = await gateCandidate(ZANINELI, ['nature'], GATE);
+    expect(v.keep).toBe(false);
+    expect(v.reason).not.toContain('matches gap term');
+  });
+
+  it('matchedTerms does not report the coincidence either', () => {
+    expect(matchedTerms(ZANINELI, ['nature'])).toEqual([]);
+  });
+
+  it('still matches a term that really is present as whole words', () => {
+    expect(bestTermMatch(ZANINELI, ['odor perception']).exact).toBe(true);
+    expect(matchedTerms(ZANINELI, ['odor perception'])).toEqual(['odor perception']);
+  });
+
+  it('matches across punctuation, so a hyphenated title still scores', () => {
+    expect(bestTermMatch(cand('Odor-perception at scale'), ['odor perception']).exact).toBe(true);
   });
 });
