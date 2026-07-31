@@ -44,11 +44,18 @@ queries:
 # search cannot reach. Resolved from note titles by arXiv title search.
 seeds:
   add:
-    - "2506.04539"   # Olfactory Inertial Odometry (France 2025, UT Dallas)
+    - "2506.02373"   # Olfactory Inertial Odometry (France 2025, UT Dallas)
+    - "2602.19577"   # Chasing Ghosts, UAV Olfactory Navigation (France 2026)
+    - "2506.00455"   # Diffusion GNNs for Olfactory Navigation (France 2025)
+    - "2605.25170"   # Grow-Prune-Freeze Networks for Olfactory Navigation (France 2026)
     - "2510.19660"   # Machine Olfaction and Embedded AI (Mershin 2025)
-    - "2202.09308"   # Indirect Optimal Control of Advection-Diffusion Fields (Berman 2022)
     - "2604.09758"   # Heterogeneous Molecular Signatures of Human Odor Perception (Zanineli 2026)
     - "2508.09217"   # Molecular Odor Taxonomies (Sajan 2025)
+    - "2409.13167"   # Drift Compensation for E-Nose Systems (Zhang 2024)
+    - "2202.09308"   # Indirect Optimal Control of Advection-Diffusion Fields (Berman 2022)
+    - "1609.07695"   # Coverage and Field Estimation by Diffusive Swarms (Berman 2016)
+    - "2504.03785"   # Detecting Plant VOCs with Indoor Air Quality Sensors (Nabaei 2025)
+    - "2604.23003"   # Robust PINN for Pollution Propagation (Siwik 2026)
 
 gate:
   threshold: 0.6
