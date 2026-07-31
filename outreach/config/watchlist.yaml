@@ -31,11 +31,14 @@ queries:
     - "olfactory receptor"
     - "gas sensor array"
     - "odor classification"
-  mute:
-    - "gaussian splatting"
-    - "3DGS"
-    - "Mirror-3DGS"
-    - "Ref-Gaussian"
+    - "olfactory field reconstruction"
+    - "gas dispersion modeling"
+    - "advection diffusion"
+    - "physics-informed neural network"
+    - "sensor placement"
+    - "gas source localization"
+    - "neural radiance field"
+    - "3D Gaussian Splatting"
 
 # Papers from Aditya's own vault (~/Documents/Coding/new/learning/Papers).
 # These are the papers his research gaps are built ON, so they seed Semantic
