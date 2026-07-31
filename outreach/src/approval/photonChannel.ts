@@ -4,7 +4,7 @@
 // this an open reflector.
 import { Spectrum } from 'spectrum-ts';
 import { imessage } from 'spectrum-ts/providers';
-import type { ApprovalChannel, InboundReply, OutboundDraftMessage } from './channel.js';
+import type { ApprovalChannel, InboundReply, OutboundDraftMessage, StreamOutcome } from './channel.js';
 
 export interface PhotonOptions {
   projectId: string;
@@ -162,7 +162,7 @@ export async function createPhotonChannel(
     // caller immediately instead of being held until a window expires.
     // Resolves when the stream ends or errors, which the caller treats as a
     // signal to rebuild the client.
-    async streamReplies(onReply: (reply: InboundReply) => Promise<void>): Promise<void> {
+    async streamReplies(onReply: (reply: InboundReply) => Promise<void>): Promise<StreamOutcome> {
       try {
         for await (const value of app.messages) {
           const reply = decodeReply(value as [unknown, RawMessage], opts.approverPhone);
@@ -172,13 +172,17 @@ export async function createPhotonChannel(
           } catch (err) {
             // One bad reply must not tear down the stream: an unattended
             // listener that dies on a single malformed approval is worse
-            // than one that logs and keeps listening.
+            // than one that logs and keeps listening. A handler failure is
+            // therefore not a session failure and does not colour the outcome.
             console.warn(`streamReplies: handler error, continuing: ${String(err)}`);
           }
         }
         console.log('streamReplies: message stream ended');
+        return { reason: 'ended' };
       } catch (err) {
-        console.warn(`streamReplies: message stream error: ${String(err)}`);
+        const detail = String(err);
+        console.warn(`streamReplies: message stream error: ${detail}`);
+        return { reason: 'error', detail };
       }
     },
 

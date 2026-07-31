@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { openDb, upsertPerson } from '../src/db/db.js';
 import { persistDraft } from '../src/approval/ledger.js';
 import { runListenLoop } from '../src/pipeline/listen.js';
-import type { ApprovalChannel, InboundReply, OutboundDraftMessage } from '../src/approval/channel.js';
+import type { ApprovalChannel, InboundReply, OutboundDraftMessage, StreamOutcome } from '../src/approval/channel.js';
 import type { Draft, DraftInput } from '../src/pipeline/draft.js';
 
 const draftInput: DraftInput = {
@@ -33,10 +33,16 @@ function seedDraft(db: ReturnType<typeof openDb>) {
   });
 }
 
-// A minimal ApprovalChannel whose captureReplies is scripted call-by-call, so
-// each "session" (one call) can simulate a batch of replies, a clean end, or
-// a thrown stream error, exactly like the real windowMs-bounded captureReplies.
-function scriptedChannel(script: (Array<InboundReply> | 'throw')[]) {
+// A minimal ApprovalChannel scripted call-by-call, so each "session" (one
+// call) can simulate replies, a clean end, a reported stream error, or a
+// rejection. Critically, the default failure shape is a RESOLVED outcome of
+// reason 'error', because that is what the real photonChannel does: it catches
+// its own stream errors and never rejects. The previous version of this fake
+// threw, so the suite proved a contract production did not implement, and the
+// daemon's entire failure path was dead code nothing tested.
+type Step = InboundReply[] | 'error' | 'throw';
+
+function scriptedChannel(script: Step[]) {
   let call = 0;
   const notices: string[] = [];
   const sent: OutboundDraftMessage[] = [];
@@ -50,16 +56,15 @@ function scriptedChannel(script: (Array<InboundReply> | 'throw')[]) {
     },
     async captureReplies() {
       const step = script[call++];
-      if (step === 'throw' || step === undefined) throw new Error('stream broke');
+      if (step === 'throw' || step === 'error' || step === undefined) throw new Error('stream broke');
       return step;
     },
-    // Push counterpart: each scripted step is one session. Delivering the
-    // step's replies one at a time and then resolving mirrors the real
-    // streamReplies, which returns only when the stream ends.
-    async streamReplies(onReply) {
+    async streamReplies(onReply): Promise<StreamOutcome> {
       const step = script[call++];
-      if (step === 'throw' || step === undefined) throw new Error('stream broke');
+      if (step === 'throw') throw new Error('stream broke');
+      if (step === 'error' || step === undefined) return { reason: 'error', detail: 'stream broke' };
       for (const r of step) await onReply(r);
+      return { reason: 'ended' };
     },
     async close() {
       closeCount++;
@@ -223,9 +228,10 @@ describe('runListenLoop delivery semantics', () => {
         captureCalls++;
         return [] as InboundReply[];
       },
-      streamReplies: async (onReply) => {
+      streamReplies: async (onReply): Promise<StreamOutcome> => {
         streamCalls++;
         await onReply({ text: 'hello', messageId: 'm1' });
+        return { reason: 'ended' };
       },
       close: async () => {},
     };

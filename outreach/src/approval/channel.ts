@@ -22,6 +22,17 @@ export type ParsedReply =
   | { kind: 'unsupported'; shortId: string }
   | { kind: 'unparseable' };
 
+// Why a returned value and not a rejection: the real channel deliberately does
+// not throw out of an unattended daemon (one bad session must not kill the
+// process), so before this type existed a stream failure and a clean end were
+// literally the same observation, and the listener's failure ceiling and
+// backoff were unreachable code. The outcome makes the difference data.
+// `detail` is present only on 'error' and carries the stringified cause.
+export interface StreamOutcome {
+  reason: 'ended' | 'error';
+  detail?: string;
+}
+
 export interface ApprovalChannel {
   sendDraftMessage(msg: OutboundDraftMessage): Promise<void>;
   notify(text: string): Promise<void>;
@@ -33,7 +44,9 @@ export interface ApprovalChannel {
   // when the underlying stream ends. This is what a long-lived listener needs.
   // A real approval sat unprocessed in captureReplies' array because the
   // daemon was waiting on a 24 day window to expire before seeing it.
-  streamReplies(onReply: (reply: InboundReply) => Promise<void>): Promise<void>;
+  // Resolving with an outcome rather than throwing keeps a transport hiccup
+  // from killing an unattended daemon while still telling it what happened.
+  streamReplies(onReply: (reply: InboundReply) => Promise<void>): Promise<StreamOutcome>;
   close?(): Promise<void>;
 }
 
@@ -96,10 +109,11 @@ export function createStubChannel(): StubChannel {
       pending = [];
       return out;
     },
-    async streamReplies(onReply: (reply: InboundReply) => Promise<void>) {
+    async streamReplies(onReply: (reply: InboundReply) => Promise<void>): Promise<StreamOutcome> {
       const batch = pending;
       pending = [];
       for (const r of batch) await onReply(r);
+      return { reason: 'ended' };
     },
   };
 }

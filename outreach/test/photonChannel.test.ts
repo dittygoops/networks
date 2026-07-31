@@ -86,3 +86,58 @@ describe('createPhotonChannel captureReplies', () => {
     expect(stopped()).toBe(true);
   });
 });
+
+describe('createPhotonChannel streamReplies', () => {
+  it('reports reason "ended" when the stream finishes cleanly', async () => {
+    const { channel } = await channelFor([
+      { id: 'm1', sender: { id: APPROVER }, content: { type: 'text', text: 'd7 y' } },
+    ]);
+    const seen: string[] = [];
+    const outcome = await channel.streamReplies(async (r) => {
+      seen.push(r.text);
+    });
+    expect(seen).toEqual(['d7 y']);
+    expect(outcome).toEqual({ reason: 'ended' });
+  });
+
+  // The defect this replaces: the whole for-await was wrapped in try/catch and
+  // resolved normally on error, so the daemon inferring health from "did it
+  // reject" always concluded healthy. The failure is now in the return value.
+  it('reports reason "error" instead of resolving as if nothing happened', async () => {
+    const failing: PhotonApp = {
+      messages: (async function* () {
+        yield [{ id: 'space-1' }, { id: 'm1', sender: { id: APPROVER }, content: { type: 'text', text: 'd7 y' } }] as [
+          unknown,
+          RawMessage,
+        ];
+        throw new Error('stream died');
+      })(),
+      async stop() {},
+    };
+    const channel = await createPhotonChannel(
+      { projectId: 'p', projectSecret: 's', approverPhone: APPROVER },
+      async () => ({ app: failing, dm: { send: vi.fn().mockResolvedValue(undefined) } }),
+    );
+    const seen: string[] = [];
+    const outcome = await channel.streamReplies(async (r) => {
+      seen.push(r.text);
+    });
+    expect(seen).toEqual(['d7 y']); // replies before the error are still delivered
+    expect(outcome.reason).toBe('error');
+    expect(outcome.detail).toContain('stream died');
+  });
+
+  it('survives a handler that throws and still reports the stream end', async () => {
+    const { channel } = await channelFor([
+      { id: 'm1', sender: { id: APPROVER }, content: { type: 'text', text: 'd7 y' } },
+      { id: 'm2', sender: { id: APPROVER }, content: { type: 'text', text: 'd8 n' } },
+    ]);
+    const seen: string[] = [];
+    const outcome = await channel.streamReplies(async (r) => {
+      seen.push(r.text);
+      if (r.messageId === 'm1') throw new Error('handler blew up');
+    });
+    expect(seen).toEqual(['d7 y', 'd8 n']);
+    expect(outcome).toEqual({ reason: 'ended' });
+  });
+});

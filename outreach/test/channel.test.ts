@@ -65,4 +65,15 @@ describe('createStubChannel', () => {
     await ch.notify('seen 3, messaged 1');
     expect(ch.notices).toEqual(['seen 3, messaged 1']);
   });
+
+  it('reports a stream outcome so a caller can tell an end from a failure', async () => {
+    const ch = createStubChannel();
+    ch.queueReply('d7 y');
+    const seen: string[] = [];
+    const outcome = await ch.streamReplies(async (r) => {
+      seen.push(r.text);
+    });
+    expect(seen).toEqual(['d7 y']);
+    expect(outcome).toEqual({ reason: 'ended' });
+  });
 });

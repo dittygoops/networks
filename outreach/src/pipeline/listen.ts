@@ -12,7 +12,7 @@
 // is built via connect(), with escalating capped backoff, and a ceiling of
 // consecutive failures exits the process so a supervisor (launchd) restarts
 // it clean.
-import type { ApprovalChannel, InboundReply } from '../approval/channel.js';
+import type { ApprovalChannel, InboundReply, StreamOutcome } from '../approval/channel.js';
 import type { DB } from '../db/db.js';
 import type { Sender } from '../sender/types.js';
 import { handleReply } from './loop.js';
@@ -125,9 +125,9 @@ export async function runListenLoop(deps: ListenDeps): Promise<void> {
     // streamReplies hands each reply over as it arrives and resolves only
     // when the stream ends, which is the signal to rebuild the client.
     const liveChannel = channel;
-    let sessionOk = true;
+    let outcome: StreamOutcome;
     try {
-      await channel.streamReplies(async (reply) => {
+      outcome = await channel.streamReplies(async (reply) => {
         try {
           await handleReply(replyDepsFor(liveChannel), { dryRun: false }, summary, reply);
         } catch (e) {
@@ -136,9 +136,13 @@ export async function runListenLoop(deps: ListenDeps): Promise<void> {
         }
       });
     } catch (e) {
-      sessionOk = false;
-      log(`listen: streamReplies failed: ${String(e)}`);
+      // A channel that rejects instead of reporting is still a failed session.
+      // The real channel does not do this; the stub and any future adapter
+      // might, and treating a rejection as healthy is the original defect.
+      outcome = { reason: 'error', detail: String(e) };
     }
+    const sessionOk = outcome.reason === 'ended';
+    if (outcome.reason === 'error') log(`listen: stream session failed: ${outcome.detail ?? 'no detail'}`);
 
     // A session that ran cleanly counts as healthy even if it delivered no
     // replies: a quiet night is the normal case for a listener, and treating
