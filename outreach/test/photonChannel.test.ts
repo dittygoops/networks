@@ -4,7 +4,7 @@
 // decoded, so it is also where R3's "log every inbound message, including
 // ignored ones, without leaking a non-approver's number or text" lives.
 import { describe, expect, it, vi } from 'vitest';
-import { createPhotonChannel } from '../src/approval/photonChannel.js';
+import { assertApproverPhone, createPhotonChannel } from '../src/approval/photonChannel.js';
 import type { PhotonApp, PhotonDm, RawMessage } from '../src/approval/photonChannel.js';
 
 const APPROVER = '+15555550123';
@@ -139,5 +139,83 @@ describe('createPhotonChannel streamReplies', () => {
     });
     expect(seen).toEqual(['d7 y', 'd8 n']);
     expect(outcome).toEqual({ reason: 'ended' });
+  });
+});
+
+describe('createPhotonChannel approver invariant', () => {
+  // The allowlist is the single control that stops a possibly shared iMessage
+  // line from being an open reflector, and the comparison is a bare !==. An
+  // empty approverPhone would accept any message whose sender.id is also
+  // empty. photonOptionsFromEnv rejects empty env values, but the factory
+  // accepts any PhotonOptions, so the invariant belongs at construction.
+  it('refuses to construct with an empty approver phone, and never connects', async () => {
+    const connect = vi.fn();
+    await expect(
+      createPhotonChannel({ projectId: 'p', projectSecret: 's', approverPhone: '' }, connect),
+    ).rejects.toThrow(/E\.164/);
+    expect(connect).not.toHaveBeenCalled();
+  });
+
+  it('refuses formats the provider never emits, so a misconfiguration fails at boot', async () => {
+    const connect = vi.fn();
+    for (const bad of ['15555550123', '(555) 555-0123', '+1 555 555 0123', '  +15555550123  ', '+0555555012']) {
+      await expect(
+        createPhotonChannel({ projectId: 'p', projectSecret: 's', approverPhone: bad }, connect),
+      ).rejects.toThrow(/E\.164/);
+    }
+    expect(connect).not.toHaveBeenCalled();
+  });
+
+  it('accepts the exact format the provider was observed to emit', () => {
+    expect(() => assertApproverPhone('+15555550123')).not.toThrow();
+  });
+
+  it('does not put the configured number in the error text', async () => {
+    await expect(
+      createPhotonChannel({ projectId: 'p', projectSecret: 's', approverPhone: '5555550123' }, vi.fn()),
+    ).rejects.toThrow(expect.not.stringContaining('5555550123'));
+  });
+});
+
+describe('createPhotonChannel allowlist diagnostics', () => {
+  // The all-quiet failure this exists for: if APPROVER_PHONE ever diverges in
+  // format from what the provider emits, every approval is silently ignored
+  // and the symptom is indistinguishable from Aditya not replying. That class
+  // of failure has already cost this project a lost approval and required
+  // attaching a separate diagnostic listener to diagnose.
+  it('warns specifically when a rejected sender differs only by formatting', async () => {
+    const warns: string[] = [];
+    const spy = vi.spyOn(console, 'warn').mockImplementation((msg: string) => {
+      warns.push(msg);
+    });
+    try {
+      const { channel, dmSend } = await channelFor([
+        { id: 'm1', sender: { id: '15555550123' }, content: { type: 'text', text: 'd7 y' } },
+      ]);
+      const replies = await channel.captureReplies(50);
+      expect(replies).toEqual([]); // still rejected: the diagnostic never authorizes
+      expect(dmSend).not.toHaveBeenCalled(); // and never answers a rejected sender
+    } finally {
+      spy.mockRestore();
+    }
+    expect(warns.some((w) => w.includes('APPROVER_PHONE is misconfigured'))).toBe(true);
+    for (const w of warns) expect(w).not.toContain('15555550123');
+  });
+
+  it('does not warn about misconfiguration for an unrelated stranger', async () => {
+    const warns: string[] = [];
+    const spy = vi.spyOn(console, 'warn').mockImplementation((msg: string) => {
+      warns.push(msg);
+    });
+    try {
+      const { channel, dmSend } = await channelFor([
+        { id: 'm1', sender: { id: '+15555550199' }, content: { type: 'text', text: 'd7 y' } },
+      ]);
+      expect(await channel.captureReplies(50)).toEqual([]);
+      expect(dmSend).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(warns.some((w) => w.includes('APPROVER_PHONE is misconfigured'))).toBe(false);
   });
 });

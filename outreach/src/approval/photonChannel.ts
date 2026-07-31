@@ -64,6 +64,35 @@ async function defaultConnect(opts: PhotonOptions): Promise<{ app: PhotonApp; dm
 }
 
 
+// Exact E.164. This is the format the provider was verified to emit
+// (sender: {"id":"+15555550123","address":"+15555550123","country":"US",
+// "service":"iMessage"}, observed live) and the allowlist compares exactly, so
+// a value in any other format could never match anything: every approval would
+// be ignored in silence, which is indistinguishable from nobody replying.
+const E164 = /^\+[1-9]\d{7,14}$/;
+
+// The single control preventing a possibly shared iMessage line from becoming
+// an open reflector deserves a hard invariant rather than a bare !== against
+// whatever a caller passed. Under launchd KeepAlive a throw here produces a
+// crash looping job with a named error in listen.err.log, which is loud. The
+// alternative is a healthy looking daemon that ignores every approval, which
+// is silent, and silence is the failure mode this whole plan exists to remove.
+// The configured number is deliberately not interpolated into the message:
+// launchd logs are shared and the number adds nothing a reader needs.
+export function assertApproverPhone(phone: string): void {
+  if (!E164.test(phone)) {
+    throw new Error(
+      'createPhotonChannel: approverPhone must be an exact E.164 string (for example +15555550123). ' +
+        'The iMessage provider emits sender.id in that format and the allowlist compares it exactly, ' +
+        'so any other format would silently ignore every approval reply.',
+    );
+  }
+}
+
+function digitsOnly(s: string): string {
+  return s.replace(/\D/g, '');
+}
+
 // Single decode for both captureReplies (batch) and streamReplies (push), so
 // the allowlist and the content check cannot drift between the two paths.
 // Returns null for anything not actionable, always logging why: the incident
@@ -72,8 +101,24 @@ async function defaultConnect(opts: PhotonOptions): Promise<{ app: PhotonApp; dm
 // a possibly shared line, so neither is ever logged.
 function decodeReply(value: [unknown, RawMessage], approverPhone: string): InboundReply | null {
   const [, message] = value;
-  if (message.sender?.id !== approverPhone) {
-    console.log('photonChannel: inbound message from a non-approver, ignoring');
+  const senderId = message.sender?.id;
+  if (senderId !== approverPhone) {
+    // Normalize for DIAGNOSIS, never for authorization. Nothing reachable from
+    // this comparison can accept a message: both branches return null. Digit
+    // equality with a formatting difference means APPROVER_PHONE no longer
+    // matches what the provider emits, which is the exact all-quiet failure
+    // that once cost a lost approval, so it is named rather than logged as
+    // just another stranger. No number and no message text is ever logged:
+    // on a possibly shared line both are attacker controlled content.
+    if (typeof senderId === 'string' && senderId !== '' && digitsOnly(senderId) === digitsOnly(approverPhone)) {
+      console.warn(
+        'photonChannel: inbound sender matches the approver only after stripping formatting. ' +
+          'APPROVER_PHONE is misconfigured: it must be the exact E.164 string the provider sends. ' +
+          'Ignoring this message.',
+      );
+    } else {
+      console.log('photonChannel: inbound message from a non-approver, ignoring');
+    }
     return null;
   }
   if (message.content?.type !== 'text' || !message.content.text) {
@@ -88,6 +133,7 @@ export async function createPhotonChannel(
   opts: PhotonOptions,
   connect: PhotonConnectFn = defaultConnect,
 ): Promise<ApprovalChannel> {
+  assertApproverPhone(opts.approverPhone);
   const { app, dm } = await connect(opts);
 
   return {
