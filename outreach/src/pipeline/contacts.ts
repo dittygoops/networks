@@ -64,6 +64,32 @@ const MARKER_WINDOW = 120;
 // Plain emails plus brace groups ({a,b}@domain), common in paper headers.
 const EMAIL_RE = /(\{[^}]+\}|[a-zA-Z0-9._%+-]+)@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g;
 
+// BUG A: the local-part character class has no left boundary, and a page like
+// "<b>Email</b>a.sajan@vu.nl" flattens (tags stripped, no space inserted) to
+// "Emaila.sajan@vu.nl": one unbroken run of letters and dots with nothing
+// between the UI label and the real address. A boundary/lookbehind on the
+// match start cannot fix this, since there is genuinely no non-letter
+// character before "Email" either; the label and the address are the same
+// kind of character glued together. Confirmed live: people rows for Akshay
+// Sajan and Qian Hu both carry a stored address with a leading "email".
+// The fix is a small dictionary strip: if a matched local part starts with a
+// known directory-page label word AND something real remains after it,
+// remove the label. Deliberately narrow (no bare "mail", which is a
+// plausible prefix of a real local part like "mailer") and deliberately a
+// no-op when the label IS the whole local part (kept as "email@x.edu" for a
+// generic inbox, matching prior behavior for that case).
+const GLUED_LOCAL_LABELS = ['email', 'e-mail', 'mailto', 'contact'];
+
+function stripGluedLabel(local: string): string {
+  const lower = local.toLowerCase();
+  for (const label of GLUED_LOCAL_LABELS) {
+    if (lower.startsWith(label) && local.length > label.length) {
+      return local.slice(label.length);
+    }
+  }
+  return local;
+}
+
 export function extractPaperEmailCandidates(text: string): EmailCandidate[] {
   const byEmail = new Map<string, EmailCandidate>();
   for (const match of text.matchAll(EMAIL_RE)) {
@@ -72,7 +98,7 @@ export function extractPaperEmailCandidates(text: string): EmailCandidate[] {
     const marker = /corresponding/i.test(window);
     const locals = localGroup.startsWith('{')
       ? localGroup.slice(1, -1).split(',').map((s) => s.trim()).filter(Boolean)
-      : [localGroup];
+      : [stripGluedLabel(localGroup)];
     for (const local of locals) {
       const email = `${local}@${domain}`.toLowerCase();
       const existing = byEmail.get(email);
@@ -132,8 +158,9 @@ export function extractWebEmailCandidates(pages: WebPage[], personName: string):
     if (cls === 'aggregator') continue; // never a usable email source
     const source: EmailSource = cls;
     for (const match of deobfuscate(page.content).matchAll(EMAIL_RE)) {
-      const email = match[0].toLowerCase();
-      if (email.startsWith('{')) continue; // brace groups are a paper-text thing
+      const [, localGroup = '', domain = ''] = match;
+      if (localGroup.startsWith('{')) continue; // brace groups are a paper-text thing
+      const email = `${stripGluedLabel(localGroup)}@${domain}`.toLowerCase();
       const existing = byEmail.get(email);
       if (existing && SOURCE_CONFIDENCE[existing.source] >= SOURCE_CONFIDENCE[source]) continue;
       byEmail.set(email, { email, source, correspondingMarker: false });
@@ -279,15 +306,68 @@ async function runWebPass(
 
 const lettersOnly = (s: string): string => s.toLowerCase().replace(/[^a-z]/g, '');
 
-// D2: after lowercasing and stripping digits/punctuation, the local part must
-// contain (a) the full last name, (b) the full first name, or (c) an initials
-// pattern (first initial + last name, or first name + last initial).
+// D2 (revised): after lowercasing and stripping digits/punctuation, the local
+// part must contain either
+//   (a) the full surname alone, or an initials combo built from it (first
+//       initial + surname, surname + first initial, first name + surname
+//       initial), all of which are distinctive enough on their own, or
+//   (b) the full first name PLUS a second, independent name signal (the
+//       surname or a middle name, in full) both present in the local part.
+//
+// A bare first name is deliberately NOT in list (a) any more. It used to be,
+// and that was a real production bug: nameMatches('daniel.lee', 'Daniel
+// Kepple') returned true because "daniel.lee" contains "daniel", with no
+// check that "lee" has anything to do with "Kepple". A cold email was
+// actually sent to daniel.lee@dlapiper.com, a law firm, for an olfaction
+// researcher. First names are common and carry little identifying signal by
+// themselves; requiring a second signal (surname or middle name) fixes that
+// without giving up the legitimate "firstname.lastname" shape, since in that
+// shape the surname is present too and still satisfies (b).
+//
+// Hyphenated surnames ("Bona-Pellissier") are often abbreviated in email
+// addresses to just one half ("joachim.bona"), so each half is also accepted
+// as a stand-alone surname candidate under (a).
+//
+// This is a precision fix on a path that sends irreversible email (D1), so it
+// deliberately leans toward rejecting an uncertain address. Known accepted
+// misses from this tightening: a bare initial standing in for an unwritten
+// surname (e.g. "Mikel M. Iparraguirre" where the source name has no way to
+// know "M." means "Martinez"), and a first name plus non-name noise like
+// digits or a student number (e.g. "hail96", "eszra22001") with no surname in
+// the local part at all. Both are unresolvable from the name text alone, and
+// the cost of rejecting them is a missed contact (the pipeline already
+// handles that gracefully, D10), not a wrong one.
 export function nameMatches(localPart: string, fullName: string): boolean {
   const local = lettersOnly(localPart);
-  const tokens = fullName.trim().split(/\s+/).map(lettersOnly).filter(Boolean);
-  if (local.length === 0 || tokens.length === 0) return false;
-  const first = tokens[0]!;
-  const last = tokens[tokens.length - 1]!;
-  const patterns = [last, first, first[0]! + last, first + last[0]!];
-  return patterns.some((p) => p.length > 1 && local.includes(p));
+  const rawTokens = fullName.trim().split(/\s+/).filter(Boolean);
+  const tokens = rawTokens.map(lettersOnly);
+  const validIdx = tokens.map((t, i) => (t.length > 0 ? i : -1)).filter((i) => i >= 0);
+  if (local.length === 0 || validIdx.length === 0) return false;
+
+  const firstIdx = validIdx[0]!;
+  const lastIdx = validIdx[validIdx.length - 1]!;
+  const first = tokens[firstIdx]!;
+  const last = tokens[lastIdx]!;
+  const middles = validIdx.slice(1, -1).map((i) => tokens[i]!);
+
+  const hyphenHalves = (rawTokens[lastIdx] ?? '')
+    .split('-')
+    .map(lettersOnly)
+    .filter((p) => p.length > 1);
+  const surnameCandidates = hyphenHalves.length > 1 ? [last, ...hyphenHalves] : [last];
+
+  const strongPatterns = surnameCandidates.flatMap((s) => [
+    s,
+    first[0]! + s,
+    s + first[0]!,
+    first + s[0]!,
+  ]);
+  if (strongPatterns.some((p) => p.length > 1 && local.includes(p))) return true;
+
+  if (first.length > 1 && local.includes(first)) {
+    const corroborators = [...surnameCandidates, ...middles].filter((t) => t.length > 1);
+    if (corroborators.some((t) => local.includes(t))) return true;
+  }
+
+  return false;
 }

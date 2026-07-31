@@ -54,10 +54,12 @@ describe('automated affiliation-discovery second pass (D1c)', () => {
     const searchLog: string[] = [];
     const d = deps({
       searchLog,
-      byQuery: () => [{ url: homepage, title: 'Kordel France', content: 'kordel@utdallas.edu' }],
+      // kordel.france, not bare kordel: nameMatches (D2) requires a surname
+      // signal alongside a first name, not the first name alone.
+      byQuery: () => [{ url: homepage, title: 'Kordel France', content: 'kordel.france@utdallas.edu' }],
     });
     const result = await extractContact(d, { name: 'Kordel France' }, null, CTX);
-    expect(result?.email).toBe('kordel@utdallas.edu');
+    expect(result?.email).toBe('kordel.france@utdallas.edu');
     // only the two pass-1 queries, no domain-scoped pass-2 query
     expect(searchLog.every((q) => !q.includes('utdallas.edu'))).toBe(true);
   });

@@ -61,13 +61,16 @@ describe('extractContact reconciliation (D1a/D1b)', () => {
         { url: 'https://rocketreach.co/x', title: 'Kordel France', content: '' },
         { url: homepage, title: 'Kordel France', content: '' },
       ],
-      fetched: { [homepage]: 'reach me: kordel@utdallas.edu' },
+      // kordel.france, not bare kordel: nameMatches (D2) requires a surname
+      // signal alongside a first name, not the first name alone (a bare first
+      // name is deliberately insufficient, see contacts.ts nameMatches).
+      fetched: { [homepage]: 'reach me: kordel.france@utdallas.edu' },
       fetchLog,
     });
     const result = await extractContact(deps, { name: 'Kordel France', affiliation: 'UT Dallas' }, null, {});
     expect(fetchLog).toContain(homepage);
     expect(fetchLog).not.toContain('https://rocketreach.co/x');
-    expect(result?.email).toBe('kordel@utdallas.edu');
+    expect(result?.email).toBe('kordel.france@utdallas.edu');
   });
 
   test('returns null when neither source yields a name-matching email', async () => {
