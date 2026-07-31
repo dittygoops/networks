@@ -249,3 +249,189 @@ describe('runListenLoop delivery semantics', () => {
     expect(captureCalls).toBe(0);
   });
 });
+
+// A channel matching the REAL photonChannel contract in the failure case the
+// production defect lived in: the stream errors or ends the instant it is
+// connected (revoked auth, degraded Spectrum, network down), and the channel
+// resolves normally rather than throwing.
+function instantEndChannel(reason: 'ended' | 'error' = 'ended') {
+  let connects = 0;
+  const channel: ApprovalChannel = {
+    sendDraftMessage: async () => {},
+    notify: async () => {},
+    captureReplies: async () => [],
+    streamReplies: async (): Promise<StreamOutcome> => ({ reason }),
+    close: async () => {},
+  };
+  return { channel, connect: async () => { connects++; return channel; }, connects: () => connects };
+}
+
+describe('runListenLoop hot-spin regression', () => {
+  // The defect: streamReplies resolved normally on error, the listener read
+  // health from "did it reject", so consecutiveFailures reset every cycle,
+  // backoff never applied, and the loop became connect -> return -> close ->
+  // connect with ZERO sleep against the live service. This is the same class
+  // as the shipped bug where a 1 year timeout overflowed Node's 32 bit timer
+  // field, became 1ms, and caused 4 rebuilds in 45 seconds.
+  //
+  // The assertion that matters is elapsed virtual time, not a call count: a
+  // call-count assertion passes against the hot-spinning code.
+  it('sleeps on every cycle and escalates when the stream ends immediately', async () => {
+    let virtualNow = 0;
+    const slept: number[] = [];
+    const sleep = async (ms: number) => {
+      slept.push(ms);
+      virtualNow += ms;
+    };
+    const { connect, connects } = instantEndChannel('ended');
+    const CYCLES = 20;
+
+    await runListenLoop({
+      connect,
+      db: openDb(':memory:'),
+      sender: { send: vi.fn() },
+      sleep,
+      now: () => virtualNow,
+      exit: () => {},
+      log: () => {},
+      maxCycles: CYCLES,
+      maxConsecutiveFailures: 1000, // not the subject of this test
+    });
+
+    expect(connects()).toBe(CYCLES);
+    expect(slept).toHaveLength(CYCLES); // every cycle slept, no exceptions
+    expect(Math.min(...slept)).toBeGreaterThanOrEqual(1000);
+    // Escalating backoff is actually applied instead of being reset each cycle.
+    expect(slept[slept.length - 1]).toBe(300_000);
+    // 20 immediate-end cycles cost over an hour of wall clock, not 0ms.
+    expect(virtualNow).toBeGreaterThan(60 * 60 * 1000);
+  });
+
+  it('applies the same pacing when the stream reports an error outcome', async () => {
+    let virtualNow = 0;
+    const slept: number[] = [];
+    const { connect } = instantEndChannel('error');
+
+    await runListenLoop({
+      connect,
+      db: openDb(':memory:'),
+      sender: { send: vi.fn() },
+      sleep: async (ms) => {
+        slept.push(ms);
+        virtualNow += ms;
+      },
+      now: () => virtualNow,
+      exit: () => {},
+      log: () => {},
+      maxCycles: 5,
+      maxConsecutiveFailures: 1000,
+    });
+
+    expect(slept).toEqual([5_000, 10_000, 20_000, 40_000, 80_000]);
+  });
+
+  // The ceiling at listen.ts:150 was unreachable against the real channel.
+  // This is the test that says it is reachable now.
+  it('exits for a supervisor restart after a ceiling of stream failures', async () => {
+    const { connect } = instantEndChannel('error');
+    const exit = vi.fn();
+    let virtualNow = 0;
+
+    await runListenLoop({
+      connect,
+      db: openDb(':memory:'),
+      sender: { send: vi.fn() },
+      sleep: async (ms) => {
+        virtualNow += ms;
+      },
+      now: () => virtualNow,
+      exit,
+      log: () => {},
+      maxConsecutiveFailures: 3,
+      // No maxCycles: exit() must be the thing that stops the loop. The fake
+      // exit does not terminate the process, so a loop that failed to stop
+      // would hang this test rather than pass it.
+    });
+
+    expect(exit).toHaveBeenCalledTimes(1);
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  // A quiet night is the normal case for a listener. Silence must never be the
+  // failure signal, or the retry budget burns down for no reason.
+  it('treats a long-lived session that ends cleanly as healthy', async () => {
+    let virtualNow = 0;
+    const slept: number[] = [];
+    const channel: ApprovalChannel = {
+      sendDraftMessage: async () => {},
+      notify: async () => {},
+      captureReplies: async () => [],
+      streamReplies: async (): Promise<StreamOutcome> => {
+        virtualNow += 10 * 60 * 1000; // ten quiet hours' worth of a session
+        return { reason: 'ended' };
+      },
+      close: async () => {},
+    };
+    const exit = vi.fn();
+
+    await runListenLoop({
+      connect: async () => channel,
+      db: openDb(':memory:'),
+      sender: { send: vi.fn() },
+      sleep: async (ms) => {
+        slept.push(ms);
+        virtualNow += ms;
+      },
+      now: () => virtualNow,
+      exit,
+      log: () => {},
+      maxCycles: 4,
+    });
+
+    // A session that already ran ten simulated minutes has, by itself,
+    // already satisfied the floor (at most one connect() per second), so the
+    // floor adds nothing on top of it. Corrected from the plan's original
+    // assertion of four 1000ms sleeps: that expectation contradicted the
+    // floor's own stated purpose (bounding the RECONNECT rate, not padding
+    // every cycle unconditionally) and contradicted the elapsed-based
+    // implementation the same plan specifies, which every other floor test in
+    // this file (the hot-spin and short-session cases) depends on. The
+    // invariant this test actually pins is what matters here: no backoff, no
+    // exit, however long or short the healthy session ran.
+    expect(slept).toEqual([]);
+    expect(exit).not.toHaveBeenCalled();
+  });
+
+  // A session that did its job is healthy however short it was, so a burst of
+  // approvals cannot be mistaken for a broken stream.
+  it('treats a short session that delivered a reply as healthy', async () => {
+    const slept: number[] = [];
+    let virtualNow = 0;
+    const channel: ApprovalChannel = {
+      sendDraftMessage: async () => {},
+      notify: async () => {},
+      captureReplies: async () => [],
+      streamReplies: async (onReply): Promise<StreamOutcome> => {
+        await onReply({ text: 'd999 y', messageId: 'm1' });
+        return { reason: 'ended' };
+      },
+      close: async () => {},
+    };
+
+    await runListenLoop({
+      connect: async () => channel,
+      db: openDb(':memory:'),
+      sender: { send: vi.fn() },
+      sleep: async (ms) => {
+        slept.push(ms);
+        virtualNow += ms;
+      },
+      now: () => virtualNow,
+      exit: () => {},
+      log: () => {},
+      maxCycles: 3,
+    });
+
+    expect(slept).toEqual([1_000, 1_000, 1_000]);
+  });
+});

@@ -29,6 +29,14 @@ export interface ListenDeps {
   maxConsecutiveFailures?: number;
   backoffMs?: (failures: number) => number;
   sleep?: (ms: number) => Promise<void>;
+  // Injected so tests can drive virtual time and assert on elapsed wall clock
+  // rather than on call counts. A call-count assertion cannot catch a hot spin.
+  now?: () => number;
+  // A stream that ends cleanly within this window without delivering anything
+  // did not have a healthy session, it failed to establish one. See below.
+  minHealthySessionMs?: number;
+  // Hard floor on how fast the loop may reconnect, whatever else happens.
+  minCycleIntervalMs?: number;
   exit?: (code: number) => void;
   log?: (msg: string) => void;
   // Test-only escape hatch: stop after this many cycles instead of running
@@ -39,6 +47,17 @@ export interface ListenDeps {
 const DEFAULT_MAX_CONSECUTIVE_FAILURES = 30;
 const BASE_BACKOFF_MS = 5_000;
 const MAX_BACKOFF_MS = 5 * 60_000;
+// A stream that connects and returns immediately is a broken connection with a
+// clean exit code, not a quiet night. Sixty seconds is far below any real
+// session and far above any plausible instant return.
+const MIN_HEALTHY_SESSION_MS = 60_000;
+// The structural anti-spin guard. Even if a channel someday returns an outcome
+// nobody anticipated, the loop cannot reach connect() more than once per
+// second. Logic-shaped guards have been defeated here before by number-shaped
+// bugs (a 1 year timeout overflowed Node's 32 bit timer field and became 1ms,
+// causing 4 client rebuilds in 45 seconds against the live service), so the
+// floor does not depend on classifying the session correctly.
+const MIN_CYCLE_INTERVAL_MS = 1_000;
 
 function defaultBackoffMs(failures: number): number {
   return Math.min(BASE_BACKOFF_MS * 2 ** (failures - 1), MAX_BACKOFF_MS);
@@ -66,6 +85,9 @@ export async function runListenLoop(deps: ListenDeps): Promise<void> {
   const exit = deps.exit ?? ((code: number) => process.exit(code));
   const backoffMs = deps.backoffMs ?? defaultBackoffMs;
   const maxFailures = deps.maxConsecutiveFailures ?? DEFAULT_MAX_CONSECUTIVE_FAILURES;
+  const now = deps.now ?? (() => Date.now());
+  const minHealthySessionMs = deps.minHealthySessionMs ?? MIN_HEALTHY_SESSION_MS;
+  const minCycleIntervalMs = deps.minCycleIntervalMs ?? MIN_CYCLE_INTERVAL_MS;
 
   // The reply-handling deps are rebuilt each cycle with whatever channel is
   // currently live; db/sender/senderEmail never change across reconnects.
@@ -93,6 +115,7 @@ export async function runListenLoop(deps: ListenDeps): Promise<void> {
       return;
     }
     cycles++;
+    const cycleStart = now();
 
     if (!channel) {
       try {
@@ -125,9 +148,12 @@ export async function runListenLoop(deps: ListenDeps): Promise<void> {
     // streamReplies hands each reply over as it arrives and resolves only
     // when the stream ends, which is the signal to rebuild the client.
     const liveChannel = channel;
+    let repliesDelivered = 0;
     let outcome: StreamOutcome;
+    const sessionStart = now();
     try {
       outcome = await channel.streamReplies(async (reply) => {
+        repliesDelivered++;
         try {
           await handleReply(replyDepsFor(liveChannel), { dryRun: false }, summary, reply);
         } catch (e) {
@@ -136,13 +162,26 @@ export async function runListenLoop(deps: ListenDeps): Promise<void> {
         }
       });
     } catch (e) {
-      // A channel that rejects instead of reporting is still a failed session.
-      // The real channel does not do this; the stub and any future adapter
-      // might, and treating a rejection as healthy is the original defect.
+      // A channel that rejects rather than reporting is still a failed session.
       outcome = { reason: 'error', detail: String(e) };
     }
-    const sessionOk = outcome.reason === 'ended';
-    if (outcome.reason === 'error') log(`listen: stream session failed: ${outcome.detail ?? 'no detail'}`);
+    const sessionMs = now() - sessionStart;
+
+    // Three ways to be healthy, and only three. A clean end after a real
+    // session, or a clean end that actually delivered work, is a working
+    // stream. A clean end that happened instantly and delivered nothing is
+    // what a revoked credential, a degraded Spectrum, or a dead network looks
+    // like from in here, and calling it healthy is what made the failure
+    // ceiling below dead code and let the loop spin with zero sleep.
+    // Silence itself is never the failure signal: a quiet night with a live
+    // stream lasts hours and passes the duration test.
+    const sessionOk = outcome.reason === 'ended' && (sessionMs >= minHealthySessionMs || repliesDelivered > 0);
+    if (!sessionOk) {
+      log(
+        `listen: unhealthy session (reason ${outcome.reason}, ${sessionMs}ms, ${repliesDelivered} reply(ies))` +
+          (outcome.detail ? `: ${outcome.detail}` : ''),
+      );
+    }
 
     // A session that ran cleanly counts as healthy even if it delivered no
     // replies: a quiet night is the normal case for a listener, and treating
@@ -170,5 +209,12 @@ export async function runListenLoop(deps: ListenDeps): Promise<void> {
     } catch (e) {
       log(`listen: channel close during reconnect failed: ${String(e)}`);
     }
+
+    // The floor. Every path that reaches the end of a cycle passes through
+    // here, and the only path that does not (the connect failure `continue`
+    // above) has already slept a backoff of at least 5000ms. So no sequence of
+    // events can make this loop call connect() twice within a second.
+    const elapsed = now() - cycleStart;
+    if (elapsed < minCycleIntervalMs) await sleep(minCycleIntervalMs - elapsed);
   }
 }
