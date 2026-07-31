@@ -2,7 +2,7 @@
 // on the account and the org allowing app passwords (F6 open question; if ASU
 // blocks them, add a gmail-api.ts behind the same Sender interface instead).
 import nodemailer from 'nodemailer';
-import type { OutboundEmail, Sender } from './types.js';
+import { assertSafeOutbound, type OutboundEmail, type Sender } from './types.js';
 
 export function createGmailSmtpSender(opts?: { user?: string; appPassword?: string }): Sender {
   const user = opts?.user ?? process.env.SENDER_EMAIL;
@@ -19,6 +19,9 @@ export function createGmailSmtpSender(opts?: { user?: string; appPassword?: stri
 
   return {
     async send(email: OutboundEmail): Promise<{ sentId: string }> {
+      // D3: nodemailer does its own header sanitation, but the guard belongs at
+      // the seam so every present and future sender is covered identically.
+      assertSafeOutbound(email);
       const info = await transport.sendMail({
         from: email.from,
         to: email.to,

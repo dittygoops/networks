@@ -2,7 +2,7 @@
 // Workspace blocks SMTP app passwords; OAuth with the gmail.send scope is the
 // supported path. Credentials come from a one-time consent (scripts/gmail-auth.ts).
 import { google } from 'googleapis';
-import type { OutboundEmail, Sender } from './types.js';
+import { assertSafeOutbound, type OutboundEmail, type Sender } from './types.js';
 
 // Build an RFC 2822 message and base64url-encode it, as the Gmail API expects.
 function toRawMessage(email: OutboundEmail): string {
@@ -42,6 +42,9 @@ export function createGmailApiSender(opts?: {
 
   return {
     async send(email: OutboundEmail): Promise<{ sentId: string }> {
+      // D3: fail closed before building the raw RFC 2822 message, which is
+      // where a CR or LF in the subject would become a real extra header.
+      assertSafeOutbound(email);
       const res = await gmail.users.messages.send({
         userId: 'me',
         requestBody: { raw: toRawMessage(email) },
