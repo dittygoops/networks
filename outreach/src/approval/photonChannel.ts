@@ -136,6 +136,30 @@ export async function createPhotonChannel(
   assertApproverPhone(opts.approverPhone);
   const { app, dm } = await connect(opts);
 
+  // The iterator and any in-flight next() live for the channel's lifetime, not
+  // for one captureReplies call. A per-call iterator abandons its in-flight
+  // next() when the window closes, and the message that promise later delivers
+  // has already been pulled off the stream, so it is consumed and lost. An
+  // approval consumed and lost is indistinguishable from one never sent, which
+  // is the failure this codebase keeps paying for. Holding both here means an
+  // unconsumed message is simply the first thing the next call sees.
+  let iterator: AsyncIterator<[unknown, RawMessage]> | undefined;
+  let pending: Promise<IteratorResult<[unknown, RawMessage]>> | undefined;
+
+  const nextMessage = (): Promise<IteratorResult<[unknown, RawMessage]>> => {
+    if (!iterator) iterator = app.messages[Symbol.asyncIterator]();
+    if (!pending) {
+      const p = iterator.next();
+      // A promise that loses the race and is never awaited again would surface
+      // as an unhandled rejection and take the process down. One handler is
+      // attached here at creation; the value is still delivered to whoever
+      // awaits `pending` later.
+      p.catch(() => {});
+      pending = p;
+    }
+    return pending;
+  };
+
   return {
     async sendDraftMessage(msg) {
       await dm.send(formatDraftMessage(msg));
@@ -150,53 +174,55 @@ export async function createPhotonChannel(
     async captureReplies(windowMs: number): Promise<InboundReply[]> {
       const out: InboundReply[] = [];
       const deadline = Date.now() + windowMs;
-      const iterator = app.messages[Symbol.asyncIterator]();
-      // R3: every inbound message must produce a log line, including ignored
-      // ones, since the incident that motivated this listener was
-      // undiagnosable without one. A non-approver's number or message text
-      // is attacker-controlled content that may end up in a shared log, so
-      // neither is ever logged, only the fact that it happened.
       const acceptIfAllowed = (value: [unknown, RawMessage]) => {
         const reply = decodeReply(value, opts.approverPhone);
         if (reply) out.push(reply);
       };
 
-      // Holds the in-flight iterator.next() promise across loop iterations so
-      // a message that arrives right as the timeout wins is not discarded:
-      // only call iterator.next() when nothing is already pending.
-      let pending: ReturnType<typeof iterator.next> | undefined;
       try {
         while (Date.now() < deadline) {
           const remaining = deadline - Date.now();
-          if (!pending) pending = iterator.next();
+          const inFlight = nextMessage();
           let timer: ReturnType<typeof setTimeout> | undefined;
           const next = await Promise.race([
-            pending,
-            new Promise<null>((r) => { timer = setTimeout(() => r(null), remaining); }),
+            inFlight,
+            new Promise<null>((r) => {
+              timer = setTimeout(() => r(null), remaining);
+            }),
           ]);
           clearTimeout(timer);
-          if (next === null) break; // timeout won; pending stays for the grace check below
+          if (next === null) break; // timeout won; `pending` stays for the grace check
           pending = undefined;
           if (next.done) break;
-          acceptIfAllowed(next.value as [unknown, RawMessage]);
+          acceptIfAllowed(next.value);
         }
 
-        // The timeout won with a next() still in flight. Give it a short
-        // grace period rather than discarding it: a reply that arrived just
-        // as the window closed should still be drained, not lost silently.
+        // The timeout won with a next() still in flight. Give it a short grace
+        // period: a reply that arrived just as the window closed should still
+        // be drained now rather than waiting for the next run. If grace also
+        // expires, `pending` is deliberately LEFT SET, so the message is not
+        // consumed and dropped, it is the first thing the next call sees.
         if (pending) {
           const graceMs = 500;
           let graceTimer: ReturnType<typeof setTimeout> | undefined;
           const settled = await Promise.race([
             pending,
-            new Promise<null>((r) => { graceTimer = setTimeout(() => r(null), graceMs); }),
+            new Promise<null>((r) => {
+              graceTimer = setTimeout(() => r(null), graceMs);
+            }),
           ]);
           clearTimeout(graceTimer);
-          if (settled && !settled.done) {
-            acceptIfAllowed(settled.value as [unknown, RawMessage]);
+          if (settled !== null) {
+            pending = undefined;
+            if (!settled.done) acceptIfAllowed(settled.value);
           }
         }
       } catch (err) {
+        // The stream itself failed. The iterator is dead, so drop it and let
+        // the next call build a fresh one, and return what was collected
+        // rather than throwing out of an unattended scheduled run.
+        pending = undefined;
+        iterator = undefined;
         console.warn(`captureReplies: message stream error, returning ${out.length} reply(ies) collected so far: ${String(err)}`);
       }
       return out;
@@ -233,6 +259,15 @@ export async function createPhotonChannel(
     },
 
     async close() {
+      // Tell the transport we are done reading rather than abandoning the
+      // iterator. Best effort: a return() that throws must not stop app.stop().
+      try {
+        await iterator?.return?.();
+      } catch (err) {
+        console.warn(`photonChannel: iterator close failed, stopping the app anyway: ${String(err)}`);
+      }
+      iterator = undefined;
+      pending = undefined;
       await app.stop();
     },
   };

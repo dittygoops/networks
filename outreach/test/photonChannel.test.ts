@@ -219,3 +219,96 @@ describe('createPhotonChannel allowlist diagnostics', () => {
     expect(warns.some((w) => w.includes('APPROVER_PHONE is misconfigured'))).toBe(false);
   });
 });
+
+// A fake app whose stream is driven by the test rather than by an array, so a
+// message can be made to arrive at a chosen moment relative to the window.
+function controllableApp() {
+  const queued: Array<[unknown, RawMessage]> = [];
+  let waiting: ((r: IteratorResult<[unknown, RawMessage]>) => void) | undefined;
+  let returnCalls = 0;
+  let stopped = false;
+  const iterator: AsyncIterator<[unknown, RawMessage]> = {
+    next() {
+      const head = queued.shift();
+      if (head !== undefined) return Promise.resolve({ value: head, done: false });
+      return new Promise<IteratorResult<[unknown, RawMessage]>>((resolve) => {
+        waiting = resolve;
+      });
+    },
+    async return() {
+      returnCalls++;
+      return { value: undefined, done: true };
+    },
+  };
+  const app: PhotonApp = {
+    messages: { [Symbol.asyncIterator]: () => iterator } as AsyncIterable<[unknown, RawMessage]>,
+    async stop() {
+      stopped = true;
+    },
+  };
+  return {
+    app,
+    deliver(m: RawMessage) {
+      const value: [unknown, RawMessage] = [{ id: 'space-1' }, m];
+      if (waiting) {
+        const w = waiting;
+        waiting = undefined;
+        w({ value, done: false });
+      } else {
+        queued.push(value);
+      }
+    },
+    returnCalls: () => returnCalls,
+    stopped: () => stopped,
+  };
+}
+
+describe('createPhotonChannel captureReplies does not drop a reply', () => {
+  // The defect: when the deadline won with a next() in flight, the 500ms grace
+  // covered the common case, but a message settling after the grace had been
+  // pulled off the iterator and was then discarded. The reply was consumed and
+  // lost, and an approval that is consumed and lost looks exactly like an
+  // approval that was never sent.
+  it('carries an in-flight message to the next call instead of discarding it', async () => {
+    const fake = controllableApp();
+    const channel = await createPhotonChannel(
+      { projectId: 'p', projectSecret: 's', approverPhone: APPROVER },
+      async () => ({ app: fake.app, dm: { send: vi.fn().mockResolvedValue(undefined) } }),
+    );
+
+    // Window and grace both expire with nothing delivered.
+    expect(await channel.captureReplies(30)).toEqual([]);
+
+    // The message settles well after the grace period is over.
+    fake.deliver({ id: 'm-late', sender: { id: APPROVER }, content: { type: 'text', text: 'd7 y' } });
+
+    // The next call sees it. Before the fix, this returned [].
+    expect(await channel.captureReplies(30)).toEqual([{ text: 'd7 y', messageId: 'm-late' }]);
+  });
+
+  it('applies the identical allowlist to a carried-over message', async () => {
+    const fake = controllableApp();
+    const dmSend = vi.fn().mockResolvedValue(undefined);
+    const channel = await createPhotonChannel(
+      { projectId: 'p', projectSecret: 's', approverPhone: APPROVER },
+      async () => ({ app: fake.app, dm: { send: dmSend } }),
+    );
+
+    expect(await channel.captureReplies(30)).toEqual([]);
+    fake.deliver({ id: 'm-late', sender: { id: '+15555550199' }, content: { type: 'text', text: 'd7 y' } });
+    expect(await channel.captureReplies(30)).toEqual([]);
+    expect(dmSend).not.toHaveBeenCalled(); // a stranger gets nothing back, ever
+  });
+
+  it('closes the iterator rather than abandoning it, and still stops the app', async () => {
+    const fake = controllableApp();
+    const channel = await createPhotonChannel(
+      { projectId: 'p', projectSecret: 's', approverPhone: APPROVER },
+      async () => ({ app: fake.app, dm: { send: vi.fn().mockResolvedValue(undefined) } }),
+    );
+    await channel.captureReplies(30);
+    await channel.close?.();
+    expect(fake.returnCalls()).toBe(1);
+    expect(fake.stopped()).toBe(true);
+  });
+});
