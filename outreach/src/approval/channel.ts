@@ -45,23 +45,24 @@ export function parseReply(text: string): ParsedReply {
   if (!tokens.length) return { kind: 'unparseable' };
 
   let shortId: string | undefined;
-  let hadPrefix = false;
   const rest: string[] = [];
   for (const t of tokens) {
     const id = shortId === undefined ? parseShortId(t) : null;
     if (id !== null) {
       shortId = formatShortId(id);
-      hadPrefix = /^[dD]/.test(t);
     } else {
       rest.push(t);
     }
   }
   if (shortId === undefined) return { kind: 'unparseable' };
 
-  // Ambiguity must never resolve toward sending: a lone bare-digit token
-  // (no 'd' prefix, no explicit keyword) is too easily an accidental text,
-  // a year, a house number, a reply meant for another conversation.
-  if (rest.length === 0) return hadPrefix ? { kind: 'approve', shortId } : { kind: 'unparseable' };
+  // Ambiguity never resolves toward sending, with no exceptions. An id alone
+  // is a noun: "d7" or "7" could be an accidental text, a year, a house
+  // number, or a reply meant for another conversation, and ids are permanent
+  // so a stale one still names a real draft. An approval must contain a verb.
+  // This costs one character and the outbound message advertises exactly that
+  // form ("Reply \"d7 y\" to send").
+  if (rest.length === 0) return { kind: 'unparseable' };
   if (rest.length === 1 && APPROVE.has(rest[0] ?? '')) return { kind: 'approve', shortId };
   if (rest.length === 1 && SKIP.has(rest[0] ?? '')) return { kind: 'skip', shortId };
   return { kind: 'unsupported', shortId }; // an edit instruction: F5 owns this
