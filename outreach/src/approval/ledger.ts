@@ -31,10 +31,20 @@ export function logEvent(db: DB, draftId: number | null, type: string, detail?: 
 
 export function persistDraft(db: DB, input: PersistDraftInput): PersistedDraft {
   const txn = db.transaction((): PersistedDraft => {
+    // D2: freeze the recipient here, next to the subject and body that
+    // revisions already freezes. people.email is mutable (upsertPerson
+    // coalesces a new non-null value in on every re-discovery of the same
+    // author), so an address resolved fresh at send time can be one no human
+    // ever approved. NULL is legitimate: `outreach add` deliberately parks a
+    // draft with no address as a manual-lookup queue, and the send path
+    // refuses such a draft rather than guessing.
+    const person = db.prepare('SELECT email FROM people WHERE id = ?').get(input.personId) as
+      | { email: string | null }
+      | undefined;
     const res = db
       .prepare(
-        `INSERT INTO drafts (short_id, person_id, paper_arxiv_id, paper_title, intent, gist, draft_input_json)
-         VALUES ('', ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO drafts (short_id, person_id, paper_arxiv_id, paper_title, intent, gist, draft_input_json, to_email)
+         VALUES ('', ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.personId,
@@ -43,6 +53,7 @@ export function persistDraft(db: DB, input: PersistDraftInput): PersistedDraft {
         input.intent,
         input.draft.subject,
         JSON.stringify(input.draftInput),
+        person?.email ?? null,
       );
     const draftId = Number(res.lastInsertRowid);
     const shortId = formatShortId(draftId);
