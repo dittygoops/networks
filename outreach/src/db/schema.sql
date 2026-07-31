@@ -57,6 +57,19 @@ CREATE TABLE IF NOT EXISTS drafts (
   sendable_revision_id INTEGER REFERENCES revisions(id),
   status TEXT NOT NULL DEFAULT 'awaiting_approval' CHECK(status IN
     ('awaiting_approval','approved','sent (stubbed)','sent','skipped')),
+  -- The approved recipient, frozen at draft creation next to the already-frozen
+  -- subject and body in revisions (D2). people.email is mutable: upsertPerson
+  -- coalesces a new non-null value in every time another paper by the same
+  -- author is discovered, so resolving the address fresh at send time can mail
+  -- an address no human ever approved. Guarded ALTER in db.ts covers a database
+  -- created before this column existed.
+  to_email TEXT,
+  -- At-most-once send claim (D1). Written and COMMITTED BEFORE the network
+  -- call, so a send that times out after Gmail accepted it still leaves the
+  -- claim behind and no automatic path can re-send it. Never cleared by a
+  -- failure; clearing it is a deliberate human act (see the send-path plan).
+  send_attempted_at TEXT,
+  send_attempts INTEGER NOT NULL DEFAULT 0,
   decided_at TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );

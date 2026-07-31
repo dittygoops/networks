@@ -18,6 +18,7 @@ export function openDb(path: string): DB {
   db.pragma('foreign_keys = ON');
   db.exec(readFileSync(schemaPath, 'utf8'));
   migrateSeenPapers(db);
+  migrateDrafts(db);
   return db;
 }
 
@@ -33,6 +34,44 @@ function migrateSeenPapers(db: DB): void {
   );
   if (!cols.has('attempts')) db.exec('ALTER TABLE seen_papers ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0');
   if (!cols.has('abstract')) db.exec('ALTER TABLE seen_papers ADD COLUMN abstract TEXT');
+}
+
+// Same mechanism as migrateSeenPapers, for the send-path columns (D1/D2).
+// schema.sql cannot reach an existing database, so this guarded ALTER is the
+// only way to_email / send_attempted_at / send_attempts land on the live file.
+// Idempotent, so it is safe on every open.
+//
+// The backfills run exactly once each, inside the branch that adds the column,
+// so a later change to people.email can never silently rewrite a snapshot.
+function migrateDrafts(db: DB): void {
+  const cols = new Set(
+    (db.prepare('PRAGMA table_info(drafts)').all() as { name: string }[]).map((c) => c.name),
+  );
+  if (!cols.has('to_email')) {
+    db.exec('ALTER TABLE drafts ADD COLUMN to_email TEXT');
+    // Pre-migration drafts were messaged to Aditya's phone with whatever
+    // people.email held at message time, and nothing has changed those
+    // addresses since (there is no address history to consult, so this is the
+    // only defensible snapshot). Adopting the current value now is exactly the
+    // behavior these drafts already had, and from this point on it is frozen.
+    db.exec(
+      'UPDATE drafts SET to_email = (SELECT email FROM people WHERE people.id = drafts.person_id) WHERE to_email IS NULL',
+    );
+  }
+  // send_attempts must exist before the send_attempted_at backfill below sets
+  // it, so keep this ALTER first.
+  if (!cols.has('send_attempts')) {
+    db.exec('ALTER TABLE drafts ADD COLUMN send_attempts INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!cols.has('send_attempted_at')) {
+    db.exec('ALTER TABLE drafts ADD COLUMN send_attempted_at TEXT');
+    // An already-sent draft did consume its one attempt. Recording that keeps
+    // the audit trail honest and is defense in depth: status alone already
+    // blocks a re-claim.
+    db.exec(
+      "UPDATE drafts SET send_attempted_at = coalesce(decided_at, created_at, datetime('now')), send_attempts = 1 WHERE status LIKE 'sent%'",
+    );
+  }
 }
 
 export interface PersonInput {
