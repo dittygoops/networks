@@ -87,3 +87,34 @@ describe('detectIdentityCollision', () => {
     expect(detectIdentityCollision(facts).suspected).toBe(false);
   });
 });
+
+// D6: this is a DELIBERATE blind spot, pinned so it cannot be mistaken for a
+// bug or quietly "fixed" by lowering the thresholds. A two- or three-person
+// merge (the common case for a common Chinese or Korean name) produces around
+// 10 institutions and is NOT flagged. The calibration run showed the cost of
+// catching it: Yuejiang Liu (218 collaborators, 4 institutions) and Zhiying Du
+// (80 collaborators, 8 institutions) are single real researchers, and a
+// threshold low enough to catch a 10-institution merge blocks them too.
+// Blocking a real person is a silent drop, which is not a safe default.
+// The defense for this population is the page-identity gate in research.ts
+// (pageIsAboutPerson), not this detector.
+describe('detectIdentityCollision known blind spot (D6)', () => {
+  const profile = (institutions: number, collaborators: number): OntologyFact[] => [
+    ...institutionFacts(institutions),
+    ...collaboratorFacts(collaborators),
+  ];
+
+  test('a plausible two- or three-person merge (10 institutions) is NOT flagged, by design', () => {
+    expect(detectIdentityCollision(profile(10, 60)).suspected).toBe(false);
+  });
+
+  test('a prolific single researcher is not flagged either (the reason the bar is high)', () => {
+    expect(detectIdentityCollision(profile(4, 218)).suspected).toBe(false);
+    expect(detectIdentityCollision(profile(8, 80)).suspected).toBe(false);
+  });
+
+  test('the gross merge it is calibrated for is still flagged', () => {
+    expect(detectIdentityCollision(profile(165, 834)).suspected).toBe(true);
+    expect(detectIdentityCollision(profile(21, 205)).suspected).toBe(true);
+  });
+});

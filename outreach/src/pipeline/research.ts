@@ -155,6 +155,21 @@ export function factsFromOpenAlex(candidate: OpenAlexCandidate, raw: OpenAlexAut
 // only when institutions are also elevated, which keeps prolific-but-single
 // researchers (4 or 8 institutions) out of the net. Blocking them is not a
 // safe default: it silently drops people worth contacting.
+//
+// KNOWN AND ACCEPTED BLIND SPOT: these thresholds only catch a GROSS merge.
+// A two- or three-person merge, which is the common case for a common Chinese
+// or Korean name, produces roughly 10 institutions and is NOT flagged. That is
+// deliberate, not an oversight: the calibration run above shows a threshold low
+// enough to catch it would also flag Yuejiang Liu (4 institutions) and Zhiying
+// Du (8 institutions), who are single real researchers, and silently dropping a
+// real person is not a safe default either.
+//
+// This detector is therefore NOT the defense for that population. The defense is
+// pageIsAboutPerson (below), which requires the surname as a complete token plus
+// a nearby given name before any web page may contribute a fact. Until 2026-07,
+// that gate was a no-op for short surnames, so BOTH defenses were degraded on
+// the SAME population at the same time. If pageIsAboutPerson is ever loosened,
+// these thresholds must be revisited in the same change.
 export const COLLISION_MIN_INSTITUTIONS = 40;
 export const COLLISION_MIN_COLLABORATORS = 200;
 // Collaborators only count as evidence alongside this much institutional spread.
