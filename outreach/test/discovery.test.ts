@@ -9,11 +9,11 @@ const cand = (arxivId: string, via: Candidate['discoveredVia']): Candidate => ({
   sourceDetail: 'detail',
 });
 
-const src = (name: Candidate['discoveredVia'], result: Candidate[] | Error): DiscoverySource => ({
+const src = (name: Candidate['discoveredVia'], result: Candidate[] | Error, errors: string[] = []): DiscoverySource => ({
   name,
   fetch: async () => {
     if (result instanceof Error) throw result;
-    return result;
+    return { candidates: result, errors };
   },
 });
 
@@ -51,5 +51,26 @@ describe('discoverAll', () => {
     const got = await discoverAll([src('saved_query', new Error('down')), src('recommend', new Error('down'))]);
     expect(got.candidates).toEqual([]);
     expect(got.errors).toHaveLength(2);
+  });
+
+  it('folds errors from a source that resolved, so a partial failure is not silent', async () => {
+    const got = await discoverAll([
+      src('saved_query', [cand('2601.00001', 'saved_query')], ['9 of 25 arXiv all queries failed (a: HTTP 429)']),
+      src('recommend', [cand('2601.00002', 'recommend')]),
+    ]);
+    expect(got.candidates).toHaveLength(2);
+    expect(got.errors).toHaveLength(1);
+    expect(got.errors[0]).toBe('saved_query: 9 of 25 arXiv all queries failed (a: HTTP 429)');
+  });
+
+  it('distinguishes a broken source from a quiet day', async () => {
+    const broken = await discoverAll([src('recommend', [], ['all 12 Semantic Scholar seeds failed (x: HTTP 429)'])]);
+    const quiet = await discoverAll([src('recommend', [])]);
+    expect(broken.candidates).toEqual([]);
+    expect(quiet.candidates).toEqual([]);
+    // Same candidate count, and the ONLY thing that tells them apart is the
+    // error list. This is the assertion the whole plan exists for.
+    expect(broken.errors).toHaveLength(1);
+    expect(quiet.errors).toEqual([]);
   });
 });

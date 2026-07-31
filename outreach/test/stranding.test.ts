@@ -31,7 +31,10 @@ const cand = (arxivId: string, title = 'Olfactory Embedding Space Sensors'): Can
   sourceDetail: 'query: olfactory embedding space',
 });
 
-const source = (cs: Candidate[]): DiscoverySource => ({ name: 'saved_query', fetch: async () => cs });
+const source = (cs: Candidate[]): DiscoverySource => ({
+  name: 'saved_query',
+  fetch: async () => ({ candidates: cs, errors: [] }),
+});
 
 const groundedDraft: Draft = { subject: 'a subject', body: 'a body', grounded: true, wordCount: 2, notes: [] };
 const draftInput: DraftInput = {
