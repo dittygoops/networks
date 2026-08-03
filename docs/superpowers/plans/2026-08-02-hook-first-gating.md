@@ -897,6 +897,14 @@ git commit -m "Prove paid calls happen only after the hook gate"
 
 **Files:** none (measurement only)
 
+> **The Tavily usage endpoint is NOT real-time.** Measured 2026-08-02: a live
+> `POST /search` that returned real results left `account.plan_usage` unchanged
+> at 255 for at least five minutes. A before/after read around a single run
+> therefore proves nothing, and reporting a delta from it would be reporting a
+> number that does not mean what it looks like. Use the DB exit-path
+> measurement in Step 4 as the primary evidence, and treat the credit delta as
+> a next-day confirmation.
+
 - [ ] **Step 1: Record the starting usage**
 
 ```bash
