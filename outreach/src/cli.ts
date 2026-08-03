@@ -278,6 +278,11 @@ async function main(): Promise<void> {
   const r = await processPaper(
     { db, search: tavily, fetcher: tavily, llm: createOpenRouterClient() },
     arg,
+    // One deliberate human invocation, not a 184-paper batch: look up the
+    // address even when the author does not resolve or does not hook,
+    // because printing "not found" for a lookup that never ran would be a
+    // false report.
+    { alwaysExtractContact: true },
   );
 
   console.log(`\n=== ${r.target}  (arXiv ${r.arxivId}) ===`);
@@ -293,7 +298,9 @@ async function main(): Promise<void> {
   if (r.notes.length) console.log(`notes:    ${r.notes.join('; ')}`);
 
   // DR6: draft the email if the person resolved and we have at least one hook.
-  if (r.resolved && r.hooks.length > 0 && r.personId != null) {
+  // Matches the loop's gate (loop.ts): a weak hook or a suspected identity
+  // collision must not produce a draft here either.
+  if (r.resolved && r.personId != null && !r.noStrongHook && r.hooks.length > 0 && !r.identityCollisionReason) {
     const self = factRows(db, null);
     const intent = self.find((f) => f.facet === 'interest' && f.key === 'writing')?.value
       ?? 'connect and get direction on future olfaction / smell research';
