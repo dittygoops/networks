@@ -365,13 +365,18 @@ async function processCandidate(
       summary.unsendable++;
       return;
     }
-    if (!result.email) {
-      setStatus(deps.db, c.arxivId, 'drafted_unsendable', 'no email resolved');
+    if (result.noStrongHook || result.hooks.length === 0) {
+      setStatus(deps.db, c.arxivId, 'drafted_unsendable', 'no grounded hook');
       summary.unsendable++;
       return;
     }
-    if (result.noStrongHook || result.hooks.length === 0) {
-      setStatus(deps.db, c.arxivId, 'drafted_unsendable', 'no grounded hook');
+    // Checked AFTER the hook gate. Hook-first gating means contact extraction
+    // does not run for a hookless candidate, so `email: null` there means "not
+    // attempted", not "looked and failed". Checking email first would relabel
+    // every no-hook paper 'no email resolved' and make the hook gate
+    // unobservable in seen_papers.
+    if (!result.email) {
+      setStatus(deps.db, c.arxivId, 'drafted_unsendable', 'no email resolved');
       summary.unsendable++;
       return;
     }

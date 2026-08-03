@@ -93,6 +93,24 @@ describe('runLoop discovery', () => {
     expect(row.reason).toContain('email');
   });
 
+  it('reports the hook failure, not the email failure, when a candidate has neither', async () => {
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'Someone' });
+    // After hook-first gating, contact extraction never runs for a hookless
+    // candidate, so email is null for a reason that is NOT "we looked and
+    // failed". The hook gate must win, or the no-grounded-hook bucket
+    // silently becomes unobservable.
+    const neither = { ...resolvedResult('2601.00009', pid), email: null, hooks: [], noStrongHook: true };
+    const { deps } = baseDeps(db, {
+      sources: [source([cand('2601.00009', 'Olfactory Embedding Space Sensors')])],
+      processPaper: vi.fn().mockResolvedValue(neither),
+    });
+    const summary = await runLoop(deps, { dryRun: false });
+    expect(summary.unsendable).toBe(1);
+    const row = db.prepare('SELECT reason FROM seen_papers WHERE arxiv_id = ?').get('2601.00009') as { reason: string };
+    expect(row.reason).toBe('no grounded hook');
+  });
+
   it('marks a flagged identity collision unsendable and never messages it', async () => {
     const db = openDb(':memory:');
     const pid = upsertPerson(db, { name: 'Wenwen Zhang' });
