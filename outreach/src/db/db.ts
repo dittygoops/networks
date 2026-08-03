@@ -92,6 +92,8 @@ export interface PersonRow {
   openalex_id: string | null;
   affiliation: string | null;
   email: string | null;
+  email_confidence: number | null;
+  email_source: string | null;
   profile_summary: string | null;
 }
 
@@ -118,9 +120,9 @@ export function upsertPerson(db: DB, p: PersonInput): number {
 }
 
 export function getPerson(db: DB, id: number): PersonRow | undefined {
-  return db.prepare('SELECT id, name, openalex_id, affiliation, email, profile_summary FROM people WHERE id = ?').get(id) as
-    | PersonRow
-    | undefined;
+  return db
+    .prepare('SELECT id, name, openalex_id, affiliation, email, email_confidence, email_source, profile_summary FROM people WHERE id = ?')
+    .get(id) as PersonRow | undefined;
 }
 
 // D11 accumulate strategy: facts persist across mines. A fact re-seen refreshes

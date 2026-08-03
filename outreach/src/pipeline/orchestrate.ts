@@ -9,10 +9,10 @@ import {
   type OpenAlexAuthorRaw,
 } from '../openalex/client.js';
 import { resolveAuthor, minePersonFree, minePersonWeb, detectIdentityCollision, extractPaperFacts } from './research.js';
-import { extractContact, type PageFetcher, type SearchClient, type SelectedEmail } from './contacts.js';
+import { extractContact, type PageFetcher, type SearchClient, type SelectedEmail, type EmailSource } from './contacts.js';
 import { persistPerson } from './persist.js';
 import { computeIntersections, type Intersection } from './intersect.js';
-import { getFacts, saveFacts, upsertPerson, clearIntersections, type DB } from '../db/db.js';
+import { getFacts, saveFacts, upsertPerson, getPerson, clearIntersections, type DB } from '../db/db.js';
 import type { LLMClient } from '../llm/client.js';
 import { extractPdfText } from './pdf.js';
 import type { ArxivPaper } from './arxiv.js';
@@ -138,6 +138,21 @@ export async function processPaper(
   // back to its initial-assignment type at read sites in the outer scope,
   // which would make `if (email)` below report `email` as `never`.
   const runContactExtraction = async (aff: string | undefined): Promise<SelectedEmail | null> => {
+    // A repeat author already has an address on record; re-paying Tavily to
+    // rediscover it is pure waste. Read the ORIGINAL source/confidence back
+    // off the person row rather than inventing a new 'on_record' value:
+    // EmailSource is a closed union keyed 1:1 by SOURCE_CONFIDENCE's
+    // exhaustive Record (contacts.ts), so widening it would force a
+    // meaningless confidence entry for a value scoreCandidate never sees, and
+    // the address really did come from a homepage or a PDF originally, so
+    // reporting that is more truthful anyway. This shortcut re-enters the
+    // upsertPerson call below with the same values it read, which is a no-op.
+    if (personId != null) {
+      const known = getPerson(deps.db, personId);
+      if (known?.email) {
+        return { email: known.email, confidence: known.email_confidence ?? 1, source: (known.email_source as EmailSource | null) ?? 'directory' };
+      }
+    }
     const paperText = deps.getPaperText ? await deps.getPaperText(arxivId) : await defaultPaperText(arxivId, fetchFn);
     return extractContact({ search: deps.search, fetcher: deps.fetcher }, { name: target.name }, paperText, {
       paperContext: ctx,

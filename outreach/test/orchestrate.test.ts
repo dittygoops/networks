@@ -142,6 +142,41 @@ describe('processPaper (orchestrator)', () => {
     expect(r.resolved).toBe(false);
     expect(r.notes.join(' ')).toContain('identity unconfirmed');
   });
+
+  test('a person whose email is already on record does not pay for another lookup', async () => {
+    // Default deps() supplies a fresh, corresponding-marker PDF text, which
+    // short-circuits tier-1 and never reaches the web tier at all -- that
+    // would make this test pass for the wrong reason (tier-1 always skips
+    // search, guard or no guard). Force tier-1 to miss so the FIRST call
+    // genuinely pays for a web contact lookup, then prove the SECOND call
+    // (same author, already on record) skips it.
+    //
+    // A bare call counter on `search` would also catch minePersonWeb's
+    // unrelated personal-facts mining, which runs on every hook-passing
+    // paper regardless of this guard (Task 7 only touches contact
+    // extraction). Its queries never contain "email" or "github" (see
+    // research.ts's minePersonalFacts), so filtering on those substrings
+    // isolates extractWebContacts's own queries.
+    const homepage = 'https://tuwien.at/~kerbl/';
+    const queries: string[] = [];
+    const search = vi.fn(async (q: string) => {
+      queries.push(q);
+      return [{ url: homepage, title: 'Bernhard Kerbl', content: '' }];
+    });
+    const fetcher = vi.fn(async (urls: string[]) =>
+      urls.map((url) => ({ url, title: '', content: url === homepage ? 'contact: bernhard.kerbl@tuwien.ac.at' : '' })),
+    );
+    const d = deps({ search: { search }, fetcher: { fetch: fetcher }, getPaperText: async () => 'no emails here' });
+    saveSelfFacts(d.db, [{ facet: 'academic', key: 'method', value: '3D Gaussian Splatting', sourceUrl: 'self', confidence: 0.9, tier: 'A' } as OntologyFact]);
+
+    const first = await processPaper(d, ARXIV_ID); // first paper: pays for a web contact lookup
+    expect(first.email?.email).toBe('bernhard.kerbl@tuwien.ac.at');
+    expect(queries.some((q) => q.includes('email') || q.includes('github'))).toBe(true);
+    queries.length = 0;
+
+    await processPaper(d, ARXIV_ID); // same author, next paper: email already on record
+    expect(queries.some((q) => q.includes('email') || q.includes('github'))).toBe(false);
+  });
 });
 
 describe('arxivAgeMonths', () => {
