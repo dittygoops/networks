@@ -70,19 +70,19 @@ export async function processPaper(deps: OrchestrateDeps, arxivId: string): Prom
   const target = selectTargetAuthor(paper);
   const ctx = buildPaperContext(paper, target);
 
-  // Resolve identity via OpenAlex; degrade to paper context on any failure.
-  let resolution = null as Awaited<ReturnType<typeof resolveAuthor>>;
+  // Resolve identity via OpenAlex. A transport failure (429, DNS, parse) is
+  // NOT the same as "this author does not exist": under hook-first gating the
+  // unresolved verdict is terminal and nothing ever revisits it, so an outage
+  // must surface as a retryable error rather than silently discarding the
+  // candidate. Only a well-formed empty/no-match result degrades.
+  let resolution: Awaited<ReturnType<typeof resolveAuthor>> = null;
   let raw: OpenAlexAuthorRaw | undefined;
   let currentAff: string | undefined;
-  try {
-    const fetched = await fetchAuthorCandidates(target.name, { fetchFn });
-    resolution = resolveAuthor(fetched.map((f) => f.candidate), target.name, ctx);
-    if (resolution) {
-      raw = fetched.find((f) => f.candidate.id === resolution!.author.id)?.raw;
-      if (raw) currentAff = currentAffiliation(raw) ?? undefined;
-    }
-  } catch {
-    notes.push('OpenAlex resolution failed; degraded to paper affiliation');
+  const fetched = await fetchAuthorCandidates(target.name, { fetchFn });
+  resolution = resolveAuthor(fetched.map((f) => f.candidate), target.name, ctx);
+  if (resolution) {
+    raw = fetched.find((f) => f.candidate.id === resolution!.author.id)?.raw;
+    if (raw) currentAff = currentAffiliation(raw) ?? undefined;
   }
   if (!resolution) notes.push('identity unconfirmed (UNRESOLVED)');
 

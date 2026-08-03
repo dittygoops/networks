@@ -110,6 +110,32 @@ describe('processPaper (orchestrator)', () => {
     // at drafted_unsendable with nothing captured and nothing retryable.
     await expect(processPaper(d, ARXIV_ID)).rejects.toBeInstanceOf(SelfOntologyMissingError);
   });
+
+  test('an OpenAlex transport failure is retryable, not a terminal identity verdict', async () => {
+    const inner = routerFetch();
+    const boom = (async (url: URL | string) => {
+      if (String(url).includes('/authors')) throw new Error('429 Too Many Requests');
+      return inner(url as never);
+    }) as unknown as typeof fetch;
+    const d = deps({ fetchFn: boom });
+    saveSelfFacts(d.db, [{ facet: 'academic', key: 'method', value: '3D Gaussian Splatting', sourceUrl: 'self', confidence: 0.9, tier: 'A' } as OntologyFact]);
+    // Degrading here would write drafted_unsendable/'identity unconfirmed',
+    // which nothing ever revisits, so an outage would silently discard the day.
+    await expect(processPaper(d, ARXIV_ID)).rejects.toThrow(/429/);
+  });
+
+  test('a genuine no-match still degrades quietly to unresolved', async () => {
+    const inner = routerFetch();
+    const empty = (async (url: URL | string) => {
+      if (String(url).includes('/authors')) return resp({ json: { results: [] } });
+      return inner(url as never);
+    }) as unknown as typeof fetch;
+    const d = deps({ fetchFn: empty });
+    saveSelfFacts(d.db, [{ facet: 'academic', key: 'method', value: '3D Gaussian Splatting', sourceUrl: 'self', confidence: 0.9, tier: 'A' } as OntologyFact]);
+    const r = await processPaper(d, ARXIV_ID);
+    expect(r.resolved).toBe(false);
+    expect(r.notes.join(' ')).toContain('identity unconfirmed');
+  });
 });
 
 describe('arxivAgeMonths', () => {
