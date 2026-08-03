@@ -8,13 +8,14 @@ import {
   type FetchFn,
   type OpenAlexAuthorRaw,
 } from '../openalex/client.js';
-import { resolveAuthor, minePerson, detectIdentityCollision, extractPaperFacts } from './research.js';
+import { resolveAuthor, minePersonFree, minePersonWeb, detectIdentityCollision, extractPaperFacts } from './research.js';
 import { extractContact, type PageFetcher, type SearchClient, type SelectedEmail } from './contacts.js';
 import { persistPerson } from './persist.js';
 import { computeIntersections, type Intersection } from './intersect.js';
-import { getFacts, saveFacts, upsertPerson, type DB } from '../db/db.js';
+import { getFacts, saveFacts, upsertPerson, clearIntersections, type DB } from '../db/db.js';
 import type { LLMClient } from '../llm/client.js';
 import { extractPdfText } from './pdf.js';
+import type { ArxivPaper } from './arxiv.js';
 
 export interface OrchestrateDeps {
   db: DB;
@@ -62,7 +63,60 @@ async function defaultPaperText(arxivId: string, fetchFn: FetchFn): Promise<stri
   }
 }
 
-export async function processPaper(deps: OrchestrateDeps, arxivId: string): Promise<OrchestrateResult> {
+// Let the discovered paper itself contribute facts about its author (see
+// research.ts extractPaperFacts), so a genuinely on-topic paper can still
+// seed a hook when the mined profile is too coarse (e.g. bare OpenAlex
+// concepts) to match. Persist BEFORE computeIntersections so the existing
+// engine picks these up with no change to its core logic. Never let a
+// paper-derived fact (always tier B) overwrite an existing (facet, key,
+// value) row: saveFacts upserts on that triple, so a paper fact that
+// happened to collide with an already-persisted tier-A profile fact would
+// silently downgrade it. Filter those out first. Returns the count of newly
+// saved facts.
+async function addPaperFacts(
+  deps: OrchestrateDeps,
+  personId: number,
+  paper: ArxivPaper,
+  authorName: string,
+): Promise<number> {
+  try {
+    const paperFacts = await extractPaperFacts(deps.llm, {
+      arxivId: paper.arxivId,
+      title: paper.title,
+      abstract: paper.abstract,
+      authorName,
+    });
+    if (paperFacts.length > 0) {
+      const existingKeys = new Set(
+        getFacts(deps.db, personId).map((f) => `${f.facet}|${f.key}|${f.value.trim().toLowerCase()}`),
+      );
+      const newPaperFacts = paperFacts.filter(
+        (f) => !existingKeys.has(`${f.facet}|${f.key}|${f.value.trim().toLowerCase()}`),
+      );
+      if (newPaperFacts.length > 0) {
+        saveFacts(deps.db, personId, newPaperFacts);
+        return newPaperFacts.length;
+      }
+    }
+  } catch {
+    // Paper-fact extraction is best-effort; a failure here must not block
+    // intersections from running on the profile facts already persisted.
+  }
+  return 0;
+}
+
+export interface ProcessPaperOptions {
+  // `outreach add` is one deliberate human invocation, not a 184-paper batch,
+  // so its contact lookup is worth the credits even when the author does not
+  // resolve or does not hook. The loop never sets this.
+  alwaysExtractContact?: boolean;
+}
+
+export async function processPaper(
+  deps: OrchestrateDeps,
+  arxivId: string,
+  opts: ProcessPaperOptions = {},
+): Promise<OrchestrateResult> {
   const fetchFn = deps.fetchFn ?? fetch;
   const notes: string[] = [];
 
@@ -70,110 +124,41 @@ export async function processPaper(deps: OrchestrateDeps, arxivId: string): Prom
   const target = selectTargetAuthor(paper);
   const ctx = buildPaperContext(paper, target);
 
-  // Resolve identity via OpenAlex. A transport failure (429, DNS, parse) is
-  // NOT the same as "this author does not exist": under hook-first gating the
-  // unresolved verdict is terminal and nothing ever revisits it, so an outage
-  // must surface as a retryable error rather than silently discarding the
-  // candidate. Only a well-formed empty/no-match result degrades.
-  let resolution: Awaited<ReturnType<typeof resolveAuthor>> = null;
-  let raw: OpenAlexAuthorRaw | undefined;
-  let currentAff: string | undefined;
-  const fetched = await fetchAuthorCandidates(target.name, { fetchFn });
-  resolution = resolveAuthor(fetched.map((f) => f.candidate), target.name, ctx);
-  if (resolution) {
-    raw = fetched.find((f) => f.candidate.id === resolution!.author.id)?.raw;
-    if (raw) currentAff = currentAffiliation(raw) ?? undefined;
-  }
-  if (!resolution) notes.push('identity unconfirmed (UNRESOLVED)');
-
-  // Contact extraction (tier-1 PDF + web tiers).
-  const paperText = deps.getPaperText ? await deps.getPaperText(arxivId) : await defaultPaperText(arxivId, fetchFn);
-  const email = await extractContact({ search: deps.search, fetcher: deps.fetcher }, { name: target.name }, paperText, {
-    paperContext: ctx,
-    currentAffiliation: currentAff,
-    paperAgeMonths: arxivAgeMonths(arxivId),
-  });
-
   let personId: number | null = null;
   let factCount = 0;
   let hooks: Intersection[] = [];
   let noStrongHook = true;
   let profileSummary: string | undefined;
   let identityCollisionReason: string | undefined;
+  let email: SelectedEmail | null = null;
 
-  if (resolution && raw) {
-    resolution.author.homepageUrls = await fetchIdentityAnchors(raw, { fetchFn }).catch(() => []);
-    const mineResult = await minePerson({ search: deps.search, fetcher: deps.fetcher, llm: deps.llm }, resolution, raw);
-    personId = persistPerson(deps.db, resolution, raw, mineResult);
-    factCount = mineResult.facts.length;
-    profileSummary = mineResult.profileSummary;
-    const collision = detectIdentityCollision(mineResult.facts);
-    if (collision.suspected) {
-      identityCollisionReason = collision.reason;
-      notes.push(collision.reason!);
-    }
-
-    // Let the discovered paper itself contribute facts about its author (see
-    // research.ts extractPaperFacts), so a genuinely on-topic paper can still
-    // seed a hook when the mined profile is too coarse (e.g. bare OpenAlex
-    // concepts) to match. Persist BEFORE computeIntersections so the existing
-    // engine picks these up with no change to its core logic. Never let a
-    // paper-derived fact (always tier B) overwrite an existing (facet, key,
-    // value) row: saveFacts upserts on that triple, so a paper fact that
-    // happened to collide with an already-persisted tier-A profile fact would
-    // silently downgrade it. Filter those out first.
-    try {
-      const paperFacts = await extractPaperFacts(deps.llm, {
-        arxivId: paper.arxivId,
-        title: paper.title,
-        abstract: paper.abstract,
-        authorName: target.name,
-      });
-      if (paperFacts.length > 0) {
-        const existingKeys = new Set(
-          getFacts(deps.db, personId).map((f) => `${f.facet}|${f.key}|${f.value.trim().toLowerCase()}`),
-        );
-        const newPaperFacts = paperFacts.filter(
-          (f) => !existingKeys.has(`${f.facet}|${f.key}|${f.value.trim().toLowerCase()}`),
-        );
-        if (newPaperFacts.length > 0) {
-          saveFacts(deps.db, personId, newPaperFacts);
-          factCount += newPaperFacts.length;
-        }
-      }
-    } catch {
-      // Paper-fact extraction is best-effort; a failure here must not block
-      // intersections from running on the profile facts already persisted.
-    }
-
-    if (email) {
-      upsertPerson(deps.db, {
-        name: target.name,
-        openalexId: resolution.author.id,
-        email: email.email,
-        emailConfidence: email.confidence,
-        emailSource: email.source,
-      });
-    }
-    // Deliberately NOT caught. An empty self ontology yields hooks: [], which
-    // the hook gate cannot distinguish from a genuinely uninteresting person,
-    // so swallowing it would terminate every paper in the run with nothing
-    // captured and nothing retryable. Let it reach processCandidate's catch
-    // (loop.ts), which records a retryable error.
-    const r = await computeIntersections(deps.db, { llm: deps.llm }, personId);
-    hooks = r.ranked;
-    noStrongHook = r.noStrongHook;
-  } else if (email) {
-    personId = upsertPerson(deps.db, {
-      name: target.name,
-      email: email.email,
-      emailConfidence: email.confidence,
-      emailSource: email.source,
+  // Contact extraction, factored out so the exits below can reuse it. Returns
+  // (rather than assigns to the outer `email` via closure) because TypeScript
+  // narrows a `let`-bound variable reassigned only inside a nested closure
+  // back to its initial-assignment type at read sites in the outer scope,
+  // which would make `if (email)` below report `email` as `never`.
+  const runContactExtraction = async (aff: string | undefined): Promise<SelectedEmail | null> => {
+    const paperText = deps.getPaperText ? await deps.getPaperText(arxivId) : await defaultPaperText(arxivId, fetchFn);
+    return extractContact({ search: deps.search, fetcher: deps.fetcher }, { name: target.name }, paperText, {
+      paperContext: ctx,
+      currentAffiliation: aff,
+      paperAgeMonths: arxivAgeMonths(arxivId),
     });
-    notes.push('persisted contact only (identity unconfirmed, no ontology)');
-  }
+  };
 
-  return {
+  // --- Step 2: identity (free). Resolve BEFORE result() is defined below, so
+  // the closure never reads `resolution`/`raw` ahead of their declaration. A
+  // transport failure (429, DNS, parse) is NOT the same as "this author does
+  // not exist": under hook-first gating the unresolved verdict is terminal
+  // and nothing ever revisits it (see Task 5), so an outage must surface as a
+  // retryable error rather than silently discarding the candidate. Only a
+  // well-formed empty/no-match result degrades.
+  const fetched = await fetchAuthorCandidates(target.name, { fetchFn });
+  const resolution = resolveAuthor(fetched.map((f) => f.candidate), target.name, ctx);
+  const raw = resolution ? fetched.find((f) => f.candidate.id === resolution.author.id)?.raw : undefined;
+  const currentAff = raw ? currentAffiliation(raw) ?? undefined : undefined;
+
+  const result = (): OrchestrateResult => ({
     arxivId: paper.arxivId,
     target: target.name,
     paperTitle: paper.title,
@@ -186,5 +171,75 @@ export async function processPaper(deps: OrchestrateDeps, arxivId: string): Prom
     noStrongHook,
     notes,
     identityCollisionReason,
-  };
+  });
+
+  if (!resolution || !raw) {
+    notes.push('identity unconfirmed (UNRESOLVED)');
+    if (opts.alwaysExtractContact) email = await runContactExtraction(currentAff);
+    return result();
+  }
+
+  // --- Step 3: free facts + collision gate ---
+  resolution.author.homepageUrls = await fetchIdentityAnchors(raw, { fetchFn }).catch(() => []);
+  const free = await minePersonFree({ llm: deps.llm }, resolution, raw);
+  personId = persistPerson(deps.db, resolution, raw, free);
+  factCount = free.facts.length;
+  profileSummary = free.profileSummary;
+
+  // Deliberately runs on the OpenAlex facts ONLY, exactly as before. Feeding
+  // it paper facts would change verdicts (arXiv-sourced academic/collaborator
+  // rows exist) and is out of scope.
+  const collision = detectIdentityCollision(free.facts);
+  if (collision.suspected) {
+    identityCollisionReason = collision.reason;
+    notes.push(collision.reason!);
+    // A person flagged on this run must not keep hook rows from an earlier
+    // run when they were not flagged: nothing else will clear them, because
+    // saveIntersections' DELETE+INSERT no longer runs for them.
+    clearIntersections(deps.db, personId);
+    if (opts.alwaysExtractContact) email = await runContactExtraction(currentAff);
+    return result();
+  }
+
+  // --- Step 4: paper facts + hook gate (still free of Tavily) ---
+  factCount += await addPaperFacts(deps, personId, paper, target.name);
+  // Deliberately NOT caught. An empty self ontology yields hooks: [], which
+  // the hook gate cannot distinguish from a genuinely uninteresting person,
+  // so swallowing it would terminate every paper in the run with nothing
+  // captured and nothing retryable. Let it reach processCandidate's catch
+  // (loop.ts), which records a retryable error.
+  ({ ranked: hooks, noStrongHook } = await computeIntersections(deps.db, { llm: deps.llm }, personId));
+
+  if (noStrongHook || hooks.length === 0) {
+    if (opts.alwaysExtractContact) email = await runContactExtraction(currentAff);
+    return result(); // zero paid calls on the loop path
+  }
+
+  // --- Step 5: paid enrichment, survivors only ---
+  const enriched = await minePersonWeb(
+    { search: deps.search, fetcher: deps.fetcher, llm: deps.llm },
+    resolution,
+    raw,
+    free.facts,
+  );
+  persistPerson(deps.db, resolution, raw, enriched);
+  factCount = enriched.facts.length;
+  profileSummary = enriched.profileSummary;
+  // Recompute so a web-mined fact can become the lead hook. Measured case:
+  // person 58's top hook (tier A, 0.9, 'olfaction') came from a CSHL page and
+  // outranked their best arXiv hook.
+  ({ ranked: hooks, noStrongHook } = await computeIntersections(deps.db, { llm: deps.llm }, personId));
+
+  // --- Step 6: contact, survivors only ---
+  email = await runContactExtraction(currentAff);
+  if (email) {
+    upsertPerson(deps.db, {
+      name: target.name,
+      openalexId: resolution.author.id,
+      email: email.email,
+      emailConfidence: email.confidence,
+      emailSource: email.source,
+    });
+  }
+  return result();
 }

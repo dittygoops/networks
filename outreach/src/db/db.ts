@@ -229,3 +229,10 @@ export function saveIntersections(db: DB, personId: number, rows: IntersectionRo
   });
   tx(rows);
 }
+
+// Used when a person is flagged as an identity collision after previously
+// producing hooks: saveIntersections' DELETE+INSERT will not run for them
+// again, so the stale rows would survive forever.
+export function clearIntersections(db: DB, personId: number): void {
+  db.prepare('DELETE FROM intersections WHERE person_id = ?').run(personId);
+}

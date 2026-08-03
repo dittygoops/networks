@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import { processPaper, arxivAgeMonths, type OrchestrateDeps } from '../src/pipeline/orchestrate.js';
 import { openDb, saveSelfFacts } from '../src/db/db.js';
 import { EXTRACT_SYSTEM, INTERSECT_SYSTEM } from '../src/llm/prompts.js';
@@ -83,7 +83,7 @@ describe('processPaper (orchestrator)', () => {
     expect(row).toMatchObject({ email: 'bernhard.kerbl@tuwien.ac.at', openalex_id: 'A1' });
   });
 
-  test('degrades when the author cannot be resolved: contact only, no ontology', async () => {
+  test('an unresolved author costs nothing: no contact lookup, no PDF fetch, no person row', async () => {
     // OpenAlex returns a different person -> no name/coauthor match -> UNRESOLVED.
     const noMatch = (): typeof fetch =>
       (async (url: URL | string) => {
@@ -93,14 +93,20 @@ describe('processPaper (orchestrator)', () => {
         if (u.includes('/works')) return resp({ json: { results: [] } });
         return resp({ json: {} });
       }) as unknown as typeof fetch;
-    const d = deps({ fetchFn: noMatch() });
+    const search = vi.fn(async () => []);
+    const fetcher = vi.fn(async () => []);
+    const getPaperText = vi.fn(async () => 'Corresponding author: bernhard.kerbl@tuwien.ac.at');
+    const d = deps({ fetchFn: noMatch(), search: { search }, fetcher: { fetch: fetcher }, getPaperText });
 
     const r = await processPaper(d, ARXIV_ID);
 
     expect(r.resolved).toBe(false);
-    expect(r.email?.email).toBe('bernhard.kerbl@tuwien.ac.at'); // still found from the paper
-    expect(r.factCount).toBe(0);
-    expect(r.notes.join(' ')).toContain('identity unconfirmed');
+    expect(r.email).toBeNull();
+    expect(r.personId).toBeNull();
+    expect(search).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(getPaperText).not.toHaveBeenCalled(); // the PDF fetch moves too
+    expect(d.db.prepare('SELECT COUNT(*) n FROM people').get()).toEqual({ n: 0 });
   });
 
   test('a missing self ontology is a run error, not a silent no-hook verdict', async () => {
