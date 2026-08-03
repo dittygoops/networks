@@ -15,7 +15,10 @@ export function persistPerson(
     openalexId: resolution.author.id,
     affiliation: currentAffiliation(raw),
     homepageUrl: resolution.author.homepageUrls?.[0] ?? null,
-    profileSummary: mineResult.profileSummary,
+    // '' is what minePerson returns when the summary LLM call throws, and
+    // coalesce('', profile_summary) is '', so passing it through would erase a
+    // good stored summary on every failed re-mine.
+    profileSummary: mineResult.profileSummary || null,
   });
   saveFacts(db, id, mineResult.facts);
   return id;
