@@ -49,4 +49,15 @@ describe('persistPerson (D11)', () => {
     expect(getPerson(db, id2)?.profile_summary).toBe('v2');
     expect(getFacts(db, id2)).toHaveLength(2); // original (deduped) + the new institution fact
   });
+
+  test('an empty summary from a failed LLM call does not overwrite a stored one', () => {
+    const db = openDb(':memory:');
+    // Reuses this file's own `resolution`/`raw` fixtures (already minimal and
+    // correctly typed) rather than the plan's `as unknown as AuthorResolution`
+    // casts, since they already satisfy what persistPerson needs.
+    const id = persistPerson(db, resolution, raw, { facts: [] as OntologyFact[], profileSummary: 'A good summary.' });
+    // Second mine: the summary LLM call threw, so minePerson returned ''.
+    persistPerson(db, resolution, raw, { facts: [] as OntologyFact[], profileSummary: '' });
+    expect(getPerson(db, id)?.profile_summary).toBe('A good summary.');
+  });
 });
