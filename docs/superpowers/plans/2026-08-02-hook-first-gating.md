@@ -14,7 +14,9 @@
 - **Never delete `pageIsAboutPerson`, `buildDomainGate`, `urlSlugMatchesPerson`, `personNameInText`, `anchorAdmitsUrl`, `safeClassify`, or `extractFactsFromPage`.** An earlier spec draft proposed it and was wrong. `scripts/purge-contaminated-facts.ts:45,75,76` imports two of them, and `tsconfig.json` includes only `src/**` and `test/**`, so `npm run typecheck` will NOT catch breaking that script.
 - **Never delete `test/mine-person.test.ts` or `test/page-identity.test.ts`.** They encode four production incidents.
 - **`better-sqlite3` is synchronous.** No `await` on db calls.
-- **Baseline before starting: 46 files, 510 tests passing.** Run `npx vitest run --reporter=dot` to confirm before Task 1.
+- **Baseline: 46 files, 510 tests passing** on `main`. Confirm with `npx vitest run --reporter=dot` before starting.
+- **If you are working in a git worktree, `git merge main` FIRST and re-measure.** Wave 1's worktrees were created from `204e3ee`, one commit behind `20e42c7` (the email-extraction fix), so they measured a 498-test baseline and ran without the 12 tests in `name-match.test.ts` and `web-extraction.test.ts`. A wrong baseline is survivable; missing a dependency task is not. Tasks 6-9 in particular REQUIRE Tasks 3, 4, and 5 to be present in your tree.
+- `test/page-identity.test.ts` has **18** tests (an earlier draft of this plan said 17).
 - **A regression test that cannot fail is worthless.** Every task's "verify it fails" step is mandatory; if the test passes before the implementation, the test is wrong.
 - **Run the full suite before each commit**, not just the new test: `npx vitest run --reporter=dot 2>&1 | tail -5`.
 - **Commit after every task.** No batching.
