@@ -2,6 +2,7 @@ import { describe, expect, test } from 'vitest';
 import { processPaper, arxivAgeMonths, type OrchestrateDeps } from '../src/pipeline/orchestrate.js';
 import { openDb, saveSelfFacts } from '../src/db/db.js';
 import { EXTRACT_SYSTEM, INTERSECT_SYSTEM } from '../src/llm/prompts.js';
+import { SelfOntologyMissingError } from '../src/pipeline/intersect.js';
 import type { LLMClient } from '../src/llm/client.js';
 import type { OntologyFact } from '../src/pipeline/research.js';
 
@@ -102,12 +103,12 @@ describe('processPaper (orchestrator)', () => {
     expect(r.notes.join(' ')).toContain('identity unconfirmed');
   });
 
-  test('does not crash when no self ontology is seeded (skips intersections)', async () => {
-    const d = deps(); // db has no self facts
-    const r = await processPaper(d, ARXIV_ID);
-    expect(r.resolved).toBe(true);
-    expect(r.hooks).toHaveLength(0);
-    expect(r.notes.join(' ')).toContain('no self ontology');
+  test('a missing self ontology is a run error, not a silent no-hook verdict', async () => {
+    const d = deps(); // no saveSelfFacts call: the self ontology is empty
+    // Silently returning hooks: [] here would be read by the hook gate as
+    // "this person is not interesting", terminating every paper in the run
+    // at drafted_unsendable with nothing captured and nothing retryable.
+    await expect(processPaper(d, ARXIV_ID)).rejects.toBeInstanceOf(SelfOntologyMissingError);
   });
 });
 

@@ -11,7 +11,7 @@ import {
 import { resolveAuthor, minePerson, detectIdentityCollision, extractPaperFacts } from './research.js';
 import { extractContact, type PageFetcher, type SearchClient, type SelectedEmail } from './contacts.js';
 import { persistPerson } from './persist.js';
-import { computeIntersections, SelfOntologyMissingError, type Intersection } from './intersect.js';
+import { computeIntersections, type Intersection } from './intersect.js';
 import { getFacts, saveFacts, upsertPerson, type DB } from '../db/db.js';
 import type { LLMClient } from '../llm/client.js';
 import { extractPdfText } from './pdf.js';
@@ -155,14 +155,14 @@ export async function processPaper(deps: OrchestrateDeps, arxivId: string): Prom
         emailSource: email.source,
       });
     }
-    try {
-      const r = await computeIntersections(deps.db, { llm: deps.llm }, personId);
-      hooks = r.ranked;
-      noStrongHook = r.noStrongHook;
-    } catch (e) {
-      if (e instanceof SelfOntologyMissingError) notes.push('no self ontology seeded; skipped intersections');
-      else throw e;
-    }
+    // Deliberately NOT caught. An empty self ontology yields hooks: [], which
+    // the hook gate cannot distinguish from a genuinely uninteresting person,
+    // so swallowing it would terminate every paper in the run with nothing
+    // captured and nothing retryable. Let it reach processCandidate's catch
+    // (loop.ts), which records a retryable error.
+    const r = await computeIntersections(deps.db, { llm: deps.llm }, personId);
+    hooks = r.ranked;
+    noStrongHook = r.noStrongHook;
   } else if (email) {
     personId = upsertPerson(deps.db, {
       name: target.name,
