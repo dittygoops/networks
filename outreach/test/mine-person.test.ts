@@ -1,6 +1,8 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import {
   minePerson,
+  minePersonFree,
+  minePersonWeb,
   type AuthorResolution,
   type MineDeps,
   type OpenAlexCandidate,
@@ -271,5 +273,49 @@ describe('minePerson (D4/D5b/D6a)', () => {
     expect(calls.extract).toHaveLength(2); // original + one retry
     expect(facts.some((f) => f.sourceUrl === talk)).toBe(false);
     expect(profileSummary).toBe('A short profile.'); // run did not crash
+  });
+});
+
+describe('minePerson split halves', () => {
+  test('minePersonFree makes no Tavily call and still returns OpenAlex facts', async () => {
+    const { client } = makeLLM(() => '[]');
+    // minePersonFree's own signature is `deps: { llm }`, with no search/fetcher
+    // slot to hand it: it is structurally incapable of reaching Tavily. These
+    // spies stand in for "the caller's" search/fetcher, proving the surrounding
+    // test setup never had to wire them in for minePersonFree to work.
+    const search = vi.fn();
+    const fetcher = vi.fn();
+
+    const r = await minePersonFree({ llm: client }, resolution, raw);
+
+    expect(search).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(r.facts.length).toBeGreaterThan(0);
+    expect(r.facts.every((f) => f.sourceUrl.includes('openalex'))).toBe(true);
+  });
+
+  test('minePersonWeb returns the free facts plus the web facts, not only the new ones', async () => {
+    const { client: freeClient } = makeLLM(() => '[]');
+    const free = await minePersonFree({ llm: freeClient }, resolution, raw);
+
+    const blog = 'https://www.cg.tuwien.ac.at/blog/gaussian-splatting';
+    const { client: webClient } = makeLLM(() =>
+      JSON.stringify([
+        { facet: 'interest', key: 'writing', value: 'Writes about Gaussian splatting', confidence: 0.8, proposedTier: 'A' },
+      ]),
+    );
+    const webDeps = makeDeps({
+      llm: webClient,
+      searchResults: [{ url: blog, title: 'Bernhard Kerbl', content: '' }],
+      fetched: { [blog]: 'I love writing about Gaussian splatting.' },
+    });
+
+    const combined = await minePersonWeb(webDeps, resolution, raw, free.facts);
+
+    expect(combined.facts.length).toBeGreaterThanOrEqual(free.facts.length);
+    for (const f of free.facts) {
+      expect(combined.facts).toContainEqual(f);
+    }
+    expect(combined.facts.some((f) => f.sourceUrl === blog)).toBe(true);
   });
 });

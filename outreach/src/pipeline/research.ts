@@ -501,6 +501,49 @@ const domainLabel = (url: string): string | null => {
   }
 };
 
+// Best-effort: an LLM failure must not lose the mined facts. Returns '' on
+// failure; persistPerson converts that to NULL so it cannot erase a stored
+// summary.
+async function summarize(llm: LLMClient, name: string, facts: OntologyFact[]): Promise<string> {
+  try {
+    return (await llm.complete(SUMMARY_SYSTEM, buildSummaryUser(name, facts))).trim();
+  } catch {
+    return '';
+  }
+}
+
+// The free half: OpenAlex-derived facts only. Makes no Tavily call, so it is
+// safe to run before the hook gate on every candidate (see the hook-first
+// gating spec). Kept separate from minePersonWeb so paid mining can be
+// deferred until we know the person is worth emailing.
+export async function minePersonFree(
+  deps: { llm: LLMClient },
+  resolution: AuthorResolution,
+  raw: OpenAlexAuthorRaw,
+): Promise<{ facts: OntologyFact[]; profileSummary: string }> {
+  const facts = splitHobbyFacts(factsFromOpenAlex(resolution.author, raw));
+  return { facts, profileSummary: await summarize(deps.llm, resolution.author.displayName, facts) };
+}
+
+// The paid half: Tavily searches + extracts, domain-gated and tier-clamped.
+// Takes the free facts and RETURNS THE COMBINED SET (callers persist the
+// return value wholesale). A web failure degrades to the free facts.
+export async function minePersonWeb(
+  deps: MineDeps,
+  resolution: AuthorResolution,
+  raw: OpenAlexAuthorRaw,
+  freeFacts: OntologyFact[],
+): Promise<{ facts: OntologyFact[]; profileSummary: string }> {
+  const facts = [...freeFacts];
+  try {
+    await minePersonalFacts(deps, resolution.author, raw, facts);
+  } catch {
+    // Tavily/LLM failure: keep the free facts, skip personal facets.
+  }
+  const finalFacts = splitHobbyFacts(facts);
+  return { facts: finalFacts, profileSummary: await summarize(deps.llm, resolution.author.displayName, finalFacts) };
+}
+
 // D4: mine personal-facet facts for a resolved author. Combines the deterministic
 // OpenAlex facts with LLM-extracted, domain-gated, tier-clamped personal facts,
 // then writes a short profile summary. Returns data (no SQLite persistence yet).
@@ -509,29 +552,8 @@ export async function minePerson(
   resolution: AuthorResolution,
   raw: OpenAlexAuthorRaw,
 ): Promise<{ facts: OntologyFact[]; profileSummary: string }> {
-  const author = resolution.author;
-  const name = author.displayName;
-
-  // OpenAlex facts are computed first and unconditionally, so a failure in the
-  // web/LLM personal pass still yields a useful ontology.
-  const facts: OntologyFact[] = factsFromOpenAlex(author, raw);
-
-  try {
-    await minePersonalFacts(deps, author, raw, facts);
-  } catch {
-    // Tavily/LLM failure: keep the OpenAlex facts, skip personal facets.
-  }
-
-  const finalFacts = splitHobbyFacts(facts);
-
-  let profileSummary = '';
-  try {
-    profileSummary = (await deps.llm.complete(SUMMARY_SYSTEM, buildSummaryUser(name, finalFacts))).trim();
-  } catch {
-    // Summary is best-effort; an LLM failure must not lose the mined facts.
-  }
-
-  return { facts: finalFacts, profileSummary };
+  const free = await minePersonFree(deps, resolution, raw);
+  return minePersonWeb(deps, resolution, raw, free.facts);
 }
 
 // Split a hobby fact whose value is a list ("chess, hiking") into one fact per
