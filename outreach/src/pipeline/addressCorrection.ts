@@ -82,6 +82,34 @@ interface DraftRow {
   personEmailSource: string | null;
 }
 
+
+// Documentation placeholders. Measured on the live probe, twice: the owner
+// replied with the literal example from the instruction line
+// ("their@address.edu", then "their@address.org"). Pasting the example is the
+// obvious move when the example is a copy-pasteable address, so the placeholder
+// is the defect, not the human.
+//
+// Accepting one is worse than refusing a real address, because a correction
+// writes source 'user_provided' at confidence 1.0, which the on-record shortcut
+// in orchestrate.ts then returns forever and upsertPerson's coalesce can never
+// displace. A junk address would be frozen permanently and the draft would be
+// re-presented as a one-tap send.
+const PLACEHOLDER_LOCALS = new Set(['their', 'someone', 'somebody', 'name', 'test', 'user', 'you', 'a', 'b', 'x', 'foo', 'example', 'firstname', 'first.last', 'address']);
+// Deliberately narrow: the domains OUR OWN instruction text uses, plus the
+// RFC 2606 reserved example domains. Nothing else. An over-broad list would
+// refuse real addresses, and refusing a real one strands a real person, which
+// is the failure this whole feature exists to prevent.
+const PLACEHOLDER_DOMAINS = new Set(['address.edu', 'address.org', 'address.com', 'example.com', 'example.org', 'example.net', 'example.edu', 'domain.com']);
+
+export function isPlaceholderAddress(email: string): boolean {
+  const [local, domain] = email.toLowerCase().split('@');
+  if (!local || !domain) return false;
+  if (PLACEHOLDER_DOMAINS.has(domain)) return true;
+  // A placeholder local part only counts alongside a domain nobody publishes
+  // under, so a real person named e.g. "Tester" at a real institution is safe.
+  return PLACEHOLDER_LOCALS.has(local) && /^(address|example|domain)\./.test(domain);
+}
+
 export function applyAddressCorrection(db: DB, draftId: number, rawEmail: string): CorrectionResult {
   const email = rawEmail.trim();
   const row = db
@@ -99,6 +127,13 @@ export function applyAddressCorrection(db: DB, draftId: number, rawEmail: string
     return {
       kind: 'refused',
       message: `${row.shortId} not changed: that is not a single plain address. Nothing recorded.`,
+    };
+  }
+
+  if (isPlaceholderAddress(email)) {
+    return {
+      kind: 'refused',
+      message: `${row.shortId} not changed: "${email}" is the example from the instructions, not a real address. Nothing recorded.`,
     };
   }
 

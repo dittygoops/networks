@@ -6,7 +6,7 @@
 // drafts.to_email so loadApprovedSend returns 'ok', and re-presented d17 as a
 // normal tapback-approvable draft. One thumbs up then sends a real,
 // irreversible cold email to the wrong human.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, test } from 'vitest';
 import { openDb, upsertPerson, getPerson } from '../src/db/db.js';
 import { persistDraft, logEvent, loadApprovedSend, decide } from '../src/approval/ledger.js';
 import { applyAddressCorrection, addressRequestDeclined, addressWasRequested } from '../src/pipeline/addressCorrection.js';
@@ -141,5 +141,35 @@ describe('the durable decline record', () => {
     logEvent(db, draftId, 'address_request_declined', { personId });
     expect(addressRequestDeclined(db, personId)).toBe(true);
     expect(addressRequestDeclined(db, personId + 999)).toBe(false);
+  });
+});
+
+// Measured on the live probe, twice: the owner replied with the literal
+// placeholder from the instruction line ("their@address.edu", then
+// "their@address.org"). Pasting the example is the obvious thing to do when the
+// example is a copy-pasteable address, so the placeholder is the defect, not
+// the human. A placeholder accepted as real would freeze a junk address at
+// confidence 1.0 with source user_provided, which nothing automatic can ever
+// displace, and would then re-present the draft as a one-tap send.
+describe('placeholder addresses are refused', () => {
+  test.each([
+    'their@address.edu',
+    'their@address.org',
+    'test@example.com',
+    'a@example.org',
+    'user@domain.com',
+  ])('refuses the documentation placeholder %s', (email) => {
+    const { db, draftId, personId } = seed(null, null);
+    logEvent(db, draftId, 'address_requested', { personId });
+    const r = applyAddressCorrection(db, draftId, email);
+    expect(r.kind).toBe('refused');
+    expect(getPerson(db, personId)!.email).toBeNull();
+  });
+
+  test('still accepts a real institutional address that merely looks unusual', () => {
+    const { db, draftId, personId } = seed(null, null);
+    logEvent(db, draftId, 'address_requested', { personId });
+    expect(applyAddressCorrection(db, draftId, 'ishen@stu.hit.edu.cn').kind).toBe('applied');
+    expect(getPerson(db, personId)!.email).toBe('ishen@stu.hit.edu.cn');
   });
 });
