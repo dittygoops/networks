@@ -29,12 +29,22 @@ const asJson = args.includes('--json');
 const db = openDb('data/outreach.db');
 
 const drafts = db.prepare(`
-  SELECT dr.short_id, dr.person_id, dr.draft_input_json, dr.to_email,
+  SELECT dr.id AS draft_row_id, dr.short_id, dr.person_id, dr.draft_input_json, dr.to_email,
          p.name, p.affiliation, p.email_source, p.homepage_url
   FROM drafts dr JOIN people p ON p.id = dr.person_id
   WHERE dr.status = ? ORDER BY dr.id`).all(status) as any[];
 
 const factById = db.prepare('SELECT id, person_id, value, source_url FROM ontology_facts WHERE id = ?');
+
+// A draft with no to_email is normally a hard fail (it cannot be sent, and the
+// glued-label and dlapiper.com incidents both showed up as address problems).
+// A draft that is deliberately WAITING for a human to supply the address is a
+// different thing, and scoring it 'fail' would make this eval permanently red.
+// Keyed on the event rather than on seen_papers.reason so the eval does not
+// depend on reason-string wording, which the address-correction feature changes
+// twice.
+const addressRequested = db.prepare(
+  `SELECT created_at FROM draft_events WHERE draft_id = ? AND type = 'address_requested' ORDER BY id LIMIT 1`);
 
 // Personal-provider domains are legitimate (one address here was supplied by
 // Aditya directly), but they carry no institutional signal, so they are a
@@ -82,7 +92,15 @@ for (const d of drafts) {
   // --- TS2: the address plausibly belongs to this researcher ---
   const email: string | null = d.to_email ?? null;
   if (!email) {
-    findings.push({ draft: d.short_id, person: d.name, set: 'TS2', severity: 'fail', detail: 'draft has no to_email' });
+    const req = addressRequested.get(d.draft_row_id) as { created_at: string } | undefined;
+    if (req) {
+      findings.push({
+        draft: d.short_id, person: d.name, set: 'TS2', severity: 'review',
+        detail: `awaiting a human-supplied address (requested ${req.created_at}); not sendable until it arrives`,
+      });
+    } else {
+      findings.push({ draft: d.short_id, person: d.name, set: 'TS2', severity: 'fail', detail: 'draft has no to_email' });
+    }
   } else {
     const domain = email.split('@')[1]?.toLowerCase() ?? '';
     const local = email.split('@')[0]?.toLowerCase() ?? '';
