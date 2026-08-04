@@ -139,7 +139,7 @@ export function markSendFailed(db: DB, draftId: number, error: string): void {
 }
 
 export type ApprovedSendLookup =
-  | { kind: 'ok'; draftId: number; shortId: string; toEmail: string; subject: string; body: string }
+  | { kind: 'ok'; draftId: number; shortId: string; toEmail: string; subject: string; body: string; personName: string }
   | { kind: 'unknown_draft' }
   | { kind: 'not_approved'; status: string }
   | { kind: 'already_attempted'; attempts: number; attemptedAt: string }
@@ -157,7 +157,8 @@ export function loadApprovedSend(db: DB, draftId: number): ApprovedSendLookup {
       `SELECT d.short_id AS shortId, d.status AS status, d.to_email AS toEmail,
               d.send_attempts AS attempts, d.send_attempted_at AS attemptedAt,
               d.sendable_revision_id AS revisionId,
-              p.email AS currentEmail, r.subject AS subject, r.body AS body
+              p.email AS currentEmail, p.name AS personName,
+              r.subject AS subject, r.body AS body
          FROM drafts d
          JOIN people p ON p.id = d.person_id
          LEFT JOIN revisions r ON r.id = d.sendable_revision_id
@@ -172,6 +173,7 @@ export function loadApprovedSend(db: DB, draftId: number): ApprovedSendLookup {
         attemptedAt: string | null;
         revisionId: number | null;
         currentEmail: string | null;
+        personName: string;
         subject: string | null;
         body: string | null;
       }
@@ -197,6 +199,7 @@ export function loadApprovedSend(db: DB, draftId: number): ApprovedSendLookup {
     toEmail: row.toEmail,
     subject: row.subject ?? '',
     body: row.body,
+    personName: row.personName,
   };
 }
 

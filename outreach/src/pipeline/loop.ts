@@ -199,7 +199,11 @@ async function performApprovedSend(
     const { sentId } = await deps.sender.send(outbound);
     markSent(deps.db, draftId, sentId);
     summary.sent++;
-    await deps.channel.notify(`${shortId} sent to ${outbound.to}.`);
+    // Names the human, not just the address. A tapback is one tap, so a
+    // mis-tap is easy in a way that typing "d25 y" was not, and the only
+    // defence against an irreversible cold email to the wrong person is that
+    // the mistake is legible immediately.
+    await deps.channel.notify(`SENT ${shortId} to ${lookup.personName} <${outbound.to}>.`);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     markSendFailed(deps.db, draftId, msg);

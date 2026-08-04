@@ -33,7 +33,20 @@ export function formatDraftMessage(msg: OutboundDraftMessage): string {
   ].join('\n');
 }
 
-export type RawMessage = { id: string; sender?: { id?: string }; content?: { type?: string; text?: string } };
+export type RawMessage = {
+  id: string;
+  sender?: { id?: string };
+  content?: {
+    type?: string;
+    text?: string;
+    // Present when type === 'reaction'. Verified live 2026-08-03: Spectrum
+    // delivers an iMessage tapback as an ordinary inbound message whose
+    // content carries exactly { type, emoji, target }, where target is the
+    // full message that was reacted to.
+    emoji?: string;
+    target?: { id?: string; content?: { type?: string; text?: string } };
+  };
+};
 
 export interface PhotonApp {
   messages: AsyncIterable<[unknown, RawMessage]>;
@@ -93,6 +106,55 @@ function digitsOnly(s: string): string {
   return s.replace(/\D/g, '');
 }
 
+// --- Tapback approval -------------------------------------------------------
+// Approving 48 drafts by typing "d25 y" each time is slow enough that it stops
+// happening, and an unread queue is its own failure mode. A tapback is one tap.
+//
+// The translation is deliberately shallow: a reaction becomes the exact text
+// command a human would have typed, and is then handed to the same decode and
+// the same handleReply path. Nothing downstream learns that reactions exist, so
+// every safety gate (the decision claim, the prior-thread check, the send
+// refusal) is reached unchanged. This is the irreversible path: a thumbs up
+// sends a real cold email to a named stranger.
+const THUMBS_UP = '\u{1F44D}';
+const THUMBS_DOWN = '\u{1F44E}';
+
+// Phones send 👍 with a skin-tone modifier and often a variation selector or
+// ZWJ. Comparing raw strings would silently ignore the default reaction on most
+// handsets, which looks identical to "reactions don't work".
+function baseEmoji(emoji: string): string {
+  return emoji.replace(/[\u{1F3FB}-\u{1F3FF}\u{FE0F}\u{200D}]/gu, '');
+}
+
+// formatDraftMessage puts "d25: Name (email)" on the first line, so the draft a
+// reaction refers to is recoverable from the reacted-to text itself. That beats
+// storing an outbound-message-id map: the listener is a long-lived daemon that
+// restarts on failure, and an in-memory map would silently lose every pending
+// draft on restart while appearing to work.
+function draftIdFromReactedText(text: string | undefined): string | null {
+  const m = /^\s*(d\d+):/.exec(text ?? '');
+  return m ? m[1]! : null;
+}
+
+// Returns the equivalent text command, or null if this reaction must be ignored.
+function reactionToCommand(content: NonNullable<RawMessage['content']>): string | null {
+  const shortId = draftIdFromReactedText(content.target?.content?.text);
+  if (!shortId) {
+    // Reacting to a status line ("d25 sent to ...") or to anything else is a
+    // normal human thing to do and must never be read as an instruction.
+    console.log('photonChannel: reaction on a non-draft message, ignoring');
+    return null;
+  }
+  const emoji = baseEmoji(content.emoji ?? '');
+  if (emoji === THUMBS_UP) return `${shortId} y`;
+  if (emoji === THUMBS_DOWN) return `${shortId} n`;
+  // iMessage also offers heart, laugh, emphasis and question. None of them mean
+  // "send this to a stranger", and guessing at intent on the irreversible path
+  // is exactly the wrong trade.
+  console.log(`photonChannel: reaction on ${shortId} is not a thumbs up or down, ignoring`);
+  return null;
+}
+
 // Single decode for both captureReplies (batch) and streamReplies (push), so
 // the allowlist and the content check cannot drift between the two paths.
 // Returns null for anything not actionable, always logging why: the incident
@@ -120,6 +182,15 @@ function decodeReply(value: [unknown, RawMessage], approverPhone: string): Inbou
       console.log('photonChannel: inbound message from a non-approver, ignoring');
     }
     return null;
+  }
+  // Reactions are translated into the text command a human would have typed,
+  // then fall through to the identical downstream path. Placed after the sender
+  // allowlist above, so a stranger cannot approve a draft by tapping one.
+  if (message.content?.type === 'reaction') {
+    const command = reactionToCommand(message.content);
+    if (!command) return null;
+    console.log(`photonChannel: reaction from approver accepted as "${command}" (id ${message.id})`);
+    return { text: command, messageId: message.id };
   }
   if (message.content?.type !== 'text' || !message.content.text) {
     console.log(`photonChannel: inbound message from approver has unreadable content (type ${message.content?.type ?? 'unknown'}), ignoring`);

@@ -101,7 +101,7 @@ describe('runListenLoop', () => {
     expect(send.mock.calls[0]?.[0]).toMatchObject({ to: 'jane@uni.edu', draftShortId: p.shortId });
     const row = db.prepare('SELECT status FROM drafts WHERE id = ?').get(p.draftId) as { status: string };
     expect(row.status).toBe('sent');
-    expect(notices.some((n) => n.includes('sent to jane@uni.edu'))).toBe(true);
+    expect(notices.some((n) => n.includes('jane@uni.edu') && n.includes('Jane Doe'))).toBe(true);
     expect(exit).not.toHaveBeenCalled();
   });
 

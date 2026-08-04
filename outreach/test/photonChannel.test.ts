@@ -312,3 +312,65 @@ describe('createPhotonChannel captureReplies does not drop a reply', () => {
     expect(fake.stopped()).toBe(true);
   });
 });
+
+// Tapback approval. Verified live 2026-08-03: Spectrum delivers an iMessage
+// reaction as a normal inbound message with content.type 'reaction', carrying
+// `emoji` and a `target` whose content.text is the message reacted to. Draft
+// messages begin "d25: Name (email)" (formatDraftMessage), so the draft id
+// parses off the target with no schema change and no in-memory map, which
+// matters because a map would not survive a daemon restart.
+//
+// A reaction is translated into the SAME text command a human would type, so
+// every downstream safety gate (decision claim, prior-thread check, send
+// refusal) is reached unchanged. This is the irreversible path: a thumbs up
+// sends a real cold email to a named stranger.
+const reaction = (emoji: string, targetText: string, id = 'r1'): RawMessage =>
+  ({
+    id,
+    sender: { id: APPROVER },
+    content: { type: 'reaction', emoji, target: { id: 'm-target', content: { type: 'text', text: targetText } } },
+  }) as unknown as RawMessage;
+
+const DRAFT_MSG = 'd25: Jiarui Meng (jiaruizhao@cuhk.edu.hk)\nSubject: quick question\n\nHi Jiarui,\n\nReply "d25 y" to send, "d25 n" to skip.';
+
+describe('createPhotonChannel tapback approval', () => {
+  it('translates a thumbs up on a draft into that draft\'s approval command', async () => {
+    const { channel } = await channelFor([reaction('\u{1F44D}', DRAFT_MSG)]);
+    expect(await channel.captureReplies(200)).toEqual([{ text: 'd25 y', messageId: 'r1' }]);
+  });
+
+  it('translates a thumbs down into the skip command', async () => {
+    const { channel } = await channelFor([reaction('\u{1F44E}', DRAFT_MSG)]);
+    expect(await channel.captureReplies(200)).toEqual([{ text: 'd25 n', messageId: 'r1' }]);
+  });
+
+  it('accepts a skin-tone modified thumbs up (the default on many phones)', async () => {
+    const { channel } = await channelFor([reaction('\u{1F44D}\u{1F3FD}', DRAFT_MSG)]);
+    expect(await channel.captureReplies(200)).toEqual([{ text: 'd25 y', messageId: 'r1' }]);
+  });
+
+  // An ambiguous reaction must never send an email. iMessage offers heart,
+  // laugh, emphasis and question alongside the two thumbs; none of them mean
+  // "send this to a stranger".
+  it.each(['❤️', '\u{1F602}', '‼️', '❓'])('ignores the non-committal reaction %s', async (emoji) => {
+    const { channel } = await channelFor([reaction(emoji, DRAFT_MSG)]);
+    expect(await channel.captureReplies(200)).toEqual([]);
+  });
+
+  it('ignores a thumbs up on something that is not a draft message', async () => {
+    const { channel } = await channelFor([reaction('\u{1F44D}', 'd25 sent to jiaruizhao@cuhk.edu.hk.')]);
+    expect(await channel.captureReplies(200)).toEqual([]);
+  });
+
+  it('ignores a reaction whose target text is missing entirely', async () => {
+    const bad = { id: 'r9', sender: { id: APPROVER }, content: { type: 'reaction', emoji: '\u{1F44D}' } } as unknown as RawMessage;
+    const { channel } = await channelFor([bad]);
+    expect(await channel.captureReplies(200)).toEqual([]);
+  });
+
+  it('applies the sender allowlist to reactions too, so a stranger cannot approve by tapping', async () => {
+    const stranger = { ...reaction('\u{1F44D}', DRAFT_MSG), sender: { id: '+15555550199' } } as RawMessage;
+    const { channel } = await channelFor([stranger]);
+    expect(await channel.captureReplies(200)).toEqual([]);
+  });
+});
