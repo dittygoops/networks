@@ -109,3 +109,53 @@ describe('nameMatches (D2)', () => {
     });
   });
 });
+
+// 2026-08-04 incident: three real cold emails went to addresses belonging to
+// nobody on the paper, because a bare surname counted as a strong match.
+//   xuhuaping@buaa.edu.cn      accepted for "Ziheng Xu"      (authors: Ziheng Xu, Qingfeng Li, Xuefeng Liu, Chen Chen, Jianwei Niu)
+//   huangbo@njust.edu.cn       accepted for "Xianliang Huang"(authors: Xianliang Huang, Chen Xiao, ...)
+//   zhangyanghui@tongji.edu.cn accepted for "Xiyu Zhang"     (authors: Xiyu Zhang, Jingyu Zhuang, ...)
+// Same class as daniel.lee@dlapiper.com, reached through the surname instead
+// of the first name. A surname alone is distinctive for "Kerbl" and close to
+// worthless for "Xu", "Zhang", "Huang" or "Li".
+describe('nameMatches: a bare surname is not enough when the local part says more', () => {
+  test.each([
+    ['xuhuaping', 'Ziheng Xu'],
+    ['huangbo', 'Xianliang Huang'],
+    ['zhangyanghui', 'Xiyu Zhang'],
+    ['lizhang', 'Xiyu Zhang'],
+    ['wangwei', 'Ming Wang'],
+    ['yangbaoquan', 'Hongkun Yang'],          // real: sent to Yang Baoquan
+    ['lanyu', 'Sicheng Yu'],                  // real: sent to Lan Yu
+    ['jawairia.khan', 'MD Wahiduzzaman Khan'],// real: sent to Jawairia Khan
+  ])('rejects %s for %s', (local, name) => {
+    expect(nameMatches(local, name)).toBe(false);
+  });
+
+  // The local part IS the surname: nothing contradicts, so it stays accepted.
+  // The residue (local part minus the surname) echoes the target's own given
+  // name, so the surname match stands. These are all real stored addresses.
+  test.each([
+    ['zhou', 'Junbao Zhou'],
+    ['kerbl', 'Bernhard Kerbl'],
+    ['xu', 'Ziheng Xu'],
+    ['pedro.zanineli12', 'P. Zanineli'],      // hand-supplied by the owner
+    ['latitia.laguzet', 'Laetitia Laguzet'],  // transliteration drift
+    ['swdai', 'Si-Wei Dai'],                  // initials
+    ['helbahja', 'Hamid El Bahja'],           // multi-token surname
+  ])('still accepts %s for %s', (local, name) => {
+    expect(nameMatches(local, name)).toBe(true);
+  });
+
+  // Surname plus first-name evidence is still a match, which is what keeps the
+  // real recipients in the queue working.
+  test.each([
+    ['liulizhou', 'Lizhou Liu'],
+    ['yinpeng', 'Peng Yin'],
+    ['bernhard.kerbl', 'Bernhard Kerbl'],
+    ['donggeonbae', 'Donggeon Bae'],
+    ['huaiyuan.weng', 'Huaiyuan Weng'],
+  ])('accepts %s for %s', (local, name) => {
+    expect(nameMatches(local, name)).toBe(true);
+  });
+});

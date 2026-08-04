@@ -356,8 +356,42 @@ export function nameMatches(localPart: string, fullName: string): boolean {
     .filter((p) => p.length > 1);
   const surnameCandidates = hyphenHalves.length > 1 ? [last, ...hyphenHalves] : [last];
 
+  // A bare surname counts ONLY when the local part is exactly that surname.
+  //
+  // It used to count as a substring, and on 2026-08-04 that sent three real
+  // cold emails to people who did not write the paper: xuhuaping@buaa.edu.cn
+  // matched "Ziheng Xu", huangbo@njust.edu.cn matched "Xianliang Huang", and
+  // zhangyanghui@tongji.edu.cn matched "Xiyu Zhang". None of the three
+  // recipients appears anywhere in their paper's author list. This is the
+  // daniel.lee@dlapiper.com failure reached through the surname instead of the
+  // first name: a surname is distinctive for "Kerbl" and close to worthless
+  // for "Xu", "Zhang", "Huang" or "Li", where it names millions of people.
+  //
+  // "zhou@njit.edu" for Junbao Zhou stays a match: nothing in the local part
+  // contradicts the identification. "xuhuaping" does contradict it, because
+  // the surrounding letters spell a different person's given name.
+  // What decides it is the RESIDUE: the local part with the surname removed.
+  // If the leftover letters echo the target's own given name, the surname
+  // match stands. If they spell somebody else's given name, it does not.
+  //   xu|huaping     residue "huaping" vs first "ziheng"    -> different person
+  //   huang|bo       residue "bo"      vs first "xianliang" -> different person
+  //   zhang|yanghui  residue "yanghui" vs first "xiyu"      -> different person
+  //   zanineli|pedro residue "pedro"   vs first "p"         -> same person
+  //   laguzet|latitia residue "latitia" vs first "laetitia" -> same person (transliteration)
+  //   dai|sw         residue "sw"      vs first "siwei"     -> same person (initials)
+  const residueEchoesFirstName = (s: string): boolean => {
+    const residue = local.replace(s, '');
+    if (residue.length === 0) return true; // the local part IS the surname
+    if (first.length === 0) return false;
+    // One shared leading letter is deliberately loose: it admits initials
+    // ("sw" for Si-Wei) and transliteration drift ("latitia" for Laetitia)
+    // while still rejecting a wholly different given name, which is the only
+    // case that has ever produced a wrong-person send.
+    return residue[0] === first[0] || first.startsWith(residue) || residue.startsWith(first);
+  };
+  if (surnameCandidates.some((s) => s.length > 1 && local.includes(s) && residueEchoesFirstName(s))) return true;
+
   const strongPatterns = surnameCandidates.flatMap((s) => [
-    s,
     first[0]! + s,
     s + first[0]!,
     first + s[0]!,
