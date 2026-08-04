@@ -138,7 +138,7 @@ async function performApprovedSend(
       // guess, and never let a text message resolve it.
       logEvent(deps.db, draftId, 'send_refused', { reason: 'already_attempted', attempts: lookup.attempts });
       await deps.channel.notify(
-        `${shortId}: a send attempt was already recorded at ${lookup.attemptedAt} and never confirmed. ` +
+        `${shortId} NOT SENT: a send attempt was already recorded at ${lookup.attemptedAt} and never confirmed. ` +
           `Nothing sent. Check the Gmail Sent folder before re-arming it by hand.`,
       );
       return;
@@ -156,7 +156,7 @@ async function performApprovedSend(
         current: lookup.current,
       });
       await deps.channel.notify(
-        `${shortId}: the address changed since you approved it (approved ${lookup.snapshot}, ` +
+        `${shortId} NOT SENT: the address changed since you approved it (approved ${lookup.snapshot}, ` +
           `now ${lookup.current ?? 'none'}). Nothing sent.`,
       );
       return;
@@ -248,7 +248,7 @@ export async function handleReply(
   // channel happening to yield no replies.
   if (opts.dryRun) {
     await deps.channel.notify(
-      `${parsed.shortId}: dry run, nothing recorded and nothing sent (would ${parsed.kind}).`,
+      `${parsed.shortId} DRY RUN: nothing recorded and nothing sent (would ${parsed.kind}).`,
     );
     return;
   }
