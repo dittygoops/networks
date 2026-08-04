@@ -365,6 +365,12 @@ async function main(): Promise<void> {
     // CLI approval gate (MVP for F5): nothing sends without an explicit yes.
     if (!r.email) {
       console.log('no email found: draft stays awaiting_approval in the manual-lookup queue');
+      // Not the same as "we looked and found nothing". A rejected candidate is
+      // an address the machine found and refused because its local part names a
+      // different person, which is exactly the case a human can resolve.
+      for (const rej of r.rejectedEmails ?? []) {
+        console.log(`  rejected candidate: ${rej.email} (${rej.source}) does not name this person`);
+      }
       return;
     }
     if (!persisted.sendable) {
