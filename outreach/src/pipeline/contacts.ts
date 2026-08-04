@@ -2,24 +2,50 @@
 // Spec: docs/spec-profile-mining.md (D1 confidence table, D2 name-match rule).
 import { parse } from 'tldts';
 
-export type EmailSource = 'pdf' | 'homepage' | 'directory' | 'github_profile' | 'github_commit';
+// Split into two tiers. Candidates only ever come from discovery, so
+// scoreCandidate keeps an exhaustive lookup and a future sixth discovery
+// source still fails typecheck if its confidence is not declared. A
+// human-supplied address never enters the scoring path at all, so it is
+// deliberately outside the Record: it is stored at confidence 1.0 and is never
+// compared against CONFIDENCE_THRESHOLD.
+export type DiscoveredEmailSource = 'pdf' | 'homepage' | 'directory' | 'github_profile' | 'github_commit';
+export type EmailSource = DiscoveredEmailSource | 'user_provided';
 
 export interface EmailCandidate {
   email: string;
-  source: EmailSource;
+  source: DiscoveredEmailSource;
   correspondingMarker?: boolean;
 }
 
 export interface SelectedEmail {
   email: string;
   confidence: number;
+  // Widened, because runContactExtraction's on-record shortcut
+  // (orchestrate.ts:150-155) reads a stored email_source back off the person
+  // row and casts it. Today that cast is a lie for the one 'user_provided'
+  // row; now it is honest.
   source: EmailSource;
+}
+
+// Why a candidate was refused, kept rather than discarded. Only an identity
+// mismatch belongs here: a github_commit candidate that names the person and
+// scores 0.55 is a confidence failure, not a wrong-person failure, and must
+// never produce a needs-address text.
+export interface RejectedCandidate {
+  email: string;
+  source: DiscoveredEmailSource;
+  reason: 'identity_mismatch';
+}
+
+export interface ContactResult {
+  selected: SelectedEmail | null;
+  rejected: RejectedCandidate[];
 }
 
 export const CONFIDENCE_THRESHOLD = 0.7;
 
 // D1 confidence table (name match required everywhere; noreply always discarded).
-const SOURCE_CONFIDENCE: Record<EmailSource, number> = {
+const SOURCE_CONFIDENCE: Record<DiscoveredEmailSource, number> = {
   pdf: 0.85, // 0.95 with corresponding-author marker
   homepage: 0.85,
   directory: 0.75,
@@ -156,7 +182,7 @@ export function extractWebEmailCandidates(pages: WebPage[], personName: string):
   for (const page of pages) {
     const cls = classifyWebPage(page, personName);
     if (cls === 'aggregator') continue; // never a usable email source
-    const source: EmailSource = cls;
+    const source: DiscoveredEmailSource = cls;
     for (const match of deobfuscate(page.content).matchAll(EMAIL_RE)) {
       const [, localGroup = '', domain = ''] = match;
       if (localGroup.startsWith('{')) continue; // brace groups are a paper-text thing
@@ -233,22 +259,43 @@ export interface ExtractOptions {
 const FRESH_PAPER_MONTHS = 12;
 const MAX_FETCH_PAGES = 3;
 
+// The mirror image of selectEmail: the candidates it threw away for naming a
+// different person. Deduped by address and ordered by the confidence the
+// candidate WOULD have had if the name had matched, so the message shows the
+// machine's own ranking. Capped at 3 because the message is read on a phone.
+export function collectRejected(candidates: EmailCandidate[], personName: string): RejectedCandidate[] {
+  const byEmail = new Map<string, { r: RejectedCandidate; rank: number }>();
+  for (const c of candidates) {
+    const [localPart = '', domain = ''] = c.email.split('@');
+    if (domain.endsWith('noreply.github.com')) continue; // a discard, not a wrong person
+    if (nameMatches(localPart, personName)) continue;
+    if (byEmail.has(c.email)) continue;
+    byEmail.set(c.email, {
+      r: { email: c.email, source: c.source, reason: 'identity_mismatch' },
+      rank: SOURCE_CONFIDENCE[c.source],
+    });
+  }
+  return [...byEmail.values()].sort((a, b) => b.rank - a.rank).slice(0, 3).map((x) => x.r);
+}
+
 // D1a/D1b: paper text first, but web is consulted unless the paper is fresh and
 // already confident. Web tier fetches full page content for the top
 // non-aggregator results (search snippets rarely contain emails). All
 // candidates are reconciled by decayed D1 score; null below 0.7 (caller owns
 // the needs_manual_lookup transition, D10).
-export async function extractContact(
+export async function extractContactDetailed(
   deps: ContactDeps,
   person: TargetPerson,
   paperText: string | null,
   options: ExtractOptions = {},
-): Promise<SelectedEmail | null> {
+): Promise<ContactResult> {
   const paperAgeMonths = options.paperAgeMonths ?? 0;
   const paperCandidates = paperText ? extractPaperEmailCandidates(paperText) : [];
 
   const paperPick = selectEmail(paperCandidates, person.name, paperAgeMonths);
-  if (paperPick && paperAgeMonths < FRESH_PAPER_MONTHS) return paperPick;
+  if (paperPick && paperAgeMonths < FRESH_PAPER_MONTHS) {
+    return { selected: paperPick, rejected: collectRejected(paperCandidates, person.name) };
+  }
 
   const affiliation = options.currentAffiliation ?? options.paperContext?.affiliationHint ?? person.affiliation ?? '';
 
@@ -256,7 +303,23 @@ export async function extractContact(
   // can't be safely resolved from the web, so web emails route to manual.
   const webCandidates = affiliation.length > 0 ? await extractWebContacts(deps, person, affiliation) : [];
 
-  return selectEmail([...paperCandidates, ...webCandidates], person.name, paperAgeMonths);
+  const allCandidates = [...paperCandidates, ...webCandidates];
+  const best = selectEmail(allCandidates, person.name, paperAgeMonths);
+  return { selected: best, rejected: collectRejected(allCandidates, person.name) };
+}
+
+// Kept at its original signature deliberately. Verified by grep: the only
+// callers are orchestrate.ts, intake.ts, five test files (extract-contact,
+// paper-context, two-pass, reconcile, snippet-scan) and
+// scripts/smoke-contact.ts. Keeping the wrapper means only orchestrate.ts
+// changes and no existing test moves.
+export async function extractContact(
+  deps: ContactDeps,
+  person: TargetPerson,
+  paperText: string | null,
+  options: ExtractOptions = {},
+): Promise<SelectedEmail | null> {
+  return (await extractContactDetailed(deps, person, paperText, options)).selected;
 }
 
 // D1c: two passes. Pass 1 is a plain name (+ paper affiliation) search. If it
