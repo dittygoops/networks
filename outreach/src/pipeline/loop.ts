@@ -22,6 +22,7 @@ import {
   type PersistedDraft,
 } from '../approval/ledger.js';
 import { formatShortId, parseShortId } from '../approval/ids.js';
+import { addressWasRequested, applyAddressCorrection } from './addressCorrection.js';
 import type { LoopConfig } from '../discovery/config.js';
 import { discoverAll } from '../discovery/index.js';
 import {
@@ -222,7 +223,9 @@ export async function handleReply(
 ): Promise<void> {
   const parsed = parseReply(reply.text);
   if (parsed.kind === 'unparseable') {
-    await deps.channel.notify(`Could not read "${reply.text}". Reply like "d7 y" or "d7 n".`);
+    await deps.channel.notify(
+      `Could not read "${reply.text}". Reply like "d7 y", "d7 n", or "d7 to their@address.edu".`,
+    );
     return;
   }
   const draftId = parseShortId(parsed.shortId);
@@ -236,7 +239,10 @@ export async function handleReply(
   if (parsed.kind === 'unsupported') {
     // Edits are F5 territory (docs/spec-imessage-approval-loop.md).
     if (!opts.dryRun) logEvent(deps.db, draftId, 'edit_reply_unsupported', { text: reply.text });
-    await deps.channel.notify(`Edits are not yet supported for ${parsed.shortId}. Reply "y" to send or "n" to skip.`);
+    await deps.channel.notify(
+      `Edits are not yet supported for ${parsed.shortId}. Reply "${parsed.shortId} to their@address.edu" to set ` +
+        `the address, "${parsed.shortId} y" to send, or "${parsed.shortId} n" to skip.`,
+    );
     return;
   }
 
@@ -248,13 +254,66 @@ export async function handleReply(
   // channel happening to yield no replies.
   if (opts.dryRun) {
     await deps.channel.notify(
-      `${parsed.shortId} DRY RUN: nothing recorded and nothing sent (would ${parsed.kind}).`,
+      parsed.kind === 'address'
+        ? `${parsed.shortId} DRY RUN: would record ${parsed.email}. Nothing recorded and nothing sent.`
+        : `${parsed.shortId} DRY RUN: nothing recorded and nothing sent (would ${parsed.kind}).`,
     );
+    return;
+  }
+
+  // A correction writes state and never sends. A further explicit
+  // "dN y" is still required, and it runs the identical, unmodified send path.
+  if (parsed.kind === 'address') {
+    const outcome = applyAddressCorrection(deps.db, draftId, parsed.email);
+    if (outcome.kind === 'refused') {
+      await deps.channel.notify(outcome.message);
+      return;
+    }
+    // Names the PERSON, not just the id and the address. d17 and d70 are one
+    // keystroke apart, and the name is the only token here he can check against
+    // what he meant. Same argument as the SENT confirmation below.
+    await deps.channel.notify(
+      `Recorded ${outcome.email} for ${outcome.personName} (${outcome.shortId}).` +
+        (outcome.nameMatched ? '' : ' The local part does not name that person.') +
+        ` Nothing sent yet.`,
+    );
+    // Present it in the standard format so tapback works on it as on any other
+    // draft. Not counted against max_messages_per_run: it is one message per
+    // reply he typed, so it is self-limiting, and a run's cap has no meaning
+    // inside `outreach listen`, which has no run.
+    const rev = deps.db
+      .prepare(
+        `SELECT r.subject AS subject, r.body AS body, p.email AS toEmail, p.name AS personName
+           FROM drafts d
+           JOIN people p ON p.id = d.person_id
+           LEFT JOIN revisions r ON r.id = d.sendable_revision_id
+          WHERE d.id = ?`,
+      )
+      .get(draftId) as { subject: string | null; body: string | null; toEmail: string | null; personName: string } | undefined;
+    if (rev?.body && rev.toEmail) {
+      await deps.channel.sendDraftMessage({
+        shortId: outcome.shortId,
+        subject: rev.subject ?? '',
+        body: rev.body,
+        to: rev.toEmail,
+        personName: rev.personName,
+      });
+    }
     return;
   }
 
   if (parsed.kind === 'skip') {
     const res = decide(deps.db, draftId, 'skip', 'imessage');
+    // A skip clears the DRAFT but not the PERSON: priorThreads matches only
+    // sent%/approved/awaiting_approval, so 'skipped' unblocks them, and
+    // people.email is still NULL, so the next paper by the same author would
+    // re-draft and re-ask forever. Record the decline against the person.
+    if (res.applied && addressWasRequested(deps.db, draftId)) {
+      const owner = deps.db.prepare('SELECT person_id AS personId FROM drafts WHERE id = ?').get(draftId) as
+        | { personId: number }
+        | undefined;
+      if (owner) logEvent(deps.db, draftId, 'address_request_declined', { personId: owner.personId });
+    }
     await deps.channel.notify(
       res.applied ? `${parsed.shortId} skipped.` : `${parsed.shortId} was already ${res.existing.action}.`,
     );
