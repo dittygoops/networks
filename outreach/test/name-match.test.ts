@@ -159,3 +159,28 @@ describe('nameMatches: a bare surname is not enough when the local part says mor
     expect(nameMatches(local, name)).toBe(true);
   });
 });
+
+// A tokenized local part tells us where the name boundaries are, so a surname
+// matching only the interior of a token is a syllable collision. Real case:
+// l.zhang.16@bham.ac.uk was accepted for "Zhisheng Han" because h-a-n sits
+// inside z-h-a-n-g. Romanized Chinese names collide this way constantly.
+describe('nameMatches: a tokenized local part must name the person', () => {
+  test.each([
+    ['l.zhang.16', 'Zhisheng Han'],
+    ['daniel.lee', 'Daniel Kepple'],
+    ['mikel.martinez', 'Mikel M. Iparraguirre'],
+    ['jawairia.khan', 'MD Wahiduzzaman Khan'],
+  ])('rejects %s for %s', (local, name) => {
+    expect(nameMatches(local, name)).toBe(false);
+  });
+
+  // Legitimate initials forms: the surname is a clean token, or there are no
+  // separators at all so the token rule does not apply. All real addresses.
+  test.each([
+    ['n.kollias.v', 'Nikolaos Kollias'],
+    ['yhudj', 'Yingdong Hu'],
+    ['zzhongyj', 'Yingji Zhong'],
+  ])('still accepts %s for %s', (local, name) => {
+    expect(nameMatches(local, name)).toBe(true);
+  });
+});

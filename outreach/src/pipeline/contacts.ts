@@ -379,8 +379,11 @@ export function nameMatches(localPart: string, fullName: string): boolean {
   //   zanineli|pedro residue "pedro"   vs first "p"         -> same person
   //   laguzet|latitia residue "latitia" vs first "laetitia" -> same person (transliteration)
   //   dai|sw         residue "sw"      vs first "siwei"     -> same person (initials)
-  const residueEchoesFirstName = (s: string): boolean => {
-    const residue = local.replace(s, '');
+  // The surname must ANCHOR at one end of the local part, not float inside it.
+  // Unanchored, "zhang" matches surname "han" (h-a-n sits inside z-h-a-n-g) and
+  // "zhengkai" matches surname "he". Those are syllable collisions, not name
+  // matches, and they are indistinguishable from a correct match to a caller.
+  const echoesFirstName = (residue: string): boolean => {
     if (residue.length === 0) return true; // the local part IS the surname
     if (first.length === 0) return false;
     // One shared leading letter is deliberately loose: it admits initials
@@ -389,7 +392,30 @@ export function nameMatches(localPart: string, fullName: string): boolean {
     // case that has ever produced a wrong-person send.
     return residue[0] === first[0] || first.startsWith(residue) || residue.startsWith(first);
   };
-  if (surnameCandidates.some((s) => s.length > 1 && local.includes(s) && residueEchoesFirstName(s))) return true;
+  // When the local part is explicitly tokenized ("l.zhang.16", "n.kollias.v"),
+  // the author has told us where the name boundaries are, so a surname that
+  // matches nothing but the interior of a token is a syllable collision rather
+  // than a name. Real case: l.zhang.16@bham.ac.uk was accepted for "Zhisheng
+  // Han" because h-a-n sits inside z-h-a-n-g. Measured across 180 stored
+  // addresses this rejects exactly that one and leaves the legitimate initials
+  // forms (n.kollias.v, yhudj, zzhongyj) untouched, because they either carry
+  // the surname as a clean token or carry no separators at all.
+  const localTokens = localPart.split(/[^a-zA-Z]+/).filter(Boolean).map(lettersOnly);
+  if (localTokens.length > 1 && !surnameCandidates.some((s) => localTokens.includes(s))) {
+    const firstIsAToken = first.length > 1 && localTokens.includes(first);
+    const middleIsAToken = middles.some((m) => m.length > 1 && localTokens.includes(m));
+    // A tokenized local part that names neither the surname nor the given name
+    // is not this person, whatever substrings happen to line up.
+    if (!firstIsAToken && !middleIsAToken) return false;
+  }
+
+  const surnameAnchorsAndAgrees = (s: string): boolean => {
+    if (s.length < 2) return false;
+    if (local.startsWith(s)) return echoesFirstName(local.slice(s.length));
+    if (local.endsWith(s)) return echoesFirstName(local.slice(0, local.length - s.length));
+    return false;
+  };
+  if (surnameCandidates.some(surnameAnchorsAndAgrees)) return true;
 
   const strongPatterns = surnameCandidates.flatMap((s) => [
     first[0]! + s,
