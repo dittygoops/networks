@@ -187,7 +187,16 @@ export function strandedReport(db: DB, _maxAttempts: number): StrandedReport {
       `SELECT arxiv_id AS arxivId, status, reason, draft_id AS draftId
        FROM seen_papers
        WHERE status = 'drafted_unsendable'
-         AND (reason LIKE 'abandoned after%' OR reason LIKE 'ambiguous orphan drafts%')
+         AND (reason LIKE 'abandoned after%'
+           OR reason LIKE 'ambiguous orphan drafts%'
+           -- The two reasons the address-correction feature creates. Both
+           -- describe a real person the system wants to email and cannot,
+           -- waiting on one text message from a human. Deliberately scoped:
+           -- the other ~250 drafted_unsendable rows stay invisible, and
+           -- 'address corrected%' is deliberately absent so a resolved row
+           -- stops printing.
+           OR reason LIKE 'awaiting address correction%'
+           OR reason LIKE 'address correction not yet requested%')
        ORDER BY updated_at DESC`,
     )
     .all() as StrandedTerminalRow[];

@@ -561,6 +561,32 @@ describe('recovering after a crash right after persistDraft (1.4, exercises the 
   });
 });
 
+describe('stranded report covers pending address corrections', () => {
+  const seedRow = (db: ReturnType<typeof openDb>, arxivId: string, reason: string) =>
+    db.prepare(
+      `INSERT INTO seen_papers (arxiv_id, title, discovered_via, status, reason)
+       VALUES (?, 'A Paper', 'saved_query', 'drafted_unsendable', ?)`,
+    ).run(arxivId, reason);
+
+  it('prints both new reasons', () => {
+    const db = openDb(':memory:');
+    seedRow(db, '2601.00001', 'awaiting address correction (d7): rejected wrong@x.edu');
+    seedRow(db, '2601.00002', 'address correction not yet requested (d8): rejected wrong@y.edu');
+    // Unchanged: the other 250-odd drafted_unsendable rows stay invisible.
+    // Making them visible is a separate spec.
+    seedRow(db, '2601.00003', 'no grounded hook');
+    const ids = strandedReport(db, 3).terminalStranded.map((r) => r.arxivId).sort();
+    expect(ids).toEqual(['2601.00001', '2601.00002']);
+  });
+
+  it('drops a corrected row, so a resolved item is not printed forever', () => {
+    const db = openDb(':memory:');
+    seedRow(db, '2601.00004', 'awaiting address correction (d7): rejected wrong@x.edu');
+    db.prepare("UPDATE seen_papers SET reason = 'address corrected (d7)' WHERE arxiv_id = ?").run('2601.00004');
+    expect(strandedReport(db, 3).terminalStranded).toEqual([]);
+  });
+});
+
 describe('resume does not starve fresh discovery (CS7.4)', () => {
   it('resumes only up to max_resume_per_run and still processes fresh candidates', async () => {
     const db = openDb(':memory:');
