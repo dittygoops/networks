@@ -5,6 +5,7 @@
 import { Spectrum } from 'spectrum-ts';
 import { imessage } from 'spectrum-ts/providers';
 import type { ApprovalChannel, InboundReply, OutboundDraftMessage, StreamOutcome } from './channel.js';
+import { needsAddressDraftId, needsAddressTapbackHint } from './channel.js';
 
 export interface PhotonOptions {
   projectId: string;
@@ -136,37 +137,57 @@ function draftIdFromReactedText(text: string | undefined): string | null {
   return m ? m[1]! : null;
 }
 
-// Returns the equivalent text command, or null if this reaction must be ignored.
-function reactionToCommand(content: NonNullable<RawMessage['content']>): string | null {
-  const shortId = draftIdFromReactedText(content.target?.content?.text);
+// Three outcomes, not two. `hint` exists because a tapback on a NEEDS ADDRESS
+// message used to produce total silence: the reacted-to text has no `dN:`
+// header (deliberately, that header is what makes a message approvable), so it
+// fell into the "reaction on a non-draft message" branch and only logged.
+type Decoded =
+  | { kind: 'command'; command: string }
+  | { kind: 'hint'; text: string }
+  | { kind: 'ignore' };
+
+function reactionToDecoded(content: NonNullable<RawMessage['content']>): Decoded {
+  const targetText = content.target?.content?.text;
+  const shortId = draftIdFromReactedText(targetText);
   if (!shortId) {
+    const needs = needsAddressDraftId(targetText);
+    if (needs) {
+      // Answer, do not act. Whatever emoji it was, the only useful response is
+      // the syntax, because this draft cannot be approved until an address
+      // exists for it.
+      console.log(`photonChannel: reaction on the needs-address message for ${needs}, replying with the syntax`);
+      return { kind: 'hint', text: needsAddressTapbackHint(needs) };
+    }
     // Reacting to a status line ("d25 sent to ...") or to anything else is a
-    // normal human thing to do and must never be read as an instruction.
+    // normal human thing to do and must never be read as an instruction, and
+    // must never be reflected: the line may be shared.
     console.log('photonChannel: reaction on a non-draft message, ignoring');
-    return null;
+    return { kind: 'ignore' };
   }
   const emoji = baseEmoji(content.emoji ?? '');
-  if (emoji === THUMBS_UP) return `${shortId} y`;
-  if (emoji === THUMBS_DOWN) return `${shortId} n`;
+  if (emoji === THUMBS_UP) return { kind: 'command', command: `${shortId} y` };
+  if (emoji === THUMBS_DOWN) return { kind: 'command', command: `${shortId} n` };
   // iMessage also offers heart, laugh, emphasis and question. None of them mean
   // "send this to a stranger", and guessing at intent on the irreversible path
   // is exactly the wrong trade.
   console.log(`photonChannel: reaction on ${shortId} is not a thumbs up or down, ignoring`);
-  return null;
+  return { kind: 'ignore' };
 }
 
 // Single decode for both captureReplies (batch) and streamReplies (push), so
 // the allowlist and the content check cannot drift between the two paths.
-// Returns null for anything not actionable, always logging why: the incident
+// 'ignore' covers anything not actionable, always logging why: the incident
 // that motivated the listener was undiagnosable because these were silent.
 // A non-approver's number and message text are attacker-controlled content on
 // a possibly shared line, so neither is ever logged.
-function decodeReply(value: [unknown, RawMessage], approverPhone: string): InboundReply | null {
+type Decoded2 = { kind: 'reply'; reply: InboundReply } | { kind: 'hint'; text: string } | { kind: 'ignore' };
+
+function decodeReply(value: [unknown, RawMessage], approverPhone: string): Decoded2 {
   const [, message] = value;
   const senderId = message.sender?.id;
   if (senderId !== approverPhone) {
     // Normalize for DIAGNOSIS, never for authorization. Nothing reachable from
-    // this comparison can accept a message: both branches return null. Digit
+    // this comparison can accept a message: both branches ignore. Digit
     // equality with a formatting difference means APPROVER_PHONE no longer
     // matches what the provider emits, which is the exact all-quiet failure
     // that once cost a lost approval, so it is named rather than logged as
@@ -181,23 +202,24 @@ function decodeReply(value: [unknown, RawMessage], approverPhone: string): Inbou
     } else {
       console.log('photonChannel: inbound message from a non-approver, ignoring');
     }
-    return null;
+    return { kind: 'ignore' };
   }
   // Reactions are translated into the text command a human would have typed,
   // then fall through to the identical downstream path. Placed after the sender
   // allowlist above, so a stranger cannot approve a draft by tapping one.
   if (message.content?.type === 'reaction') {
-    const command = reactionToCommand(message.content);
-    if (!command) return null;
-    console.log(`photonChannel: reaction from approver accepted as "${command}" (id ${message.id})`);
-    return { text: command, messageId: message.id };
+    const d = reactionToDecoded(message.content);
+    if (d.kind === 'ignore') return { kind: 'ignore' };
+    if (d.kind === 'hint') return { kind: 'hint', text: d.text };
+    console.log(`photonChannel: reaction from approver accepted as "${d.command}" (id ${message.id})`);
+    return { kind: 'reply', reply: { text: d.command, messageId: message.id } };
   }
   if (message.content?.type !== 'text' || !message.content.text) {
     console.log(`photonChannel: inbound message from approver has unreadable content (type ${message.content?.type ?? 'unknown'}), ignoring`);
-    return null;
+    return { kind: 'ignore' };
   }
   console.log(`photonChannel: inbound message from approver accepted (id ${message.id})`);
-  return { text: message.content.text, messageId: message.id };
+  return { kind: 'reply', reply: { text: message.content.text, messageId: message.id } };
 }
 
 export async function createPhotonChannel(
@@ -245,9 +267,19 @@ export async function createPhotonChannel(
     async captureReplies(windowMs: number): Promise<InboundReply[]> {
       const out: InboundReply[] = [];
       const deadline = Date.now() + windowMs;
-      const acceptIfAllowed = (value: [unknown, RawMessage]) => {
-        const reply = decodeReply(value, opts.approverPhone);
-        if (reply) out.push(reply);
+      // Async now, because a hint is an outbound message. A send failure here
+      // must not abort the drain: an unanswered tapback is bad, a lost approval
+      // is worse.
+      const acceptIfAllowed = async (value: [unknown, RawMessage]) => {
+        const d = decodeReply(value, opts.approverPhone);
+        if (d.kind === 'reply') out.push(d.reply);
+        else if (d.kind === 'hint') {
+          try {
+            await dm.send(d.text);
+          } catch (err) {
+            console.warn(`captureReplies: could not send the needs-address hint: ${String(err)}`);
+          }
+        }
       };
 
       try {
@@ -265,7 +297,7 @@ export async function createPhotonChannel(
           if (next === null) break; // timeout won; `pending` stays for the grace check
           pending = undefined;
           if (next.done) break;
-          acceptIfAllowed(next.value);
+          await acceptIfAllowed(next.value);
         }
 
         // The timeout won with a next() still in flight. Give it a short grace
@@ -285,7 +317,7 @@ export async function createPhotonChannel(
           clearTimeout(graceTimer);
           if (settled !== null) {
             pending = undefined;
-            if (!settled.done) acceptIfAllowed(settled.value);
+            if (!settled.done) await acceptIfAllowed(settled.value);
           }
         }
       } catch (err) {
@@ -308,8 +340,17 @@ export async function createPhotonChannel(
     async streamReplies(onReply: (reply: InboundReply) => Promise<void>): Promise<StreamOutcome> {
       try {
         for await (const value of app.messages) {
-          const reply = decodeReply(value as [unknown, RawMessage], opts.approverPhone);
-          if (!reply) continue;
+          const d = decodeReply(value as [unknown, RawMessage], opts.approverPhone);
+          if (d.kind === 'ignore') continue;
+          if (d.kind === 'hint') {
+            try {
+              await dm.send(d.text);
+            } catch (err) {
+              console.warn(`streamReplies: could not send the needs-address hint: ${String(err)}`);
+            }
+            continue;
+          }
+          const reply = d.reply;
           try {
             await onReply(reply);
           } catch (err) {

@@ -6,6 +6,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { assertApproverPhone, createPhotonChannel } from '../src/approval/photonChannel.js';
 import type { PhotonApp, PhotonDm, RawMessage } from '../src/approval/photonChannel.js';
+import { formatNeedsAddressMessage } from '../src/approval/channel.js';
 
 const APPROVER = '+15555550123';
 
@@ -372,5 +373,45 @@ describe('createPhotonChannel tapback approval', () => {
     const stranger = { ...reaction('\u{1F44D}', DRAFT_MSG), sender: { id: '+15555550199' } } as RawMessage;
     const { channel } = await channelFor([stranger]);
     expect(await channel.captureReplies(200)).toEqual([]);
+  });
+});
+
+describe('a tapback on the needs-address message', () => {
+  const NEEDS = formatNeedsAddressMessage({
+    shortId: 'd70', personName: 'Xiyu Zhang', affiliation: 'Tongji University', paperTitle: 'A Paper',
+    rejected: [{ email: 'zhangyanghui@tongji.edu.cn', source: 'homepage', reason: 'the local part names a different person' }],
+  });
+
+  // The safety half: a thumbs up here must NOT decode to "d70 y". If it did,
+  // one tap would send the exact email the message exists to stop.
+  it('never becomes an approval', async () => {
+    const { channel } = await channelFor([reaction('\u{1F44D}', NEEDS)]);
+    expect(await channel.captureReplies(200)).toEqual([]);
+  });
+
+  // The usability half: silence is indistinguishable from a dead listener.
+  it('answers on-channel with the correction syntax', async () => {
+    const { channel, dmSend } = await channelFor([reaction('\u{1F44D}', NEEDS)]);
+    await channel.captureReplies(200);
+    expect(dmSend).toHaveBeenCalledTimes(1);
+    const sent = String(dmSend.mock.calls[0]![0]);
+    expect(sent).toContain('"d70 to their@address.edu"');
+    expect(/^\s*d\d+:/.test(sent)).toBe(false);
+  });
+
+  it('hints on the push path too, so batch and listener cannot drift', async () => {
+    const { channel, dmSend } = await channelFor([reaction('\u{1F44E}', NEEDS)]);
+    const seen: string[] = [];
+    await channel.streamReplies(async (r) => { seen.push(r.text); });
+    expect(seen).toEqual([]);
+    expect(dmSend).toHaveBeenCalledTimes(1);
+  });
+
+  // Unchanged behaviour, and it matters: the line may be shared, so a reaction
+  // on anything else must never be reflected back.
+  it('still reflects nothing for a reaction on an ordinary status line', async () => {
+    const { channel, dmSend } = await channelFor([reaction('\u{1F44D}', 'd25 sent to jiaruizhao@cuhk.edu.hk.')]);
+    expect(await channel.captureReplies(200)).toEqual([]);
+    expect(dmSend).not.toHaveBeenCalled();
   });
 });
