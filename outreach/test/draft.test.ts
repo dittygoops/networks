@@ -163,3 +163,33 @@ describe('paper-derived hook specificity check', () => {
     expectPaper(d.notes.join(' ')).not.toMatch(/paper-derived hooks only/i);
   });
 });
+
+// d68 went out to Mohamed Shawky Sabae with TWO sign-offs: the model ended its
+// single-paragraph body "...where to start. Best, Aditya" and the canonical
+// block was appended underneath. stripTrailingSignoff required a newline before
+// the sign-off, so an inline one survived. Found by the draft-quality judge
+// after the email had already been sent.
+describe('stripTrailingSignoff handles an inline sign-off', () => {
+  // generateDraft appends the canonical SIGNATURE, which itself starts "Best,".
+  // So the property is EXACTLY ONE sign-off, not zero.
+  const signoffs = (body: string) => (body.match(/^\s*Best,\s*$/gm) ?? []).length;
+
+  test('strips a sign-off that follows a sentence on the same line', async () => {
+    const body = 'Hi Mohamed, I saw your work on AEGIR. I was curious if you had any pointers on where to start. Best, Aditya';
+    const d = await generateDraft(llm(JSON.stringify({ subject: 's', body })), input);
+    expect(d.body).not.toMatch(/where to start\. Best, Aditya/);
+    expect(signoffs(d.body)).toBe(1);
+  });
+
+  test('does NOT eat a sentence that merely ends with the word best', async () => {
+    const body = 'Hi Ada, I read your paper. I am trying to work out which approach is best.';
+    const d = await generateDraft(llm(JSON.stringify({ subject: 's', body })), input);
+    expect(d.body).toMatch(/which approach is best\./);
+  });
+
+  test('still strips the newline-separated form it always handled', async () => {
+    const body = 'Hi Ada, I read your paper on X.\n\nBest,\nAditya';
+    const d = await generateDraft(llm(JSON.stringify({ subject: 's', body })), input);
+    expect(signoffs(d.body)).toBe(1);
+  });
+});

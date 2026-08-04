@@ -35,8 +35,21 @@ const stripStanceTags = (s: string): string => s.replace(/\s*\[(?:done|exploring
 // The model is told not to sign, but sometimes still ends with "Best,\nAditya".
 // Strip a trailing closing word (optionally followed by a short name line) so the
 // canonical SIGNATURE is not doubled up.
+// The model sometimes signs off INLINE, at the end of a single-paragraph body,
+// rather than on its own line. d68 went out to a real researcher reading
+// "...where to start. Best, Aditya" with the canonical block appended
+// underneath, because this pattern required a preceding newline. Found by the
+// draft-quality judge, after the send.
+//
+// The alternative opener `(?<=[.!?])\s+` is deliberately narrow: it requires
+// the sign-off word to directly follow sentence-ending punctuation, so a body
+// ending "...which approach is best." keeps its sentence (there, "best" is
+// preceded by a space and a word, not by punctuation).
 const stripTrailingSignoff = (s: string): string =>
-  s.replace(/\n+\s*(?:best|thanks|thank you|cheers|regards|sincerely|warmly|all the best)[,!.]?\s*(?:\n+\s*[A-Za-z][A-Za-z.\s]{0,30})?\s*$/i, '');
+  s.replace(
+    /(?:\n+\s*|(?<=[.!?])[ \t]+)(?:best|thanks|thank you|cheers|regards|sincerely|warmly|all the best)[,!.]?\s*(?:\n+\s*|[ \t]*)?(?:[A-Za-z][A-Za-z.\s]{0,30})?\s*$/i,
+    '',
+  );
 // Stems (first 5 chars of each >=5-char word), so "olfactory" and "olfaction"
 // both reduce to "olfac" and the grounding check tolerates natural paraphrase.
 const stems = (s: string): Set<string> =>
