@@ -177,6 +177,53 @@ describe('processPaper (orchestrator)', () => {
     await processPaper(d, ARXIV_ID); // same author, next paper: email already on record
     expect(queries.some((q) => q.includes('email') || q.includes('github'))).toBe(false);
   });
+
+  test('a name-mismatched address is reported on the result, not silently dropped', async () => {
+    // The whole point: "we found an address for the wrong person" must be
+    // distinguishable downstream from "we found nothing". Tier-1 PDF text is
+    // suppressed and an affiliation is present (KERBL's TU Wien) so this
+    // actually reaches extractContactDetailed's web tier, not just the
+    // on-record shortcut or a skipped lookup.
+    const search = vi.fn(async () => [
+      { url: 'https://tuwien.ac.at/staff', title: 'Staff', content: 'someoneelse@tuwien.ac.at' },
+    ]);
+    const d = deps({ search: { search }, fetcher: { fetch: async () => [] }, getPaperText: async () => null });
+    saveSelfFacts(d.db, [{ facet: 'academic', key: 'method', value: '3D Gaussian Splatting', sourceUrl: 'self', confidence: 0.9, tier: 'A' } as OntologyFact]);
+
+    const r = await processPaper(d, ARXIV_ID);
+
+    // Confirms the fixture actually exercises the web-search path (the whole
+    // point of the WARNING: a person with no affiliation never reaches it).
+    expect(search).toHaveBeenCalled();
+    expect(r.email).toBeNull();
+    expect((r.rejectedEmails ?? []).map((x) => x.email)).toContain('someoneelse@tuwien.ac.at');
+  });
+
+  test('the on-record shortcut reports no rejections, because nothing was looked up', async () => {
+    // Same setup as "a person whose email is already on record does not pay
+    // for another lookup" above: minePersonWeb calls `search` on every
+    // hook-passing paper for unrelated personal-fact mining, so a bare
+    // "search not called" assertion would catch the wrong thing. Filter to
+    // this feature's own queries (email / github), as that test does.
+    const homepage = 'https://tuwien.at/~kerbl/';
+    const queries: string[] = [];
+    const search = vi.fn(async (q: string) => {
+      queries.push(q);
+      return [{ url: homepage, title: 'Bernhard Kerbl', content: '' }];
+    });
+    const fetcher = vi.fn(async (urls: string[]) =>
+      urls.map((url) => ({ url, title: '', content: url === homepage ? 'contact: bernhard.kerbl@tuwien.ac.at' : '' })),
+    );
+    const d = deps({ search: { search }, fetcher: { fetch: fetcher }, getPaperText: async () => 'no emails here' });
+    saveSelfFacts(d.db, [{ facet: 'academic', key: 'method', value: '3D Gaussian Splatting', sourceUrl: 'self', confidence: 0.9, tier: 'A' } as OntologyFact]);
+
+    await processPaper(d, ARXIV_ID); // first pass: web tier runs, stores the address
+    queries.length = 0;
+    const r = await processPaper(d, ARXIV_ID); // same author, next paper: already on record
+
+    expect(queries.some((q) => q.includes('email') || q.includes('github'))).toBe(false);
+    expect(r.rejectedEmails ?? []).toEqual([]);
+  });
 });
 
 describe('arxivAgeMonths', () => {

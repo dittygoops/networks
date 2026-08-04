@@ -9,7 +9,11 @@ import {
   type OpenAlexAuthorRaw,
 } from '../openalex/client.js';
 import { resolveAuthor, minePersonFree, minePersonWeb, detectIdentityCollision, extractPaperFacts } from './research.js';
-import { extractContact, type PageFetcher, type SearchClient, type SelectedEmail, type EmailSource } from './contacts.js';
+import {
+  extractContactDetailed,
+  type PageFetcher, type SearchClient, type SelectedEmail, type EmailSource,
+  type RejectedCandidate, type ContactResult,
+} from './contacts.js';
 import { persistPerson } from './persist.js';
 import { computeIntersections, type Intersection } from './intersect.js';
 import { getFacts, saveFacts, upsertPerson, getPerson, clearIntersections, type DB } from '../db/db.js';
@@ -42,6 +46,11 @@ export interface OrchestrateResult {
   // OpenAlex identity collision (several real people merged under one author
   // id). The loop must never draft from a flagged person; see loop.ts.
   identityCollisionReason?: string;
+  // Candidates rejected for naming a different person. OPTIONAL: two test
+  // files build an OrchestrateResult literal behind an explicit type
+  // annotation, so a required field breaks typecheck outside this file. Read
+  // it as `(result.rejectedEmails ?? [])` everywhere.
+  rejectedEmails?: RejectedCandidate[];
 }
 
 // arXiv ids encode YYMM: 2308.x -> 2023-08. Used for D1 paper-email age decay.
@@ -131,13 +140,14 @@ export async function processPaper(
   let profileSummary: string | undefined;
   let identityCollisionReason: string | undefined;
   let email: SelectedEmail | null = null;
+  let rejectedEmails: RejectedCandidate[] = [];
 
   // Contact extraction, factored out so the exits below can reuse it. Returns
   // (rather than assigns to the outer `email` via closure) because TypeScript
   // narrows a `let`-bound variable reassigned only inside a nested closure
   // back to its initial-assignment type at read sites in the outer scope,
   // which would make `if (email)` below report `email` as `never`.
-  const runContactExtraction = async (aff: string | undefined): Promise<SelectedEmail | null> => {
+  const runContactExtraction = async (aff: string | undefined): Promise<ContactResult> => {
     // A repeat author already has an address on record; re-paying Tavily to
     // rediscover it is pure waste. Read the ORIGINAL source/confidence back
     // off the person row rather than inventing a new 'on_record' value:
@@ -147,14 +157,19 @@ export async function processPaper(
     // the address really did come from a homepage or a PDF originally, so
     // reporting that is more truthful anyway. This shortcut re-enters the
     // upsertPerson call below with the same values it read, which is a no-op.
+    // `rejected: []` is not a shrug, it is the truth: nothing was looked up,
+    // so nothing was rejected.
     if (personId != null) {
       const known = getPerson(deps.db, personId);
       if (known?.email) {
-        return { email: known.email, confidence: known.email_confidence ?? 1, source: (known.email_source as EmailSource | null) ?? 'directory' };
+        return {
+          selected: { email: known.email, confidence: known.email_confidence ?? 1, source: (known.email_source as EmailSource | null) ?? 'directory' },
+          rejected: [],
+        };
       }
     }
     const paperText = deps.getPaperText ? await deps.getPaperText(arxivId) : await defaultPaperText(arxivId, fetchFn);
-    return extractContact({ search: deps.search, fetcher: deps.fetcher }, { name: target.name }, paperText, {
+    return extractContactDetailed({ search: deps.search, fetcher: deps.fetcher }, { name: target.name }, paperText, {
       paperContext: ctx,
       currentAffiliation: aff,
       paperAgeMonths: arxivAgeMonths(arxivId),
@@ -186,11 +201,12 @@ export async function processPaper(
     noStrongHook,
     notes,
     identityCollisionReason,
+    rejectedEmails,
   });
 
   if (!resolution || !raw) {
     notes.push('identity unconfirmed (UNRESOLVED)');
-    if (opts.alwaysExtractContact) email = await runContactExtraction(currentAff);
+    if (opts.alwaysExtractContact) ({ selected: email, rejected: rejectedEmails } = await runContactExtraction(currentAff));
     return result();
   }
 
@@ -212,7 +228,7 @@ export async function processPaper(
     // run when they were not flagged: nothing else will clear them, because
     // saveIntersections' DELETE+INSERT no longer runs for them.
     clearIntersections(deps.db, personId);
-    if (opts.alwaysExtractContact) email = await runContactExtraction(currentAff);
+    if (opts.alwaysExtractContact) ({ selected: email, rejected: rejectedEmails } = await runContactExtraction(currentAff));
     return result();
   }
 
@@ -226,7 +242,7 @@ export async function processPaper(
   ({ ranked: hooks, noStrongHook } = await computeIntersections(deps.db, { llm: deps.llm }, personId));
 
   if (noStrongHook || hooks.length === 0) {
-    if (opts.alwaysExtractContact) email = await runContactExtraction(currentAff);
+    if (opts.alwaysExtractContact) ({ selected: email, rejected: rejectedEmails } = await runContactExtraction(currentAff));
     return result(); // zero paid calls on the loop path
   }
 
@@ -246,7 +262,7 @@ export async function processPaper(
   ({ ranked: hooks, noStrongHook } = await computeIntersections(deps.db, { llm: deps.llm }, personId));
 
   // --- Step 6: contact, survivors only ---
-  email = await runContactExtraction(currentAff);
+  ({ selected: email, rejected: rejectedEmails } = await runContactExtraction(currentAff));
   if (email) {
     upsertPerson(deps.db, {
       name: target.name,
