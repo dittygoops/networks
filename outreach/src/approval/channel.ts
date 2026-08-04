@@ -19,6 +19,7 @@ export interface InboundReply {
 export type ParsedReply =
   | { kind: 'approve'; shortId: string }
   | { kind: 'skip'; shortId: string }
+  | { kind: 'address'; shortId: string; email: string }
   | { kind: 'unsupported'; shortId: string }
   | { kind: 'unparseable' };
 
@@ -53,18 +54,45 @@ export interface ApprovalChannel {
 const APPROVE = new Set(['y', 'yes', 'send', 'ok', 'approve']);
 const SKIP = new Set(['n', 'no', 'skip', 'reject']);
 
+// Deliberately narrow, and the same shape assertSafeOutbound enforces: exactly
+// one bare address, no display name, no comma, no angle brackets. This is a
+// convenience refusal so a malformed reply gets a useful message at correction
+// time; assertSafeOutbound remains the real gate at send time.
+const ADDRESS_SHAPE = /^[^\s<>,;:\\"]+@[^\s<>,;:\\"]+\.[^\s<>,;:\\"]+$/;
+
+// The local part of an address is not formally case-insensitive, so it is read
+// from the RAW token and preserved; only the domain is lowercased. One run of
+// trailing sentence punctuation is stripped because iOS inserts a period on a
+// double space, and no real address ends in one.
+function normalizeAddress(rawToken: string): string | null {
+  const trimmed = rawToken.replace(/[.,;:!?]+$/, '');
+  if (!ADDRESS_SHAPE.test(trimmed)) return null;
+  const at = trimmed.lastIndexOf('@');
+  return `${trimmed.slice(0, at)}@${trimmed.slice(at + 1).toLowerCase()}`;
+}
+
 export function parseReply(text: string): ParsedReply {
-  const tokens = text.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  // Two parallel arrays, deliberately. The id-stripping loop below removes the
+  // id token WHEREVER it appears, not only at position 0, so `rest` is not
+  // positionally aligned with the input: parseReply('to d70 a@b.edu') yields
+  // rest = ['to','a@b.edu'] exactly like the normal form. Recovering the
+  // original-case address by indexing `raw` at rest's own index would read
+  // 'd70' as the address. `restIdx` records the ORIGINAL index instead.
+  const raw = text.trim().split(/\s+/).filter(Boolean);
+  const tokens = raw.map((t) => t.toLowerCase());
   if (!tokens.length) return { kind: 'unparseable' };
 
   let shortId: string | undefined;
   const rest: string[] = [];
-  for (const t of tokens) {
+  const restIdx: number[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i]!;
     const id = shortId === undefined ? parseShortId(t) : null;
     if (id !== null) {
       shortId = formatShortId(id);
     } else {
       rest.push(t);
+      restIdx.push(i);
     }
   }
   if (shortId === undefined) return { kind: 'unparseable' };
@@ -78,7 +106,57 @@ export function parseReply(text: string): ParsedReply {
   if (rest.length === 0) return { kind: 'unparseable' };
   if (rest.length === 1 && APPROVE.has(rest[0] ?? '')) return { kind: 'approve', shortId };
   if (rest.length === 1 && SKIP.has(rest[0] ?? '')) return { kind: 'skip', shortId };
+  // One advertised form only. A bare "d70 someone@uni.edu" stays unsupported,
+  // matching the existing "d70 y" shape and keeping the grammar small.
+  if (rest.length === 2 && rest[0] === 'to') {
+    const email = normalizeAddress(raw[restIdx[1]!] ?? '');
+    if (email) return { kind: 'address', shortId, email };
+  }
   return { kind: 'unsupported', shortId }; // an edit instruction: F5 owns this
+}
+
+// --- The needs-address message -------------------------------------------
+// Lives here, not in photonChannel.ts, because two places need it and must not
+// drift: the loop sends it, and the channel must recognise a tapback on it.
+//
+// It MUST begin with the literal 'NEEDS ADDRESS' and no line of it may begin
+// with `dN:`. draftIdFromReactedText (photonChannel.ts) turns any message whose
+// text starts /^\s*(d\d+):/ into a tapback-approvable draft, so a needs-address
+// message with that header would let one thumbs up send the very email that was
+// flagged as going to the wrong person. The header therefore puts the id AFTER
+// the word 'for' and never follows it with a colon, so even a tolerant future
+// parser finds nothing to bind.
+export interface NeedsAddressMessage {
+  shortId: string;
+  personName: string;
+  affiliation?: string | null;
+  paperTitle: string;
+  rejected: Array<{ email: string; source: string; reason: string }>;
+}
+
+const NEEDS_ADDRESS_HEADER = /^NEEDS ADDRESS for (d\d+)\b/;
+
+export function formatNeedsAddressMessage(m: NeedsAddressMessage): string {
+  const who = m.affiliation ? `${m.personName} (${m.affiliation})` : m.personName;
+  return [
+    `NEEDS ADDRESS for ${m.shortId}`,
+    who,
+    `Paper: ${m.paperTitle}`,
+    ...m.rejected.map((r) => `Rejected: ${r.email} (${r.source}) because ${r.reason}`),
+    `Reply "${m.shortId} to their@address.edu" with the right address, or "${m.shortId} n" to skip.`,
+  ].join('\n');
+}
+
+export function needsAddressDraftId(text: string | undefined): string | null {
+  const m = NEEDS_ADDRESS_HEADER.exec((text ?? '').trim());
+  return m ? m[1]! : null;
+}
+
+// A tapback is the owner's trained reflex, and on this message it used to
+// produce total silence, which is indistinguishable from a dead listener.
+// Begins with "d70 " and no colon, so the hint is not itself an approval button.
+export function needsAddressTapbackHint(shortId: string): string {
+  return `${shortId} needs a typed address, not a tapback. Reply "${shortId} to their@address.edu", or "${shortId} n" to skip.`;
 }
 
 export interface StubChannel extends ApprovalChannel {
