@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { openDb, upsertPerson } from '../src/db/db.js';
 import { runLoop } from '../src/pipeline/loop.js';
 import { createStubChannel } from '../src/approval/channel.js';
-import { persistDraft, priorThreads } from '../src/approval/ledger.js';
+import { logEvent, persistDraft, priorThreads } from '../src/approval/ledger.js';
 import { recordDiscovered } from '../src/discovery/seenLedger.js';
 import type { Candidate, DiscoverySource } from '../src/discovery/types.js';
 import type { Draft, DraftInput } from '../src/pipeline/draft.js';
@@ -61,6 +61,12 @@ const resolvedResult = (arxivId: string, personId: number): OrchestrateResult =>
   hooks: [{ tier: 'A' } as never],
   noStrongHook: false,
   notes: [],
+});
+
+const rejectedResult = (arxivId: string, personId: number): OrchestrateResult => ({
+  ...resolvedResult(arxivId, personId),
+  email: null,
+  rejectedEmails: [{ email: 'someoneelse@uni.edu', source: 'homepage', reason: 'identity_mismatch' }],
 });
 
 describe('runLoop discovery', () => {
@@ -344,6 +350,131 @@ describe('runLoop discovery', () => {
     expect(first?.status).toBe('messaged');
     expect(second?.status).toBe('drafted_unsendable');
     expect(second?.reason).toContain('prior thread');
+  });
+
+  it('drafts, asks for the address, and parks the row with its draft id attached', async () => {
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'Someone' });
+    const { deps, channel } = baseDeps(db, {
+      sources: [source([cand('2601.00020', 'Olfactory Embedding Space Sensors')])],
+      processPaper: vi.fn().mockResolvedValue(rejectedResult('2601.00020', pid)),
+    });
+    await runLoop(deps, { dryRun: false });
+    // The message, not a draft message: a draft message begins "dN:" and is
+    // tapback-approvable, which would let one thumbs up send the very email
+    // that was flagged as going to the wrong person.
+    expect(channel.sent).toHaveLength(0);
+    const needs = channel.notices.find((n) => n.startsWith('NEEDS ADDRESS'));
+    expect(needs).toBeDefined();
+    expect(needs).toContain('someoneelse@uni.edu');
+    const row = db.prepare('SELECT status, reason, draft_id AS draftId FROM seen_papers WHERE arxiv_id = ?')
+      .get('2601.00020') as { status: string; reason: string; draftId: number | null };
+    expect(row.status).toBe('drafted_unsendable');
+    expect(row.reason).toMatch(/^awaiting address correction \(d\d+\): rejected someoneelse@uni\.edu$/);
+    // Load-bearing: without it, a successful correction makes strandedReport's
+    // orphanDrafts query raise a permanent false alarm.
+    expect(row.draftId).not.toBeNull();
+  });
+
+  it('still reports no email resolved when nothing was rejected', async () => {
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'Someone' });
+    const { deps } = baseDeps(db, {
+      sources: [source([cand('2601.00021', 'Olfactory Embedding Space Sensors')])],
+      processPaper: vi.fn().mockResolvedValue({ ...resolvedResult('2601.00021', pid), email: null }),
+    });
+    await runLoop(deps, { dryRun: false });
+    const row = db.prepare('SELECT reason FROM seen_papers WHERE arxiv_id = ?').get('2601.00021') as { reason: string };
+    expect(row.reason).toBe('no email resolved');
+  });
+
+  // The budget-separation regression. GATE.maxMessagesPerRun is 3 in this
+  // file, and maxAddressRequestsPerRun defaults to 3, so three approvable
+  // drafts AND an address request must all go out in one run.
+  it('does not let an address request consume a message slot', async () => {
+    const db = openDb(':memory:');
+    const ids = ['2601.00030', '2601.00031', '2601.00032'];
+    const people = ids.map((_, i) => upsertPerson(db, { name: `Person ${i}`, openalexId: `A${i}` }));
+    const needy = upsertPerson(db, { name: 'Needy', openalexId: 'A-needy' });
+    const byId: Record<string, OrchestrateResult> = {};
+    ids.forEach((a, i) => { byId[a] = resolvedResult(a, people[i]!); });
+    byId['2601.00033'] = rejectedResult('2601.00033', needy);
+    const { deps, channel } = baseDeps(db, {
+      sources: [source([...ids, '2601.00033'].map((a) => cand(a, 'Olfactory Embedding Space Sensors')))],
+      processPaper: vi.fn(async (_d: unknown, a: string) => byId[a]!),
+    });
+    const summary = await runLoop(deps, { dryRun: false });
+    expect(summary.messaged).toBe(3);              // the cap is fully spent on drafts
+    expect(summary.addressRequested).toBe(1);      // and the request still went out
+    expect(channel.notices.filter((n) => n.startsWith('NEEDS ADDRESS'))).toHaveLength(1);
+  });
+
+  it('defers past its own budget without touching queued_for_message', async () => {
+    const db = openDb(':memory:');
+    const ids = ['2601.00040', '2601.00041', '2601.00042', '2601.00043'];
+    const byId: Record<string, OrchestrateResult> = {};
+    ids.forEach((a, i) => { byId[a] = rejectedResult(a, upsertPerson(db, { name: `P${i}`, openalexId: `B${i}` })); });
+    const { deps, channel } = baseDeps(db, {
+      sources: [source(ids.map((a) => cand(a, 'Olfactory Embedding Space Sensors')))],
+      processPaper: vi.fn(async (_d: unknown, a: string) => byId[a]!),
+    });
+    const summary = await runLoop(deps, { dryRun: false });
+    expect(summary.addressRequested).toBe(3);
+    expect(channel.notices.filter((n) => n.startsWith('NEEDS ADDRESS'))).toHaveLength(3);
+    const deferred = db.prepare(
+      `SELECT status, reason FROM seen_papers WHERE reason LIKE 'address correction not yet requested%'`,
+    ).all() as { status: string; reason: string }[];
+    expect(deferred).toHaveLength(1);
+    // queued_for_message is the wrong resting place: runLoop's flush would call
+    // resolveSendableDraft, hit the no_email branch, and RETIRE the draft,
+    // destroying the very draft the correction waits for.
+    expect(deferred[0]!.status).toBe('drafted_unsendable');
+  });
+
+  it('drains the deferred backlog on the next run', async () => {
+    const db = openDb(':memory:');
+    const ids = ['2601.00040', '2601.00041', '2601.00042', '2601.00043'];
+    const byId: Record<string, OrchestrateResult> = {};
+    ids.forEach((a, i) => { byId[a] = rejectedResult(a, upsertPerson(db, { name: `P${i}`, openalexId: `C${i}` })); });
+    const first = baseDeps(db, {
+      sources: [source(ids.map((a) => cand(a, 'Olfactory Embedding Space Sensors')))],
+      processPaper: vi.fn(async (_d: unknown, a: string) => byId[a]!),
+    });
+    await runLoop(first.deps, { dryRun: false });
+    const second = baseDeps(db, { sources: [source([])] });
+    const summary = await runLoop(second.deps, { dryRun: false });
+    expect(summary.addressRequested).toBe(1);
+    expect(second.channel.notices.filter((n) => n.startsWith('NEEDS ADDRESS'))).toHaveLength(1);
+    expect(db.prepare(`SELECT COUNT(*) AS n FROM seen_papers WHERE reason LIKE 'address correction not yet requested%'`)
+      .get()).toEqual({ n: 0 });
+  });
+
+  it('never asks again about a person who declined', async () => {
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'Someone' });
+    const { deps, channel } = baseDeps(db, {
+      sources: [source([cand('2601.00050', 'Olfactory Embedding Space Sensors')])],
+      processPaper: vi.fn().mockResolvedValue(rejectedResult('2601.00050', pid)),
+    });
+    // Stand in for an earlier "dN n" on a different draft for the same person.
+    logEvent(db, null, 'address_request_declined', { personId: pid });
+    await runLoop(deps, { dryRun: false });
+    expect(channel.notices.filter((n) => n.startsWith('NEEDS ADDRESS'))).toHaveLength(0);
+    const row = db.prepare('SELECT reason FROM seen_papers WHERE arxiv_id = ?').get('2601.00050') as { reason: string };
+    expect(row.reason).toBe('address correction declined for this person');
+  });
+
+  it('puts the pending backlog in the run summary, because a CLI command is somewhere he has to go', async () => {
+    const db = openDb(':memory:');
+    const pid = upsertPerson(db, { name: 'Someone' });
+    const { deps, channel } = baseDeps(db, {
+      sources: [source([cand('2601.00060', 'Olfactory Embedding Space Sensors')])],
+      processPaper: vi.fn().mockResolvedValue(rejectedResult('2601.00060', pid)),
+    });
+    await runLoop(deps, { dryRun: false });
+    const line = channel.notices[channel.notices.length - 1]!;
+    expect(line).toContain('address requests 1');
+    expect(line).toContain('addresses pending 1');
   });
 });
 

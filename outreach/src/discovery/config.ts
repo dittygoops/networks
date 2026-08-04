@@ -16,6 +16,12 @@ export interface GateConfig {
   // so nothing retries a poison candidate forever (CS3.3).
   maxResumePerRun: number;
   maxResumeAttempts: number;
+  // Its own bound, deliberately not shared with maxMessagesPerRun: a draft
+  // message can be approved with one tap, an address request costs a human
+  // lookup, so sharing the cap would let a request silently displace an
+  // approvable draft. OPTIONAL because three test files build a
+  // GateConfig-shaped literal and a required field breaks all three.
+  maxAddressRequestsPerRun?: number;
 }
 
 export interface LoopConfig {
@@ -35,6 +41,7 @@ interface RawFile {
     max_messages_per_run?: number;
     max_resume_per_run?: number;
     max_resume_attempts?: number;
+    max_address_requests_per_run?: number;
   };
 }
 
@@ -44,6 +51,7 @@ const DEFAULT_GATE: GateConfig = {
   maxMessagesPerRun: 3,
   maxResumePerRun: 10,
   maxResumeAttempts: 3,
+  maxAddressRequestsPerRun: 3,
 };
 
 // An absent file is the normal zero-config path, so it stays quiet. A file that
@@ -91,6 +99,7 @@ export function loadConfig(db: DB, path = 'config/watchlist.yaml'): LoopConfig {
       maxMessagesPerRun: raw.gate?.max_messages_per_run ?? DEFAULT_GATE.maxMessagesPerRun,
       maxResumePerRun: raw.gate?.max_resume_per_run ?? DEFAULT_GATE.maxResumePerRun,
       maxResumeAttempts: raw.gate?.max_resume_attempts ?? DEFAULT_GATE.maxResumeAttempts,
+      maxAddressRequestsPerRun: raw.gate?.max_address_requests_per_run ?? DEFAULT_GATE.maxAddressRequestsPerRun,
     },
   };
 }

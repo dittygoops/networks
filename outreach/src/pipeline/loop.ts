@@ -22,7 +22,16 @@ import {
   type PersistedDraft,
 } from '../approval/ledger.js';
 import { formatShortId, parseShortId } from '../approval/ids.js';
-import { addressWasRequested, applyAddressCorrection } from './addressCorrection.js';
+import {
+  addressRequestDeclined,
+  addressWasRequested,
+  applyAddressCorrection,
+  deferAddressRequest,
+  deferredAddressRequests,
+  deferredPayload,
+  pendingAddressCount,
+  requestAddress,
+} from './addressCorrection.js';
 import type { LoopConfig } from '../discovery/config.js';
 import { discoverAll } from '../discovery/index.js';
 import {
@@ -39,6 +48,7 @@ import {
 import { gateCandidate } from '../discovery/relevanceGate.js';
 import type { Candidate, DiscoverySource } from '../discovery/types.js';
 import type { Draft, DraftInput } from './draft.js';
+import type { RejectedCandidate } from './contacts.js';
 import type { OrchestrateResult } from './orchestrate.js';
 import { assertSafeOutbound, type Sender } from '../sender/types.js';
 import type { LLMClient } from '../llm/client.js';
@@ -92,8 +102,23 @@ export interface LoopSummary {
   // Optional so listen.ts's LoopSummary literal still compiles; this plan does
   // not own that file.
   stalled?: number;
+  // Needs-address texts sent this run. Deliberately NOT `messaged`: nothing was
+  // messaged as an approvable draft, and conflating them would hide an address
+  // request inside a number the summary line already reports. Optional, like
+  // `stalled`, because listen.ts builds a LoopSummary literal.
+  addressRequested?: number;
+  // The whole outstanding backlog, reported every run. It otherwise appears
+  // only in `outreach stranded`, and 18 drafts once sat undelivered because
+  // nothing that requires going somewhere gets read.
+  addressesPending?: number;
   errors: string[];
 }
+
+// Small on purpose. Measured drafts per day on data/outreach.db were 11, 6 and
+// 7 over the three days before this shipped, against a max_messages_per_run of
+// 10, so the message cap is NOT saturated daily and this is hygiene rather than
+// an emergency. Raise it once the real rate of rejections is measured.
+const DEFAULT_MAX_ADDRESS_REQUESTS_PER_RUN = 3;
 
 // A parsed short id only proves the text was well formed, not that the draft
 // it names exists. decisions.draft_id and draft_events.draft_id both
@@ -401,6 +426,67 @@ async function emit(
   }
 }
 
+// Drafts first, then asks. Drafting is forced, not preferred: the correction
+// reply is handled by handleReply, whose dependency set is ReplyDeps, and that
+// split exists so `outreach listen` never fabricates drafting dependencies.
+// Drafting inside the reply handler would put llm, buildDraftInput and an
+// OpenRouter key into the listener daemon. Drafting up front also gives the
+// correction a dN to name, which is what makes the reply syntax work.
+async function draftAndRequestAddress(
+  deps: LoopDeps,
+  summary: LoopSummary,
+  c: Candidate,
+  result: OrchestrateResult,
+  rejected: RejectedCandidate[],
+  relevanceReason: string,
+): Promise<void> {
+  const input = deps.buildDraftInput(result);
+  const draft = await deps.generateDraft(deps.llm as LLMClient, input);
+  if (!draft.grounded) {
+    setStatus(deps.db, c.arxivId, 'drafted_unsendable', `grounding failed: ${draft.notes.join('; ')}`);
+    summary.unsendable++;
+    return;
+  }
+  const persisted = deps.db.transaction((): PersistedDraft => {
+    const p = persistDraft(deps.db, {
+      personId: result.personId as number,
+      paperArxivId: result.arxivId,
+      paperTitle: result.paperTitle,
+      intent: input.intent,
+      draftInput: input,
+      draft,
+      contextJson: { discoveredVia: c.discoveredVia, sourceDetail: c.sourceDetail, relevance: relevanceReason },
+    });
+    // persistDraft reads people.email (NULL here) into drafts.to_email, which
+    // is the shape `outreach add` already parks as a manual-lookup queue and
+    // which loadApprovedSend already refuses as no_snapshot.
+    setStatus(deps.db, c.arxivId, 'discovered', relevanceReason, p.draftId);
+    return p;
+  })();
+
+  const person = getPerson(deps.db, result.personId as number);
+  const req = {
+    db: deps.db,
+    arxivId: c.arxivId,
+    draftId: persisted.draftId,
+    shortId: persisted.shortId,
+    personId: result.personId as number,
+    personName: result.target,
+    affiliation: person?.affiliation ?? null,
+    paperTitle: result.paperTitle,
+    rejected,
+  };
+  summary.unsendable++;
+  const budget = deps.config.gate.maxAddressRequestsPerRun ?? DEFAULT_MAX_ADDRESS_REQUESTS_PER_RUN;
+  if ((summary.addressRequested ?? 0) >= budget) {
+    deferAddressRequest(req);
+    return;
+  }
+  if (await requestAddress({ ...req, notify: (t) => deps.channel.notify(t) })) {
+    summary.addressRequested = (summary.addressRequested ?? 0) + 1;
+  }
+}
+
 async function processCandidate(
   deps: LoopDeps,
   opts: LoopOptions,
@@ -435,12 +521,35 @@ async function processCandidate(
     }
     // Checked AFTER the hook gate. Hook-first gating means contact extraction
     // does not run for a hookless candidate, so `email: null` there means "not
-    // attempted", not "looked and failed". Checking email first would relabel
-    // every no-hook paper 'no email resolved' and make the hook gate
-    // unobservable in seen_papers.
+    // attempted", not "looked and failed".
     if (!result.email) {
-      setStatus(deps.db, c.arxivId, 'drafted_unsendable', 'no email resolved');
-      summary.unsendable++;
+      const rejected = result.rejectedEmails ?? [];
+      if (rejected.length === 0) {
+        setStatus(deps.db, c.arxivId, 'drafted_unsendable', 'no email resolved');
+        summary.unsendable++;
+        return;
+      }
+      // Duplicated rather than hoisted above the email gate. Hoisting would
+      // relabel every candidate that fails both checks from 'no email resolved'
+      // to 'prior thread exists', and the hook-first spec's Change 2 is the
+      // record of what a gate reorder does to the status buckets.
+      const priorForAddress = priorThreads(deps.db, result.personId);
+      if (priorForAddress.length > 0) {
+        setStatus(deps.db, c.arxivId, 'drafted_unsendable', `prior thread exists (${priorForAddress[0]?.shortId ?? ''})`);
+        summary.unsendable++;
+        return;
+      }
+      if (addressRequestDeclined(deps.db, result.personId)) {
+        setStatus(deps.db, c.arxivId, 'drafted_unsendable', 'address correction declined for this person');
+        summary.unsendable++;
+        return;
+      }
+      if (opts.dryRun) {
+        setStatus(deps.db, c.arxivId, 'discovered', 'dry run: would request address');
+        summary.wouldMessage++;
+        return;
+      }
+      await draftAndRequestAddress(deps, summary, c, result, rejected, verdict.reason);
       return;
     }
     const prior = priorThreads(deps.db, result.personId);
@@ -862,6 +971,36 @@ async function reportStalledApprovals(deps: LoopDeps, summary: LoopSummary): Pro
   }
 }
 
+// A deferred needs-address row rests at drafted_unsendable, which is terminal:
+// getResumable only looks at 'discovered', and queued_for_message is unusable
+// here because resolveSendableDraft's no_email branch RETIRES the draft. So the
+// backlog needs its own drain, bounded by the same per-run address budget.
+async function drainAddressRequests(deps: LoopDeps, summary: LoopSummary): Promise<void> {
+  const budget = deps.config.gate.maxAddressRequestsPerRun ?? DEFAULT_MAX_ADDRESS_REQUESTS_PER_RUN;
+  const remaining = budget - (summary.addressRequested ?? 0);
+  if (remaining <= 0) return;
+  for (const row of deferredAddressRequests(deps.db, remaining)) {
+    // Rebuilt from the structured event payload, never by parsing the address
+    // back out of a reason string: the reason wording changes twice in this
+    // feature and the drain must not be coupled to it.
+    const p = deferredPayload(deps.db, row.draftId);
+    if (!p) continue;
+    const ok = await requestAddress({
+      db: deps.db,
+      notify: (t) => deps.channel.notify(t),
+      arxivId: row.arxivId,
+      draftId: row.draftId,
+      shortId: row.shortId,
+      personId: p.personId,
+      personName: p.personName,
+      affiliation: p.affiliation,
+      paperTitle: row.paperTitle,
+      rejected: p.rejected,
+    });
+    if (ok) summary.addressRequested = (summary.addressRequested ?? 0) + 1;
+  }
+}
+
 export async function runLoop(deps: LoopDeps, opts: LoopOptions): Promise<LoopSummary> {
   const summary: LoopSummary = {
     dryRun: opts.dryRun,
@@ -922,6 +1061,17 @@ export async function runLoop(deps: LoopDeps, opts: LoopOptions): Promise<LoopSu
       }
     }
 
+    // After the queued draft flush and before discovery, same reason queued
+    // work goes out ahead of new work.
+    if (!opts.dryRun) {
+      try {
+        await drainAddressRequests(deps, summary);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        summary.errors.push(`address request drain failed: ${msg}`);
+      }
+    }
+
     // CS1.1: resume discovered rows before discovering anything fresh, same
     // reason queued work goes out ahead of new work. Failure-isolated (CS7.6)
     // so a resume failure never prevents discovery (F1).
@@ -950,6 +1100,11 @@ export async function runLoop(deps: LoopDeps, opts: LoopOptions): Promise<LoopSu
     const msg = e instanceof Error ? e.message : String(e);
     summary.errors.push(`run failed: ${msg}`);
   } finally {
+    try {
+      summary.addressesPending = pendingAddressCount(deps.db);
+    } catch {
+      // Read-only reporting must never mask the real failure above.
+    }
     const line =
       `outreach loop${opts.dryRun ? ' (dry run)' : ''}: seen ${summary.seen}, filtered ${summary.filtered}, ` +
       `unsendable ${summary.unsendable}, messaged ${summary.messaged}, queued ${summary.queued}, sent ${summary.sent}, ` +
@@ -962,6 +1117,8 @@ export async function runLoop(deps: LoopDeps, opts: LoopOptions): Promise<LoopSu
       (summary.retryable ? `, retryable ${summary.retryable}` : '') +
       (summary.stranded ? `, stranded ${summary.stranded}` : '') +
       (summary.stalled ? `, stalled approvals ${summary.stalled}` : '') +
+      (summary.addressRequested ? `, address requests ${summary.addressRequested}` : '') +
+      (summary.addressesPending ? `, addresses pending ${summary.addressesPending}` : '') +
       (summary.errors.length ? `, errors: ${summary.errors.join(' | ')}` : '');
     try {
       await deps.channel.notify(line);
