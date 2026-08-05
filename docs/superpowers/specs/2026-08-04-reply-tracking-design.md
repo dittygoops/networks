@@ -44,8 +44,9 @@ and stable (it was also exactly 5 at the previous measurement of 39 sends).
 
 **What actually guarantees at most one send on the `add` path.** Not
 `beginSendAttempt`, which that path bypasses entirely, as the 5-row gap proves.
-It is `decide`'s `UNIQUE(draft_id)` on the `decisions` table (`schema.sql:96`,
-commented there as "UNIQUE(draft_id) IS the A9 first-write-wins guarantee").
+It is `decide`'s `UNIQUE(draft_id)` on the `decisions` table (the constraint is
+`schema.sql:96`; the comment "UNIQUE(draft_id) IS the A9 first-write-wins
+guarantee" is `schema.sql:93`).
 `cli.ts:398-402` calls `decide` and returns early if `applied` is false, so a
 second `outreach add` on the same draft cannot reach `sender.send`. This matters
 for Change 2: `recordSentThread` is called on both paths and must not assume the
@@ -53,6 +54,7 @@ for Change 2: `recordSentThread` is called on both paths and must not assume the
 
 So the raw material for reply tracking already exists and is complete: `markSent`
 (`src/approval/ledger.ts:119`) writes `logEvent(db, draftId, 'sent', { sentId })`
+(`ledger.ts:122`)
 inside the same transaction as the status update, and all 56 of those ids are
 real Gmail message ids rather than the two synthesized fallbacks in the code
 (`gmail-${Date.now()}` at `src/sender/gmail-api.ts:52`, `smtp-${Date.now()}` at
@@ -242,7 +244,7 @@ event is not recoverable at all. The asymmetry decides it.
 In `performApprovedSend` (`loop.ts:137-240`) the network `try` spans lines
 **224-232**: `deps.sender.send`, `markSent`, `summary.sent++`, and the `SENT ...`
 notify. If `recordSentThread` were called inside that block unwrapped, a throw
-would land in the catch at :232, which calls `markSendFailed` (writing a
+would land in the catch at **:233**, which calls `markSendFailed` (writing a
 `send_failed` event) and texts `"${shortId} failed to send: ..."` **for an email
 that already went out**. The draft would stay `sent` (that UPDATE committed) but
 the ledger and the human would both be told the opposite. So the call is placed
@@ -260,11 +262,23 @@ never polled and nothing that counts the gap. Split the two:
   head of every run:
 
   ```sql
-  INSERT INTO sent_threads (draft_id, person_id, sent_message_id, thread_id, sent_at)
+  INSERT INTO sent_threads (draft_id, person_id, sent_message_id, thread_id, sent_at, watch_state)
   SELECT e.draft_id, d.person_id,
          json_extract(e.detail_json, '$.sentId'),
          json_extract(e.detail_json, '$.threadId'),
-         e.created_at
+         e.created_at,
+         -- The Gmail-shape guard, applied AT ADOPT TIME. Without this column the
+         -- insert falls through to the table DEFAULT of 'open', so a non-Gmail
+         -- sentId (an SMTP Message-ID, or one of the two synthesized fallbacks)
+         -- is adopted as pollable and the poller retries it forever, which
+         -- directly contradicts "recorded once as unresolvable and never
+         -- retried" two paragraphs below. GLOB rather than a regex because
+         -- SQLite has no REGEXP by default: the pair of clauses is "starts with
+         -- a lowercase hex character" AND "contains no character that is not
+         -- lowercase hex".
+         CASE WHEN json_extract(e.detail_json, '$.sentId') GLOB '[0-9a-f]*'
+               AND json_extract(e.detail_json, '$.sentId') NOT GLOB '*[^0-9a-f]*'
+              THEN 'open' ELSE 'unresolvable' END
     FROM draft_events e
     JOIN drafts d ON d.id = e.draft_id
     LEFT JOIN sent_threads st ON st.draft_id = e.draft_id
@@ -331,32 +345,42 @@ The earlier draft said `received_at` would be stored "as an ISO UTC string to
 match every other timestamp in the schema". **That claim is false and the format
 it prescribes is a bug.** No other timestamp in this schema is ISO-Z: every one
 of them is `datetime('now')`, which emits a space separator and no `Z`. Measured
-on this machine, against the live database, 2026-08-04 21:03 UTC:
+on this machine 2026-08-05:
 
 ```
-sqlite> SELECT '2026-08-04T10:00:00Z' <= datetime('now'),
-   ...>        '2026-08-04 10:00:00'  <= datetime('now'),
-   ...>        datetime('now');
-0|1|2026-08-04 21:03:34
+strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 hour') <= datetime('now')  ->  0
+strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 day')  <= datetime('now')  ->  1
+strftime('%Y-%m-%d %H:%M:%S','now','-1 hour')  <= datetime('now')  ->  1
 ```
 
-A due time eleven hours in the past compares as **not yet due** in the ISO-Z
-form. SQLite compares TEXT bytewise, `T` is 0x54 and space is 0x20, so
-`'2026-08-04T...'` sorts above `'2026-08-04 21:03:34'` for every hour of the same
-day. Written that way, `next_poll_at <= datetime('now')` in the selection query
-is false forever, the row is selected exactly once (from its
-`DEFAULT (datetime('now'))`, which is in the correct form) and never again, and
-the poller goes permanently silent after the first cycle **with no error, no
-failed cycle, and no notification**, because from its point of view nothing is
-due.
+SQLite compares TEXT bytewise, `T` is 0x54 and space is 0x20, so an ISO-Z string
+sorts above `datetime('now')` **only while the two share a date prefix**. A due
+time an hour in the past reads as not yet due; one a day in the past reads as
+due, because the date prefix settles the comparison before the separator is
+reached.
+
+**The severity, corrected.** An earlier draft of this section said an ISO-Z
+`next_poll_at` is "false forever" and the poller "goes permanently silent after
+the first cycle". That overstates it. What actually happens is a **cadence
+collapse**: a row written with a due time later today is not selected again until
+the UTC date rolls over, so every tier degenerates to roughly one poll a day, the
+`+4h` tier stops meaning anything, and the 60 day close stretches with it. Bad
+and recoverable, not silent forever. What is unchanged is that it happens **with
+no error, no failed cycle, and no notification**: nothing reports that the
+feature is running at a quarter speed. The prescription below (one canonical
+space-separated form, everywhere) is unchanged and still correct.
 
 The reason this survives a green test suite: `julianday()` parses both forms
-identically (`2461256.91666667` for each, measured above), so any test that
-computes time-to-reply, or asserts a cadence with `julianday(next_poll_at) -
+identically (`2461256.91666667` for each), so any test that computes
+time-to-reply, or asserts a cadence with `julianday(next_poll_at) -
 julianday(sent_at)`, passes under both. **The only test that can catch this is
 one that asserts the stored string against `/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/`,
 and one that re-selects a row it has just written with a past due time.** Both
-are required (Verification 3a).
+are required (Verification 3a). The second one must pin that past due time to the
+**current UTC date** (for example the start of `date('now')`), not to a relative
+offset like "an hour ago": the same-day window above is the only window in which
+the bug is observable, so a fixture an hour in the past silently stops proving
+anything for any run in the first hour of the UTC day.
 
 `internalDate` arrives from Gmail as a string of epoch milliseconds. Convert it
 with a single helper, used for every timestamp this feature writes from
@@ -801,17 +825,30 @@ Rejected alternatives, against how the existing jobs are actually built:
   restart, `MIN_CYCLE_INTERVAL_MS`) is entirely about the Spectrum stream, with
   no place to express a Gmail failure. Adding a concurrent timer beside that
   await is precisely the shape of change this codebase has already been burned
-  by: `listen.ts:53-60` records a one-year timeout that overflowed Node's 32-bit
+  by: `listen.ts:54-59` records a one-year timeout that overflowed Node's 32-bit
   timer field, became 1ms, and rebuilt the client four times in 45 seconds
   against the live service.
 - A separate job also gets its own logs, its own restart behavior, and can be run
   by hand for the live verification below.
 
 **Module shape: an options object with injected seams**, matching `ListenDeps`
-(`listen.ts:20-44`) and `createGmailApiSender`'s `opts` parameter
-(`gmail-api.ts:25-29`). The reader takes `{ db, reader, channel?, now, sleep,
-log, maxThreadsPerCycle, maxCallsPerMinute, senderEmail, dryRun }`, where `now`,
-`sleep` and `log` all default to the real implementations. Without an injected
+(`listen.ts:21-45`) and `createGmailApiSender`'s `opts` parameter
+(`gmail-api.ts:25-29`). The reader takes `{ db, reader, channel?, leaseHeld?,
+now, sleep, log, maxThreadsPerCycle, maxCallsPerMinute, senderEmail, dryRun }`,
+where `now`, `sleep` and `log` all default to the real implementations.
+
+**`channel` is a factory, `() => Promise<ApprovalChannel>`, not a channel.** This
+is what makes "never connect on a quiet cycle" below achievable rather than
+aspirational: typed as a value, whatever assembles the options object has to have
+connected before the cycle function is entered, so no behavior inside that
+function can undo it and no assertion inside it can observe it. The cycle holds
+the resolved instance in a local and closes that, so its own cleanup path cannot
+construct one either.
+
+**`leaseHeld` says the caller already holds the run lease** and will release it.
+The CLI command sets it, because `--backfill` (the largest single quota spend in
+this feature) and `--rearm` both run outside the cycle function and must be
+covered by the same lock. Unset, the cycle takes and releases its own lease. Without an injected
 `now` the age-tier logic and the 60 day close are untestable except by waiting,
 and without an injected `sleep` the pacing rule makes the test suite take
 minutes. Both mistakes have already been made and fixed once in `listen.ts`.
@@ -956,7 +993,11 @@ volume. So:
   5. A cycle that could not take the lease is neither a success nor a failure:
      it exits 0 and touches none of these columns.
 - **Construct the Photon channel only when there is something to say.** On a
-  quiet cycle the job never connects to Spectrum at all. When it does connect, it
+  quiet cycle the job never connects to Spectrum at all. This is why `channel` is
+  a factory (Change 5) and why the assertion that proves it belongs to the **CLI
+  command**, which decides whether a channel gets built, and not to the cycle
+  function, which can at most decline to call a factory somebody else already
+  invoked. When it does connect, it
   closes the channel before exiting (Change 5).
 
 **"Exactly one notification" is enforced by `replies.notified_at`, not by
@@ -1128,14 +1169,19 @@ requested) **at the boundary**, and returns nothing else to any other module.
 
 Per the project rule: demonstrate against reality, not artifacts.
 
-**Baseline, re-measured 2026-08-04 21:04 UTC with `npx vitest run --reporter=dot`:
-50 files, 633 tests, 631 passing, 2 failing.** Both failures are in
-`test/draft.test.ts` (`stripTrailingSignoff handles an inline sign-off`), are
-pre-existing on `main`, and are unrelated to reply tracking. They are recorded
-here rather than rounded away so that "all green" is not silently redefined
-mid-implementation: the target after this change is **633 + N tests with the same
-2 pre-existing failures and no new ones**. If either `draft.test.ts` failure
-disappears or a third appears, stop and find out why before continuing.
+**Baseline, re-measured 2026-08-05 with `npx vitest run --reporter=basic`:
+50 files, 633 tests, 633 passing, 0 failing. The suite is fully green.**
+
+An earlier draft of this section recorded "631 passing, 2 failing, both in
+`test/draft.test.ts` under `stripTrailingSignoff handles an inline sign-off`",
+and told the implementer to stop if either of those failures disappeared. That
+claim was already stale when it was written: those two tests were fixed in
+`5927688`, the commit immediately before the one carrying this spec. The stop
+rule would therefore have fired on step zero, and normalising 2 failures would
+have let a real regression back to 2 read as pre-existing.
+
+**The target after this change is 633 + N passing, zero failures.** There is no
+allowed-failure list. Any failure is caused by this work.
 
 0. **Prove the scope is grantable before writing any code.** Re-run
    `scripts/gmail-auth.ts` with `gmail.metadata`, confirm a refresh token comes
@@ -1233,7 +1279,10 @@ that follows it measure the wrong process.
    If only one does, the array form did not take and the job is running once a
    day, which the age tiers assume it is not.
 5. **Run one cycle by hand and read `data/replies.log`.** Confirm it prints the
-   adopt count (`adopted N sends with no watch row`, `N = 56` on the first run),
+   adopt count (`adopted N sends with no watch row`, where N on the first run is
+   **the current `sent` event count**, `SELECT count(*) FROM draft_events WHERE
+   type='sent'`: it was 56 when this spec was written and only ever grows, so
+   read it rather than expecting a literal),
    the `unresolvable` count, and that `data/replies.err.log` is empty. Confirm
    `reply_poll_state.last_success_at` is set and
    `consecutive_cycle_failures` is 0.
@@ -1399,9 +1448,14 @@ that follows it measure the wrong process.
    is the case Deploy step 3 exists to prevent and is the most likely one in
    practice.
 
-   Test it at the seam rather than by contriving a database fault: inject a
-   `recordSentThread` that throws, run `performApprovedSend`, and assert **three**
-   things:
+   Test it at the seam rather than by contriving a database fault: make
+   `recordSentThread` throw and assert **three** things. Note that
+   `performApprovedSend` is **not exported** (`loop.ts:137`), so the send is
+   driven through `handleReply` (`loop.ts:243`, exported, and already driven this
+   way nineteen times in `test/send-path.test.ts`), and that there is no deps
+   seam for `recordSentThread` either: it is a static import. Use `vi.mock` on
+   `src/pipeline/sentThreads.js`, or add an optional `recordSentThread` field to
+   `ReplyDeps` (`loop.ts:62`). The plan names both. Assert:
    1. the draft is `sent`,
    2. the `sent` event is present,
    3. **no `send_failed` event was written and no `... failed to send` notify was
@@ -1410,7 +1464,7 @@ that follows it measure the wrong process.
    The third assertion is the one that matters and the earlier draft omitted it.
    In `loop.ts` the network `try` spans **224-232** and covers `sender.send`,
    `markSent` and the SENT notify; a `recordSentThread` placed inside it would
-   land in the catch at :232, which calls `markSendFailed` and texts "failed to
+   land in the catch at **:233**, which calls `markSendFailed` and texts "failed to
    send" **for an email that went out**. Assertions 1 and 2 both stay green in
    that arrangement, because the `markSent` transaction already committed. Only
    assertion 3 goes red. **Mutation:** move the `recordSentThread` call inside

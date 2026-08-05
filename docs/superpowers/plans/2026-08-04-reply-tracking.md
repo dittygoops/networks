@@ -11,8 +11,16 @@
 ## Global Constraints
 
 - **ESM with explicit `.js` import extensions.** `import { x } from './foo.js'` even though the file is `foo.ts`. No exceptions.
-- **Baseline: 50 test files, 633 tests, 631 passing, 2 failing.** Measured 2026-08-04 21:04 with `npx vitest run --reporter=dot 2>&1 | tail -5`. **The 2 failures are pre-existing and unrelated**: both are in `test/draft.test.ts`, under `stripTrailingSignoff handles an inline sign-off`. Do NOT fix them in this plan and do NOT treat them as breakage you caused. The target after each task is "633 + N tests, the same 2 failures, no new ones". If a third failure appears, or if either of those two disappears, stop and find out why.
-- **ONE timestamp format, everywhere.** `YYYY-MM-DD HH:MM:SS` UTC, exactly what `datetime('now')` emits. Never `Date#toISOString()` directly into a column. Measured on this machine: `SELECT '2026-08-04T10:00:00Z' <= datetime('now')` returns **0** while `SELECT '2026-08-04 10:00:00' <= datetime('now')` returns **1**, because SQLite compares TEXT bytewise and `T` (0x54) sorts above space (0x20). An ISO-Z `next_poll_at` makes every row permanently not-yet-due, and the poller goes silent after one cycle with no error. `julianday()` parses both forms identically (`2461256.91666667` for each), so any cadence test written with `julianday` passes under the bug.
+- **Baseline: 50 test files, 633 tests, 633 passing, 0 failing.** Re-measured 2026-08-05 with `npx vitest run --reporter=basic 2>&1 | tail -5`. An earlier draft of this plan and of the spec recorded "631 passing, 2 failing, both in `test/draft.test.ts` under `stripTrailingSignoff handles an inline sign-off`". That was already stale when it was written: those two tests were fixed in `5927688`, the commit immediately before the one carrying this plan. **The suite is fully green. The target after each task is "633 + N passing, zero failures."** Any failure at all is yours; there is no pre-existing-failure allowance to spend.
+- **ONE timestamp format, everywhere.** `YYYY-MM-DD HH:MM:SS` UTC, exactly what `datetime('now')` emits. Never `Date#toISOString()` directly into a column. Measured on this machine 2026-08-05:
+
+  ```
+  strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 hour') <= datetime('now')  ->  0
+  strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 day')  <= datetime('now')  ->  1
+  strftime('%Y-%m-%d %H:%M:%S','now','-1 hour')  <= datetime('now')  ->  1
+  ```
+
+  SQLite compares TEXT bytewise and `T` (0x54) sorts above space (0x20), so an ISO-Z string loses only the tie-break **within the same UTC calendar day**: the date prefix still decides once the day advances. So the damage from an ISO-Z `next_poll_at` is **not** permanent silence, it is a **cadence collapse**: a row due in 4 hours reads not-yet-due until the UTC date rolls over, so four polls a day become roughly one, and the 60-day close and the age tiers all stretch with it. Bad and recoverable, not silent-forever. The prescription is unchanged: one canonical space-separated form, everywhere. `julianday()` parses both forms identically (`2461256.91666667` for each), so any cadence test written with `julianday` passes under the bug.
 - **A cycle-wide failure must NEVER touch `sent_threads.poll_failures`.** An expired token, a 429, a 5xx or a `SQLITE_BUSY` hits every selected row at once. Five such cycles under a naive counter marks the entire watch set `unresolvable`. Only a 404 or a per-thread 4xx may increment.
 - **Every insert that runs on repeat data is conflict-ignoring.** `replies` gets `ON CONFLICT(gmail_message_id) DO NOTHING`; the adopt gets `ON CONFLICT(draft_id) DO NOTHING`. An auto-reply keeps its thread `open` by design, so the same `gmail_message_id` is seen every cycle forever. A plain INSERT throws inside the per-thread transaction, rolls back `next_poll_at` with it, and blinds the thread in five cycles.
 - **No message this plan adds may begin with `dN:`.** `draftIdFromReactedText` (`photonChannel.ts:135-138`) turns any message whose text starts `/^\s*(d\d+):/` into a tapback-approvable draft. `dN ` followed by anything other than a colon is safe.
@@ -37,35 +45,74 @@
 | `src/pipeline/replyState.ts` (new) | lease, failure taxonomy, `consecutive_cycle_failures`, the alarm | 8 |
 | `src/pipeline/replies.ts` (new) | `runReplyCycle`, the per-thread transaction, notification delivery | 9 |
 | `src/cli.ts` | `cmdReplies`, flags, hardened top-level catch | 10 |
-| `scripts/gmail-auth.ts` | optional scope argument, scope-following output, safer advice | 11 |
+| `scripts/gmail-auth.ts` | optional scope argument, scope-following output, safer advice | 11, executed inside 0 |
 | `scripts/com.aditya.outreach-replies.plist` (new) | the third launchd job | 12 |
 | (none) | live demonstration | 13 |
 
-**Dependency order.** 1 → 6, 8. 4 → 5, 9. 6 → 7, 9. 1, 2, 3, 4, 6, 8 → 9. 9 → 10 → 12 → 13.
+**Dependency order.** **0 → everything.** 1 → 6, 8. 4 → 5, 9. 6 → 7, 9. 1, 2, 3, 4, 6, 8 → 9. 9 → 10 → 12 → 13.
 
 **Parallel waves:**
-- **Wave A (no dependencies):** Tasks 1, 2, 3, 4, 11.
+- **Task 0 (SERIAL, ALONE, BEFORE EVERY WAVE):** the Google gate. It subsumes Task 11 (whose offline steps it runs first, because Verification 0 needs the `--scope` argument to exist). Nothing else starts until it returns an answer.
+- **Wave A (needs 0):** Tasks 1, 2, 3, 4.
 - **Wave B (needs A):** Task 5 (needs 4), Task 6 (needs 1), Task 8 (needs 1).
 - **Wave C (needs B):** Task 7 (needs 6), Task 9 (needs 1, 2, 3, 4, 6, 8).
 - **Wave D (needs C):** Task 10 (needs 9).
 - **Wave E (serial, live):** Task 12 (needs 10), then Task 13.
 
 **Tasks that CANNOT run offline and need live Google credentials:**
-- **Task 11's Step 6** (minting a real `gmail.metadata` refresh token) and **spec Verifications 0, 0b, 0c**. Everything else in Task 11 is offline.
+- **Task 0's Steps 2 to 4** (spec Verifications 0b, 0, 0c: minting a real `gmail.metadata` refresh token). Task 0's Step 1, which is all of Task 11's script work, is offline.
 - **Task 12** (loading a launchd job on this machine).
 - **Task 13** entirely.
 
 Everything in Tasks 1 through 10 runs offline against an injected `GmailReader`. **No test in this plan may touch the network.** If a test needs a real Gmail response, it needs a fixture instead.
 
-**Do spec Verifications 0b, then 0, then 0c BEFORE starting Task 1.** If Google refuses to grant `gmail.metadata` to this OAuth client, Tasks 2, 9, 12 and 13 are all blocked and the spec needs revision rather than a workaround. Verification 0b (the console's user type) comes first because it changes what 0 is likely to find: an **Internal** consent screen makes a restricted scope straightforward, while **External + Published (unverified)** makes it hardest.
+**The Google gate is Task 0 and it is not a wave member.** An earlier draft said "do spec Verifications 0b, 0, 0c before starting Task 1" and then put Task 11 in Wave A beside Task 1, with the live steps buried in Task 11 Step 6. Run as a wave, the gate does not gate: the work it exists to protect is already in flight when the answer arrives. So it is a numbered task that runs alone, to completion, before Wave A begins.
+
+**The blast radius of a refusal, stated once.** If Google refuses to grant `gmail.metadata` to this OAuth client, the entire poller is wasted work: **Tasks 2, 3, 8, 9, 10, 12 and 13.** What survives and is still worth building: **Tasks 1, 4, 5, 6, 7 and 11** (the canonical timestamp and the three tables, the notification formatters and their tapback hint, `sent_threads` as a projection of `draft_events`, the `threadId` capture on the send path, and the auth script's scope argument). A refusal means the spec needs revision, not a workaround. This is the only statement of the wasted set in this plan; do not restate it elsewhere.
 
 If you work in a git worktree, `git merge main` FIRST and re-measure the baseline.
 
 ---
 
+### Task 0: The Google gate
+
+**Requires:** nothing. **Blocks:** every other task. **Runs alone; it is not part of Wave A.**
+
+**Why:** Everything downstream of Task 1 assumes a `gmail.metadata` refresh token exists. If Google refuses that grant, seven tasks are wasted (see "The blast radius of a refusal" above). The gate is worth nothing if it runs concurrently with the work it gates, which is what putting Task 11 in Wave A did. So the whole of Task 11's script work happens here, first, and then the three live checks run, and only then does Wave A start.
+
+**Files:**
+- Modify: `scripts/gmail-auth.ts` (via Task 11's steps)
+- Modify: this spec's Verification 0b (record the console reading)
+
+- [ ] **Step 1: Do Task 11 Steps 1 through 5, then commit it (Task 11 Step 7)**
+
+All of it is offline and touches only `scripts/gmail-auth.ts`. It has to happen here rather than in Wave A because Verification 0 cannot be performed without the `--scope=gmail.metadata` argument that Task 11 Step 1 adds. Task 11's own Step 6 is now this task's Steps 2 to 4; do not run it twice.
+
+- [ ] **Step 2 (LIVE): spec Verification 0b, the console reading, FIRST**
+
+Read the OAuth consent screen's user type and publishing status in the Google Cloud Console and **record both in the spec**, replacing the three-way uncertainty there with the measured answer. This comes before Step 3 because it changes what Step 3 is likely to find: an **Internal** user type (ASU is a Workspace org) makes a restricted scope straightforward, while **External + Published (unverified)** makes it hardest, and **External + Testing** puts a 7-day expiry on the token.
+
+- [ ] **Step 3 (LIVE): spec Verification 0, the grant itself**
+
+Complete the `gmail.metadata` consent, confirm a refresh token comes back, confirm it can call `users.threads.get` on one real thread, and confirm it is **refused** on `users.messages.send`. Do not paste the result over `GMAIL_OAUTH_REFRESH_TOKEN`.
+
+**If Google refuses: stop here.** Do not start Wave A. Report the refusal, and revise the spec.
+
+- [ ] **Step 4 (LIVE): spec Verification 0c, re-prove the EXISTING send token**
+
+With the new token in `.env` and `GMAIL_OAUTH_REFRESH_TOKEN` byte-identical to before, run one real `outreach add <arxiv-id> --to-self` and confirm it sends. The two refresh tokens are separate strings but are issued by the same OAuth client to the same account, so the consent grant is shared state and the second consent modifies the object the first token hangs off. This is the single check the whole "cannot break sending" claim rests on.
+
+- [ ] **Step 5: Record the answer in the spec and release Wave A**
+
+Write the outcome of 0b, 0 and 0c into the spec's Verification section as measured fact, not as expectation. Only then start Wave A.
+
+---
+
 ### Task 1: The canonical timestamp and the three tables
 
-**Why:** This is the foundation everything else writes through, and it is where the single most dangerous bug in the feature lives. The spec's earlier draft said to store `received_at` "as an ISO UTC string to match every other timestamp in the schema". No other timestamp in this schema is ISO-Z: every one is `datetime('now')`, space-separated, no `Z`. Written the ISO way, `next_poll_at <= datetime('now')` is false forever for any past due time, the poller stops after one cycle, and there is no error, no failed cycle and no notification to tell anyone.
+**Why:** This is the foundation everything else writes through, and it is where the quietest bug in the feature lives. The spec's earlier draft said to store `received_at` "as an ISO UTC string to match every other timestamp in the schema". No other timestamp in this schema is ISO-Z: every one is `datetime('now')`, space-separated, no `Z`.
+
+The consequence, measured rather than assumed: an ISO-Z `next_poll_at` reads as **not yet due only within the same UTC calendar day**, because the date prefix decides the bytewise comparison as soon as the day rolls over and only the `T`-versus-space tie-break is left when it does not. So the poller does not go permanently silent; its **cadence collapses to roughly one poll a day** whatever tier the row is in, the +4h tier stops meaning anything, and the 60-day close stretches. There is still no error, no failed cycle and no notification: nothing tells anyone the feature is running at a quarter speed. That is why it gets a test rather than a comment.
 
 **Files:**
 - Create: `src/db/time.ts`
@@ -87,24 +134,57 @@ Create `test/reply-time.test.ts`:
 
 ```ts
 // The bug this file exists to make impossible, measured on this machine
-// 2026-08-04 against the live database:
+// 2026-08-05:
 //
-//   sqlite> SELECT '2026-08-04T10:00:00Z' <= datetime('now'),
-//      ...>        '2026-08-04 10:00:00'  <= datetime('now'), datetime('now');
-//   0|1|2026-08-04 21:03:34
+//   strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 hour') <= datetime('now')  ->  0
+//   strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 day')  <= datetime('now')  ->  1
+//   strftime('%Y-%m-%d %H:%M:%S','now','-1 hour')  <= datetime('now')  ->  1
 //
-// A due time eleven hours in the past compares as NOT YET DUE in the ISO-Z
-// form, because SQLite compares TEXT bytewise and 'T' (0x54) sorts above ' '
-// (0x20). Written that way, next_poll_at <= datetime('now') is false forever,
-// every row is selected exactly once from its DEFAULT and never again, and the
-// poller goes permanently silent with no error and no notification.
+// SQLite compares TEXT bytewise and 'T' (0x54) sorts above ' ' (0x20), so an
+// ISO-Z due time loses the comparison ONLY while its date prefix equals today's.
+// A due time an hour in the past reads NOT YET DUE; one a day in the past reads
+// due. So the failure is not permanent silence, it is a cadence collapse: every
+// tier degenerates to about one poll a day, with no error and no notification.
+//
+// That same-UTC-day window is why the round-trip test below pins its past time
+// to the START of the database's current UTC day rather than to `Date.now() -
+// 1 hour`. With a relative hour, a suite run between 00:00 and 01:00 UTC puts
+// the fixture on the PREVIOUS date, the mutation in Step 6 stays GREEN, and the
+// plan sends the implementer to investigate a bug that is really a clock.
 //
 // julianday() parses BOTH forms identically (2461256.91666667 for each), so a
 // cadence test written with julianday passes under the bug and proves nothing.
 // The round-trip test below therefore uses the REAL selection query.
+//
+// foreign_keys = ON (db.ts:18) and sent_threads.draft_id / person_id are both
+// REFERENCES, so these fixtures cannot invent ids: seedWatchRow creates a real
+// person and a real draft first. An earlier draft of this plan inserted
+// (draft_id, person_id) = (1, 1) into an empty database, which throws
+// SQLITE_CONSTRAINT_FOREIGNKEY and tests nothing at all.
 import { describe, expect, it } from 'vitest';
-import { openDb } from '../src/db/db.js';
+import { openDb, upsertPerson } from '../src/db/db.js';
+import { persistDraft } from '../src/approval/ledger.js';
 import { toSqlTime, fromInternalDate, addHours, SQL_TIME_SHAPE } from '../src/db/time.js';
+import type { Draft, DraftInput } from '../src/pipeline/draft.js';
+
+const draftInput: DraftInput = {
+  recipient: { name: 'Daniel Kepple', paperTitle: 'A Paper' },
+  hooks: [], intent: 'seeking direction', senderName: 'Aditya Gupta',
+};
+const groundedDraft: Draft = { subject: 's', body: 'b', grounded: true, wordCount: 1, notes: [] };
+
+// The same shape Task 6's seedSent uses, for the same reason. Returns real ids
+// that satisfy both foreign keys.
+function seedWatchRow(): { db: ReturnType<typeof openDb>; draftId: number; personId: number } {
+  const db = openDb(':memory:');
+  const personId = upsertPerson(db, { name: 'Daniel Kepple', openalexId: 'A-dk', email: 'dk@example.edu' });
+  const p = persistDraft(db, {
+    personId, paperArxivId: '2601.00001', paperTitle: 'A Paper',
+    intent: 'seeking direction', draftInput, draft: groundedDraft, contextJson: {},
+  });
+  db.prepare("UPDATE drafts SET status = 'sent' WHERE id = ?").run(p.draftId);
+  return { db, draftId: p.draftId, personId };
+}
 
 describe('the one canonical timestamp form', () => {
   it('emits the datetime(\'now\') shape, with no T and no Z', () => {
@@ -129,12 +209,19 @@ describe('the one canonical timestamp form', () => {
   // uses to decide what is due. This is the only assertion that can catch the
   // ISO-Z bug end to end.
   it('a past due time actually selects, through the real query', () => {
-    const db = openDb(':memory:');
-    const past = toSqlTime(new Date(Date.now() - 3600_000));
+    const { db, draftId, personId } = seedWatchRow();
+    // Pinned to the START of the database's own current UTC day, NOT to
+    // Date.now() - 1 hour. It is always <= datetime('now') (equal at worst), and
+    // it is always on the SAME UTC date, which is the only window in which the
+    // ISO-Z bug is observable. A relative offset would put the fixture on
+    // yesterday's date for any run in the first hour of the UTC day, and the
+    // Step 6 mutation would then quietly stay green.
+    const today = (db.prepare("SELECT date('now') AS d").get() as { d: string }).d;
+    const past = toSqlTime(new Date(`${today}T00:00:00Z`));
     db.prepare(
       `INSERT INTO sent_threads (draft_id, person_id, sent_message_id, sent_at, next_poll_at)
-       VALUES (1, 1, 'abc123', ?, ?)`,
-    ).run(past, past);
+       VALUES (?, ?, 'abc123', ?, ?)`,
+    ).run(draftId, personId, past, past);
     const due = db
       .prepare("SELECT draft_id FROM sent_threads WHERE watch_state = 'open' AND next_poll_at <= datetime('now')")
       .all();
@@ -142,13 +229,13 @@ describe('the one canonical timestamp form', () => {
   });
 
   it('a future due time does not select, so the predicate is not vacuously true', () => {
-    const db = openDb(':memory:');
+    const { db, draftId, personId } = seedWatchRow();
     const now = toSqlTime(new Date());
-    const future = toSqlTime(new Date(Date.now() + 3600_000));
+    const future = toSqlTime(new Date(Date.now() + 86400_000));   // tomorrow, so the date prefix differs
     db.prepare(
       `INSERT INTO sent_threads (draft_id, person_id, sent_message_id, sent_at, next_poll_at)
-       VALUES (1, 1, 'abc123', ?, ?)`,
-    ).run(now, future);
+       VALUES (?, ?, 'abc123', ?, ?)`,
+    ).run(draftId, personId, now, future);
     expect(
       db.prepare("SELECT draft_id FROM sent_threads WHERE watch_state = 'open' AND next_poll_at <= datetime('now')").all(),
     ).toHaveLength(0);
@@ -176,14 +263,15 @@ describe('the three new tables reach a live database', () => {
   });
 
   it('rejects a second reply row for the same gmail_message_id', () => {
-    const db = openDb(':memory:');
+    // Real ids again: replies.draft_id and replies.person_id are REFERENCES too.
+    const { db, draftId, personId } = seedWatchRow();
     const ins = db.prepare(
       `INSERT INTO replies (draft_id, person_id, gmail_message_id, thread_id, from_address, received_at, kind)
-       VALUES (1, 1, 'msg1', 't1', 'a@b.edu', '2026-08-04 10:00:00', 'human')
+       VALUES (?, ?, 'msg1', 't1', 'a@b.edu', '2026-08-04 10:00:00', 'human')
        ON CONFLICT(gmail_message_id) DO NOTHING`,
     );
-    expect(ins.run().changes).toBe(1);
-    expect(ins.run().changes).toBe(0);   // a repeat sighting is a NO-OP, not a throw
+    expect(ins.run(draftId, personId).changes).toBe(1);
+    expect(ins.run(draftId, personId).changes).toBe(0);   // a repeat sighting is a NO-OP, not a throw
     expect((db.prepare('SELECT count(*) AS n FROM replies').get() as { n: number }).n).toBe(1);
   });
 });
@@ -202,18 +290,21 @@ Expected: FAIL, cannot resolve `../src/db/time.js`, and `no such table: sent_thr
 // separator, no T, no Z, no fractional seconds, no offset.
 //
 // Getting this wrong does not throw and does not fail a test that uses
-// julianday(). Measured on this machine 2026-08-04:
+// julianday(). Measured on this machine 2026-08-05:
 //
-//   SELECT '2026-08-04T10:00:00Z' <= datetime('now')  ->  0
-//   SELECT '2026-08-04 10:00:00'  <= datetime('now')  ->  1
-//   SELECT julianday('2026-08-04T10:00:00Z')          ->  2461256.91666667
-//   SELECT julianday('2026-08-04 10:00:00')           ->  2461256.91666667
+//   strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 hour') <= datetime('now')  ->  0
+//   strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 day')  <= datetime('now')  ->  1
+//   strftime('%Y-%m-%d %H:%M:%S','now','-1 hour')  <= datetime('now')  ->  1
+//   SELECT julianday('2026-08-04T10:00:00Z')                           ->  2461256.91666667
+//   SELECT julianday('2026-08-04 10:00:00')                            ->  2461256.91666667
 //
 // SQLite compares TEXT bytewise. 'T' is 0x54, ' ' is 0x20, so an ISO-Z string
-// sorts ABOVE datetime('now') for every hour of the same day, a past due time
-// reads as not-yet-due forever, and the poller stops after one cycle in total
-// silence. julianday parses both, which is why the round-trip test in
-// test/reply-time.test.ts runs the real selection query instead.
+// sorts ABOVE datetime('now') for the rest of the SAME UTC DAY and below it
+// once the date rolls over. A past due time therefore reads not-yet-due until
+// midnight UTC: the poller does not stop, its cadence collapses to roughly one
+// poll a day in every tier, silently. julianday parses both, which is why the
+// round-trip test in test/reply-time.test.ts runs the real selection query
+// instead, against a due time pinned to the current UTC date.
 export const SQL_TIME_SHAPE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
 
 export function toSqlTime(d: Date): string {
@@ -248,14 +339,19 @@ Append at the end of the file, after the `seen_papers` indexes. Copy the DDL fro
 - [ ] **Step 5: Run the tests and the full suite**
 
 Run: `npx vitest run test/reply-time.test.ts` → PASS
-Run: `npx vitest run --reporter=dot 2>&1 | tail -5` → 641 tests, still exactly 2 failures, both in `test/draft.test.ts`
+Run: `npx vitest run --reporter=basic 2>&1 | tail -5` → **641 tests, 641 passing, zero failures**
 Run: `npm run typecheck`
 
 - [ ] **Step 6: Mutate to prove the tests can fail**
 
 **Mandatory, and this is the single most important mutation in the plan.** Change `toSqlTime` to `return d.toISOString();`.
 
-Confirm: the shape test goes RED **and** `a past due time actually selects` goes RED. If only the shape test goes red, the round-trip test is not running the real query and must be fixed before continuing. Then, to see the trap for yourself, temporarily rewrite the round-trip assertion to use `julianday(next_poll_at) <= julianday('now')` and confirm it goes GREEN under the broken `toSqlTime`. That is the test that would have shipped this bug. Restore both.
+Confirm **both** go RED: the shape test, and `a past due time actually selects`. Expect them together. Two things can make the second one stay green, and they are different problems:
+
+- **If it errors rather than failing**, with `SQLITE_CONSTRAINT_FOREIGNKEY`, the fixture is inventing ids instead of using `seedWatchRow`. That is not a mutation result at all; that test was never exercising the query. Fix the fixture.
+- **If it passes**, the fixture's `next_poll_at` is not on the current UTC date, so the ISO-Z form still wins the comparison on its date prefix. Check that `past` is derived from `date('now')` as written above, not from a relative offset.
+
+Then, to see the trap for yourself, temporarily rewrite the round-trip assertion to use `julianday(next_poll_at) <= julianday('now')` and confirm it goes GREEN under the broken `toSqlTime`. That is the test that would have shipped this bug. Restore both.
 
 - [ ] **Step 7: Commit**
 
@@ -543,7 +639,7 @@ export function createGmailReader(opts?: {
 - [ ] **Step 4: Run the tests and the full suite**
 
 Run: `npx vitest run test/gmail-reader.test.ts` → PASS
-Run: `npx vitest run --reporter=dot 2>&1 | tail -5` → still exactly 2 pre-existing failures
+Run: `npx vitest run --reporter=basic 2>&1 | tail -5` → **633 + N passing, zero failures**
 Run: `npm run typecheck`
 
 - [ ] **Step 5: Mutate to prove the tests can fail**
@@ -1119,6 +1215,20 @@ function seedSent(sentId: string, threadId?: string) {
   return { db, personId, draftId: p.draftId };
 }
 
+// A SECOND real draft for the same person, for the two tests below that need
+// two watch rows. foreign_keys = ON (db.ts:18) and sent_threads.draft_id
+// REFERENCES drafts(id), so `draftId + 1000` is not a spare id, it is a
+// SQLITE_CONSTRAINT_FOREIGNKEY. An earlier draft of this plan used it and both
+// tests threw instead of asserting anything.
+function secondDraft(db: ReturnType<typeof openDb>, personId: number): number {
+  const p = persistDraft(db, {
+    personId, paperArxivId: '2601.00002', paperTitle: 'Another Paper',
+    intent: 'seeking direction', draftInput, draft: groundedDraft, contextJson: {},
+  });
+  db.prepare("UPDATE drafts SET status = 'sent' WHERE id = ?").run(p.draftId);
+  return p.draftId;
+}
+
 describe('the Gmail-shape guard', () => {
   it('accepts the shape all 56 real sent ids have', () => {
     expect(isGmailShapedId('19fca6e82b8956ad')).toBe(true);
@@ -1234,7 +1344,7 @@ describe('selectDueThreads', () => {
     db.prepare(
       `INSERT INTO sent_threads (draft_id, person_id, sent_message_id, thread_id, sent_at, next_poll_at)
        VALUES (?, ?, 'aa11', 't2', ?, ?)`,
-    ).run(draftId + 1000, personId, older, toSqlTime(new Date(Date.now() - 3600_000)));
+    ).run(secondDraft(db, personId), personId, older, toSqlTime(new Date(Date.now() - 3600_000)));
     const due = selectDueThreads(db, 10);
     expect(due.map((d) => d.threadId)).toEqual(['t1', 't2']);
     expect(selectDueThreads(db, 1)).toHaveLength(1);
@@ -1254,10 +1364,11 @@ describe('selectDueThreads', () => {
     db.prepare(
       `INSERT INTO sent_threads (draft_id, person_id, sent_message_id, thread_id, sent_at, next_poll_at)
        VALUES (?, ?, 'bb22', 'shared', datetime('now'), datetime('now'))`,
-    ).run(draftId + 1000, personId);
+    ).run(secondDraft(db, personId), personId);
     const due = selectDueThreads(db, 10);
     expect(due).toHaveLength(1);
-    // Attributed to the LOWEST open draft_id carrying that thread.
+    // Attributed to the LOWEST open draft_id carrying that thread, which is the
+    // seedSent one: secondDraft's id is strictly greater.
     expect(due[0]!.draftId).toBe(draftId);
   });
 });
@@ -1457,7 +1568,7 @@ git commit -m "Project sent_threads from draft_events, adopt orphans every cycle
 
 **Requires:** Task 6.
 
-**Why:** This is the one task that touches the irreversible path, and the constraint on it is absolute: **nothing here may add a new way for a send to abort, and nothing here may make a successful send look like a failed one.** In `performApprovedSend` the network `try` spans `loop.ts:224-232` and covers `sender.send`, `markSent` and the `SENT ...` notify. A `recordSentThread` throw inside that block lands in the catch at :232, which calls `markSendFailed` (writing a `send_failed` event) and texts `"${shortId} failed to send: ..."` **for an email that already went out**.
+**Why:** This is the one task that touches the irreversible path, and the constraint on it is absolute: **nothing here may add a new way for a send to abort, and nothing here may make a successful send look like a failed one.** In `performApprovedSend` the network `try` spans `loop.ts:224-232` and covers `sender.send`, `markSent` and the `SENT ...` notify. A `recordSentThread` throw inside that block lands in the catch at **:233**, which calls `markSendFailed` (writing a `send_failed` event) and texts `"${shortId} failed to send: ..."` **for an email that already went out**.
 
 **Files:**
 - Modify: `src/sender/types.ts`, `src/sender/gmail-api.ts`, `src/approval/ledger.ts`, `src/pipeline/loop.ts`, `src/cli.ts`
@@ -1476,7 +1587,23 @@ Both additions are **optional**, so every existing implementation, stub and test
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `test/send-path-thread-capture.test.ts`. Build the `LoopDeps` literal the way `test/loop.test.ts` already does; adapt to that file's helpers rather than inventing new ones.
+Create `test/send-path-thread-capture.test.ts`. **Model it on `test/send-path.test.ts`, not on `test/loop.test.ts`.** `test/loop.test.ts` never calls `handleReply`; `test/send-path.test.ts` does, nineteen times, and already has exactly the shape this task needs: it imports `handleReply` from `../src/pipeline/loop.js` (line 18), builds the `ReplyDeps` literal as `{ db, channel, sender }`, and drives a send with `handleReply(deps, { dryRun: false }, summary, { text: \`${shortId} y\` })`. Copy its `seed` / `freshSummary` helpers rather than inventing new ones.
+
+**How the send is driven, and why not directly.** `performApprovedSend` is `async function performApprovedSend(...)` at `loop.ts:137` with **no `export`**. It cannot be imported. Drive it through `handleReply` (exported, `loop.ts:243`), which reaches it on an approval reply. Every assertion below is observable from there.
+
+**How `recordSentThread` is made to throw.** There is no deps seam for it: the implementation in Step 5 calls it as a static ESM import, and `ReplyDeps` (`loop.ts:62`) has no field for it. Pick one and say so in the test file:
+
+- **Preferred: `vi.mock`.** Hoisted module mocking, which needs no production change:
+
+  ```ts
+  vi.mock('../src/pipeline/sentThreads.js', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('../src/pipeline/sentThreads.js')>()),
+    recordSentThread: vi.fn(() => { throw new Error('no such table: sent_threads'); }),
+  }));
+  ```
+
+  Note that **no test in this repo currently uses `vi.mock`**, so this is the first one. If it fights the ESM loader, fall back to the alternative below rather than weakening the assertions.
+- **Alternative: an optional deps field.** Add `recordSentThread?: typeof recordSentThread` to `ReplyDeps` in `loop.ts` and call `(deps.recordSentThread ?? recordSentThread)(...)`. Optional, so every existing `ReplyDeps` literal in `test/send-path.test.ts` and `src/pipeline/listen.ts` still compiles untouched, and `npm run typecheck` is the assertion that it did.
 
 ```ts
 describe('threadId capture on the send path', () => {
@@ -1499,14 +1626,16 @@ describe('threadId capture on the send path', () => {
 // THE test this task exists for.
 describe('a recordSentThread failure cannot make a sent email look unsent', () => {
   it('leaves the draft sent, the event present, and NO send_failed written', async () => {
-    // Inject a recordSentThread that throws, via the deps seam.
+    // recordSentThread throws (vi.mock, or the optional deps field: see above).
+    // The send is driven by handleReply, because performApprovedSend is not
+    // exported.
     // Assertion 1: the draft is 'sent'.
     expect(draft.status).toBe('sent');
     // Assertion 2: the sent event is present.
     expect(events.filter((e) => e.type === 'sent')).toHaveLength(1);
     // Assertion 3: THE ONE THAT MATTERS, and the one the earlier draft of the
     // spec omitted. If recordSentThread sits inside the network try (loop.ts
-    // 224-232), assertions 1 and 2 BOTH stay green, because markSent's
+    // 224-232, catch at 233), assertions 1 and 2 BOTH stay green, because markSent's
     // transaction already committed. Only this one goes red, and without it
     // the whole test is decorative.
     expect(events.filter((e) => e.type === 'send_failed')).toHaveLength(0);
@@ -1564,7 +1693,7 @@ Keep the `threadId ?` conditional rather than always writing the key: the 56 his
 
 - [ ] **Step 5: Wire both call sites, OUTSIDE the network try**
 
-`src/pipeline/loop.ts`. The network try currently ends at :232 with `} catch (e) {`. Change the try body's send line to destructure `threadId`, and add the record call **after the closing brace of the catch**:
+`src/pipeline/loop.ts`. The network try body currently ends at :232 and the `} catch (e) {` is at :233. Change the try body's send line to destructure `threadId`, and add the record call **after the closing brace of the catch**:
 
 ```ts
   let sentThreadInfo: { sentId: string; threadId?: string } | null = null;
@@ -1635,6 +1764,10 @@ export const LEASE_MS = 15 * 60_000;
 export const FAILURE_ALARM_CYCLES = 3;
 export function acquireLease(db: DB, pid: number, now: Date): boolean;
 export function releaseLease(db: DB): void;
+// Writes last_cycle_at and NOTHING else. Called from runReplyCycle's finally so
+// that spec Change 6 step 1 ("every cycle writes last_cycle_at, whatever
+// happened") also covers a throw that reaches neither of the two below.
+export function recordCycleAttempt(db: DB): void;
 export function recordCycleSuccess(db: DB): void;
 export function recordCycleFailure(db: DB, message: string): { consecutive: number; shouldNotify: boolean };
 export function markFailureNotified(db: DB): void;
@@ -1790,6 +1923,12 @@ export function releaseLease(db: DB): void {
   db.prepare('UPDATE reply_poll_state SET lock_pid = NULL, lock_expires_at = NULL WHERE id = 1').run();
 }
 
+// last_cycle_at and nothing else: not a success, not a failure, just "this
+// process got here". runReplyCycle calls it from a finally.
+export function recordCycleAttempt(db: DB): void {
+  db.prepare("UPDATE reply_poll_state SET last_cycle_at = datetime('now') WHERE id = 1").run();
+}
+
 export function recordCycleSuccess(db: DB): void {
   db.prepare(
     `UPDATE reply_poll_state
@@ -1871,11 +2010,29 @@ git commit -m "Add durable cycle state so the 3-cycle alarm can fire across proc
 **Interfaces produced:**
 
 ```ts
-export interface ReplyDeps {
+// NOT `ReplyDeps`. `loop.ts:62` already exports an interface by that name, and
+// it is the parameter type of both performApprovedSend and handleReply, both of
+// which Task 7 edits. Two exported `ReplyDeps` with different shapes in one
+// pipeline directory is a rename waiting to happen in the middle of the one task
+// that touches the irreversible send path.
+export interface ReplyCycleDeps {
   db: DB;
   reader: GmailReader;
-  channel?: ApprovalChannel;          // absent on a quiet cycle: never constructed
+  // A FACTORY, not a value. Typing this as `channel?: ApprovalChannel` makes
+  // "never construct a channel on a quiet cycle" (spec Change 5) unachievable:
+  // whatever builds the deps object has to have constructed the channel before
+  // runReplyCycle is entered, so the property is a live connection by then no
+  // matter what this function does with it. As a factory, the connection does
+  // not exist until step 4 finds something to say, and a quiet cycle simply
+  // never calls it.
+  channel?: () => Promise<ApprovalChannel>;
   senderEmail: string;                // REQUIRED. Never defaulted. See below.
+  // The caller already holds the run lease and will release it. cmdReplies sets
+  // this, because --backfill (56 messages.get, 1,120 units, the largest single
+  // spend in the feature) runs BEFORE this function and must be inside the
+  // lease too. Left unset, this function takes and releases the lease itself,
+  // which is what a direct caller and every test does.
+  leaseHeld?: boolean;
   now?: () => Date;
   sleep?: (ms: number) => Promise<void>;
   log?: (msg: string) => void;
@@ -1888,7 +2045,7 @@ export interface ReplyCycleSummary {
   notified: number; unresolvable: number; skippedNoLease: boolean;
   cycleFailure?: string;
 }
-export async function runReplyCycle(deps: ReplyDeps): Promise<ReplyCycleSummary>;
+export async function runReplyCycle(deps: ReplyCycleDeps): Promise<ReplyCycleSummary>;
 ```
 
 `senderEmail` is **required and never defaulted**. If it were optional and defaulted, an unset `SENDER_EMAIL` would make `isOurs` false for every message and every one of Aditya's own follow-ups would be recorded as an inbound reply from a stranger. The CLI refuses to start without it, in the style of `createGmailApiSender`'s missing-credential error (`gmail-api.ts:33-37`).
@@ -1936,10 +2093,30 @@ it('five consecutive thread-scoped failures mark that row unresolvable, and a su
 // inserting repeats it forever on the same crash.
 it('does not set notified_at when notify throws, and notifies exactly once across both runs', async () => {});
 
-it('never constructs a channel on a quiet cycle', async () => {
-  // deps.channel is a getter that throws if read. A quiet cycle must not touch
-  // it: on a quiet night the job never connects to Spectrum at all.
+// The QUIET-CYCLE property, at this level only. deps.channel is a FACTORY, so
+// this asserts the factory is never CALLED, which is the thing that would open
+// a Spectrum connection. An earlier draft made deps.channel a throwing getter
+// and called that a proof; it was not. With `channel?: ApprovalChannel` the
+// caller has to construct the channel to build the deps object at all, so the
+// getter proves only that runReplyCycle does not read a property whose value
+// already exists. Worse, the `finally` did `await deps.channel?.close?.()`,
+// which reads it, so the throwing getter fired in the finally and the test
+// failed for a reason unrelated to what it claimed to check.
+it('never CALLS the channel factory on a quiet cycle', async () => {
+  const factory = vi.fn(async () => { throw new Error('a quiet cycle must not connect'); });
+  // 3 due threads, none of them carrying an unnotified human reply.
+  await runReplyCycle({ ...deps, channel: factory });
+  expect(factory).not.toHaveBeenCalled();
 });
+
+it('calls the factory exactly ONCE when there are several notices to send', async () => {
+  // Two notices, one connection. `channel ??= await deps.channel?.()` is the
+  // whole implementation of this.
+});
+
+// The real end of the quiet-cycle guarantee is in Task 10, where cmdReplies
+// decides whether to build a channel at all. That assertion lives in
+// test/cli-replies.test.ts, not here.
 
 it('writes nothing at all under --dry-run, but still reports what it WOULD do', async () => {
   // Both halves. A dry run that reports nothing passes the "wrote nothing"
@@ -1954,6 +2131,23 @@ it('logs no address, no subject and no snippet, even when the reader throws a Ga
 it('paces at maxCallsPerMinute using the INJECTED sleep, so the suite stays fast', async () => {});
 
 it('honours maxThreadsPerCycle, and the overflow is simply due next run', async () => {});
+
+// persistThread settles the THREAD, not the row. Two drafts share 'shared';
+// selectDueThreads returns it once, so a WHERE draft_id update leaves the
+// sibling due and the thread is fetched twice before the tier catches up.
+it('settles EVERY open row for the thread it just polled, not only the selected one', async () => {
+  // Two sent_threads rows, thread_id 'shared', both due, both open.
+  // After one cycle: both have next_poll_at advanced and last_polled_at set,
+  // and a second cycle at the same `now` selects nothing.
+});
+
+// Spec Change 6 step 1: "every cycle writes last_cycle_at in a finally,
+// whatever happened."
+it('writes last_cycle_at even when the cycle throws something it does not classify', async () => {
+  // reader.getThreadMetadata throws a non-Error (e.g. a string), or
+  // selectDueThreads itself throws. Assert last_cycle_at moved, and that
+  // last_success_at and consecutive_cycle_failures did NOT.
+});
 ```
 
 - [ ] **Step 2: Run and confirm failure**
@@ -1965,14 +2159,20 @@ Run: `npx vitest run test/replies-cycle.test.ts` → FAIL, module not found.
 The structure, with the invariants that must not be reorganised away:
 
 ```ts
-export async function runReplyCycle(deps: ReplyDeps): Promise<ReplyCycleSummary> {
+export async function runReplyCycle(deps: ReplyCycleDeps): Promise<ReplyCycleSummary> {
   const now = deps.now ?? (() => new Date());
   const log = deps.log ?? ((m: string) => console.log(m));
+  // The one live channel, if this cycle ever needs one. Held here rather than on
+  // deps, so `deps.channel` stays a factory that a quiet cycle never calls and
+  // the finally still has something concrete to close.
+  let channel: ApprovalChannel | undefined;
 
   // 1. Lease. A loser exits 0 and is NEITHER a success NOR a failure: it must
   //    not touch consecutive_cycle_failures or the 3-cycle alarm would fire on
-  //    three hand-runs during a scheduled cycle.
-  if (!acquireLease(deps.db, process.pid, now())) {
+  //    three hand-runs during a scheduled cycle. When the CALLER already holds
+  //    it (cmdReplies does, so that --backfill is covered too), do not take a
+  //    second one and do not release the caller's in the finally.
+  if (!deps.leaseHeld && !acquireLease(deps.db, process.pid, now())) {
     log('another reply cycle holds the lease; exiting');
     return { ...empty, skippedNoLease: true };
   }
@@ -1999,7 +2199,13 @@ export async function runReplyCycle(deps: ReplyDeps): Promise<ReplyCycleSummary>
           // ABORT. Touch no row's poll_failures. Record OUTSIDE any aborted
           // transaction, or the counter rolls back with it.
           const { shouldNotify, consecutive } = recordCycleFailure(deps.db, msg);
-          if (shouldNotify) { await notifyFailure(consecutive, msg); markFailureNotified(deps.db); }
+          if (shouldNotify) {
+            // The alarm IS something to say, so this is a legitimate reason to
+            // build the channel. It still goes through the factory.
+            channel ??= await deps.channel?.();
+            await channel?.notify(formatPollFailureNotice(consecutive, msg));   // Task 4
+            markFailureNotified(deps.db);
+          }
           return { ...summary, cycleFailure: msg };
         }
         bumpThreadFailure(deps.db, t.draftId, now());   // per-thread only; 5 -> unresolvable
@@ -2017,8 +2223,12 @@ export async function runReplyCycle(deps: ReplyDeps): Promise<ReplyCycleSummary>
     //    unnamed 7 forever.
     const pending = selectUnnotified(deps.db);   // notified_at IS NULL AND kind IN ('human','bounce')
     if (pending.length && !deps.dryRun) {
+      // HERE is the first and only place a quiet cycle would have connected,
+      // and it is inside `pending.length`. Nothing above this line may touch
+      // deps.channel.
+      channel ??= await deps.channel?.();
       for (const [text, ids] of buildNotices(pending)) {
-        await deps.channel!.notify(text);
+        await channel!.notify(text);
         markNotified(deps.db, ids);
       }
     }
@@ -2026,13 +2236,33 @@ export async function runReplyCycle(deps: ReplyDeps): Promise<ReplyCycleSummary>
     recordCycleSuccess(deps.db);
     return summary;
   } finally {
-    releaseLease(deps.db);
+    // last_cycle_at on EVERY exit from this function, including an unclassified
+    // throw that reaches neither recordCycleSuccess nor recordCycleFailure.
+    // Spec Change 6 says "every cycle writes last_cycle_at in a finally,
+    // whatever happened", and without this line the one case that most needs a
+    // timestamp (an exception nobody anticipated) is the one case that writes
+    // neither counter nor timestamp, so the row still shows the last healthy
+    // run and the job looks like it never fired. It touches ONLY that column:
+    // it is not a success and not a failure.
+    recordCycleAttempt(deps.db);
+    if (!deps.leaseHeld) releaseLease(deps.db);
     // A leaked Photon connection means the process never exits and launchd
     // never schedules this job again: a leak does not degrade the feature, it
     // silently stops it forever. close() is on ApprovalChannel
-    // (channel.ts:51), implemented at photonChannel.ts:373.
-    await deps.channel?.close?.();
+    // (channel.ts:51), implemented at photonChannel.ts:373. `channel` is the
+    // LOCAL, so this line cannot itself construct one: reading deps.channel
+    // here would defeat the whole quiet-cycle property.
+    await channel?.close?.();
   }
+}
+```
+
+`recordCycleAttempt` is a one-line addition to Task 8's module, and it is the only writer of `last_cycle_at` that does not also decide success or failure:
+
+```ts
+// src/pipeline/replyState.ts
+export function recordCycleAttempt(db: DB): void {
+  db.prepare("UPDATE reply_poll_state SET last_cycle_at = datetime('now') WHERE id = 1").run();
 }
 ```
 
@@ -2057,12 +2287,21 @@ const persistThread = db.transaction((t, messages, senderEmail, now) => {
   // OPEN: if a Monday out-of-office moved the row out of 'open', the real reply
   // arriving the following week would never be seen.
   const tier = nextPollAt(new Date(t.sentAt + 'Z'), now);
+  // WHERE thread_id, not WHERE draft_id. selectDueThreads groups by thread_id
+  // and returns ONE row per distinct thread, attributed to the lowest open
+  // draft_id carrying it, so a thread shared by two drafts (two --to-self sends,
+  // or a --force second email to one person) has a sibling row that this cycle
+  // never selected. Settling only t.draftId leaves the sibling at its old
+  // next_poll_at, so the same thread is selected and fetched AGAIN on the next
+  // cycle, doubling the quota spend on it until the tier finally catches up.
+  // Restricted to 'open' so this cannot resurrect a row already settled as
+  // replied, closed_no_reply or unresolvable.
   db.prepare(
     `UPDATE sent_threads
         SET last_polled_at = ?, poll_failures = 0, next_poll_at = ?, watch_state = ?
-      WHERE draft_id = ?`,
+      WHERE thread_id = ? AND watch_state = 'open'`,
   ).run(toSqlTime(now), 'next' in tier ? tier.next : toSqlTime(now),
-        sawHuman ? 'replied' : 'close' in tier ? 'closed_no_reply' : 'open', t.draftId);
+        sawHuman ? 'replied' : 'close' in tier ? 'closed_no_reply' : 'open', t.threadId);
 });
 ```
 
@@ -2073,7 +2312,7 @@ Add `'src/pipeline/replies.ts'` to the array at line 21. **Necessary and not suf
 - [ ] **Step 5: Run the tests, the full suite, and typecheck**
 
 Run: `npx vitest run test/replies-cycle.test.ts` → PASS
-Run: `npx vitest run --reporter=dot 2>&1 | tail -5` → still exactly 2 pre-existing failures
+Run: `npx vitest run --reporter=basic 2>&1 | tail -5` → **633 + N passing, zero failures**
 Run: `npm run typecheck`
 
 - [ ] **Step 6: Mutate to prove the tests can fail**
@@ -2083,7 +2322,9 @@ Five mutations, all mandatory. Each maps to a blocker or a must-fix:
 2. Classify a 401 as thread-scoped (in the cycle, not in `classifyFailure`, so Task 2's test cannot cover it). Confirm 10 rows go `unresolvable` and the cycle-wide test goes RED. Restore.
 3. Swap step 4 to mark-then-notify. Confirm the crash test goes RED (`notified_at` set with no notification delivered). Restore.
 4. Mark `notified_at` only on the named rows, not the tail. Confirm the "next cycle sends nothing" assertion goes RED. Restore.
-5. Change the per-thread `catch` to log `console.error(e)`. Confirm the privacy log test goes RED. Restore, confirm GREEN.
+5. Change the per-thread `catch` to log `console.error(e)`. Confirm the privacy log test goes RED. Restore.
+6. Change `persistThread`'s settle to `WHERE draft_id = ?` with `t.draftId`. Confirm `settles EVERY open row for the thread it just polled` goes RED: the sibling row keeps its old `next_poll_at` and the second cycle selects it again. Restore.
+7. Delete `recordCycleAttempt(deps.db)` from the `finally`. Confirm `writes last_cycle_at even when the cycle throws something it does not classify` goes RED. Restore, confirm GREEN.
 
 - [ ] **Step 7: Commit**
 
@@ -2103,16 +2344,63 @@ git commit -m "Add the reply poll cycle: lease, adopt, per-thread transaction, n
 **Files:**
 - Modify: `src/cli.ts`
 - Test: `test/cli-error-shape.test.ts` (new, small)
+- Test: `test/cli-replies.test.ts` (new, small): the quiet-cycle assertion, which cannot live in Task 9
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
-The top-level handler is module-level code with no export, so test the shape rather than the wiring: assert that `src/cli.ts` contains no bare `console.error(e)` / `console.error(err)` on an error binding, the same static-scan approach `test/notify-tapback-safety.test.ts` uses and for the same reason (the failure is a FORMAT, and new call sites get added over time).
+**1a, the error shape.** The top-level handler is module-level code with no export, so test the shape rather than the wiring: assert that `src/cli.ts` contains no bare `console.error(e)` / `console.error(err)` on an error binding, the same static-scan approach `test/notify-tapback-safety.test.ts` uses and for the same reason (the failure is a FORMAT, and new call sites get added over time).
 
 ```ts
 it('never prints a bare error object, which would dump a GaxiosError response', () => {
   const src = readFileSync(join(here, '..', 'src/cli.ts'), 'utf8');
   // console.error(e) and console.error(err) append own enumerable properties.
   expect(/console\.error\(\s*(e|err|error)\s*\)/.test(src)).toBe(false);
+});
+```
+
+**1b, the quiet cycle never connects to Spectrum.** Spec Change 5 puts this property here, not in `runReplyCycle`, because `cmdReplies` is what decides whether a channel gets built. Task 9 can only assert that the cycle never CALLS the factory; only this test can assert that nothing built a channel in the first place.
+
+`cli.ts` exports nothing today, and `cmdReplies` reads `DB_PATH`, `createGmailReader` and `lazyChannel` from module scope, so give it the seam the rest of this codebase already uses (`ListenDeps`, `createGmailApiSender`'s `opts`) and export it:
+
+```ts
+// src/cli.ts
+export interface RepliesSeams {
+  dbPath?: string;
+  createReader?: () => GmailReader;
+  lazyChannel?: () => Promise<ApprovalChannel>;
+}
+export async function cmdReplies(argv: string[], seams: RepliesSeams = {}): Promise<void> { ... }
+```
+
+Every field is optional and defaults to the real implementation, so `main`'s dispatch calls `cmdReplies(argv)` exactly as before.
+
+```ts
+it('a quiet cycle never builds a channel, so the job never connects to Spectrum', async () => {
+  const lazyChannel = vi.fn(async () => { throw new Error('a quiet cycle must not connect'); });
+  // A reader over threads with no inbound message at all.
+  await cmdReplies([], { dbPath: ':memory:', createReader: () => quietReader, lazyChannel });
+  expect(lazyChannel).not.toHaveBeenCalled();
+});
+
+it('--dry-run never builds a channel either, even when there IS a reply to report', async () => {
+  const lazyChannel = vi.fn(async () => { throw new Error('dry run must not connect'); });
+  await cmdReplies(['--dry-run'], { dbPath: ':memory:', createReader: () => replyReader, lazyChannel });
+  expect(lazyChannel).not.toHaveBeenCalled();
+});
+
+it('builds exactly one channel when there is a reply to report', async () => {
+  const lazyChannel = vi.fn(async () => stubChannel);
+  await cmdReplies([], { dbPath: ':memory:', createReader: () => replyReader, lazyChannel });
+  expect(lazyChannel).toHaveBeenCalledTimes(1);   // not zero, so the test is not vacuous
+});
+
+// The lease covers --backfill, which is the largest quota spend in the feature.
+it('does not spend the backfill quota when it cannot take the lease', async () => {
+  const db = openDb(path);
+  acquireLease(db, 999, new Date());               // somebody else holds it
+  const createReader = vi.fn(() => backfillReader);
+  await cmdReplies(['--backfill'], { dbPath: path, createReader, lazyChannel });
+  expect(backfillReader.getMessageMetadata).not.toHaveBeenCalled();
 });
 ```
 
@@ -2132,19 +2420,43 @@ async function cmdReplies(argv: string[]): Promise<void> {
   if (!senderEmail) throw new Error('SENDER_EMAIL is not set; the reply poller refuses to start without it');
 
   const db = openDb(DB_PATH);
-  if (argv.includes('--rearm')) { console.log(`re-armed ${rearmUnresolvable(db, parseRearmIds(argv))} threads`); return; }
 
-  const reader = createGmailReader();
-  if (argv.includes('--backfill')) await backfillThreadIds(db, reader);
+  // THE LEASE WRAPS EVERYTHING THIS COMMAND DOES, not just runReplyCycle.
+  // --backfill is 56 `messages.get` calls and 1,120 quota units: the single
+  // largest spend in the whole feature, and it runs BEFORE the cycle. With the
+  // lease taken inside runReplyCycle, a hand-run `replies --backfill` during a
+  // scheduled cycle spends all 1,120 units twice and only then discovers it
+  // lost the lease. --rearm returns before the cycle is even reached, so it was
+  // never covered at all. Taking it here covers --rearm, --backfill and the
+  // cycle under one lock.
+  if (!acquireLease(db, process.pid, new Date())) {
+    console.log('another reply cycle holds the lease; exiting');
+    return;   // exit 0: not a success, not a failure. Touch no counters.
+  }
 
   // A dry run constructs NO channel at all, and a quiet cycle never connects to
-  // Spectrum either: the channel is created lazily, only when there is
-  // something to say.
+  // Spectrum either. Both properties come from this being a FACTORY that
+  // nothing calls until there is something to say. Passing `await
+  // lazyChannel()` here, as an earlier draft did, connects to Spectrum on every
+  // non-dry-run cycle before runReplyCycle is even entered, which is precisely
+  // the thing spec Change 5 forbids, and no assertion inside runReplyCycle can
+  // see it happen.
   let channel: ApprovalChannel | undefined;
+  const channelFactory = async (): Promise<ApprovalChannel> => (channel ??= await lazyChannel());
+
   try {
+    if (argv.includes('--rearm')) {
+      console.log(`re-armed ${rearmUnresolvable(db, parseRearmIds(argv))} threads`);
+      return;
+    }
+
+    const reader = createGmailReader();
+    if (argv.includes('--backfill')) await backfillThreadIds(db, reader);
+
     const summary = await runReplyCycle({
       db, reader, senderEmail, dryRun,
-      channel: dryRun ? undefined : await lazyChannel(),
+      leaseHeld: true,                                   // taken above, released below
+      channel: dryRun ? undefined : channelFactory,
     });
     console.log(JSON.stringify(summary, null, 2));
   } catch (e) {
@@ -2154,7 +2466,8 @@ async function cmdReplies(argv: string[]): Promise<void> {
     console.error(e instanceof Error ? e.message : 'unknown error');
     process.exitCode = 1;
   } finally {
-    await channel?.close?.();
+    releaseLease(db);
+    await channel?.close?.();   // the local, never the factory
   }
 }
 ```
@@ -2177,7 +2490,10 @@ main().catch((e) => {
 
 - [ ] **Step 5: Mutate**
 
-Restore `console.error(e)` and confirm the shape test goes RED. Restore.
+Three mutations:
+1. Restore `console.error(e)` and confirm the shape test goes RED. Restore.
+2. Change the `channel:` argument back to `dryRun ? undefined : await lazyChannel()` (and the dep back to a value). Confirm `a quiet cycle never builds a channel` goes RED. Restore.
+3. Move `acquireLease` back inside `runReplyCycle` only, so `cmdReplies` takes no lease. Confirm `does not spend the backfill quota when it cannot take the lease` goes RED with the reader called anyway. Restore, confirm GREEN.
 
 Then verify the leak claim by hand, once, so the reasoning is not taken on faith:
 
@@ -2190,7 +2506,7 @@ The first print must contain `secret@uni.edu`; the second must not. Paste both i
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/cli.ts test/cli-error-shape.test.ts
+git add src/cli.ts test/cli-error-shape.test.ts test/cli-replies.test.ts
 git commit -m "Add outreach replies, and stop the CLI printing a bare error object"
 ```
 
@@ -2251,12 +2567,9 @@ Line 52 currently prints a hardcoded `GMAIL_OAUTH_REFRESH_TOKEN=`. Replace with 
 
 Run `npx tsx scripts/gmail-auth.ts --scope=gmail.bogus` and confirm it throws with the list of valid scopes. Run `npx tsx --env-file=.env scripts/gmail-auth.ts --scope=gmail.metadata` and **read the printed auth URL without opening it**: confirm it contains `scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fgmail.metadata` and `prompt=consent`. Ctrl-C. Paste the URL's scope parameter into the commit body. `npm run typecheck` must stay clean.
 
-- [ ] **Step 6 (LIVE, needs Google credentials): actually mint the token**
+- [ ] **Step 6: MOVED. Do not run it here.**
 
-This is spec Verifications 0, 0b and 0c, and it is **the only part of Tasks 1 to 11 that cannot run offline**. In order:
-- **0b first.** Read the OAuth consent screen's user type and publishing status in the Google Cloud Console and record both in the spec. It comes first because it changes what 0 is likely to find: an **Internal** user type (ASU is a Workspace org) makes a restricted scope straightforward, while **External + Published (unverified)** makes it hardest.
-- **0.** Complete the `gmail.metadata` consent, confirm a refresh token comes back, confirm it can call `users.threads.get` on one real thread, and confirm it is **refused** on `users.messages.send`. If Google refuses the grant, Tasks 12 and 13 are blocked and the spec needs revision, not a workaround.
-- **0c.** With the new token in `.env` and `GMAIL_OAUTH_REFRESH_TOKEN` byte-identical to before, run one real `outreach add <arxiv-id> --to-self` and confirm it sends. The two refresh tokens are separate strings but are issued by the same OAuth client to the same account, so the consent grant is shared state. This is the single check the whole "cannot break sending" claim rests on.
+Minting the real token (spec Verifications 0b, 0 and 0c) is **Task 0, Steps 2 to 4**. It gates seven other tasks, so it cannot sit at the end of a Wave A task that runs concurrently with them. In practice Task 0 has already executed Steps 1 to 5 and 7 of this task before Wave A began; this task exists as a numbered unit only so the plan's numbering does not shift.
 
 - [ ] **Step 7: Commit**
 
@@ -2298,7 +2611,15 @@ Add a comment recording **why this key and not `StartInterval`**, quoted from `m
 
 Add a second comment recording that the **array** form is documented but is **not** proven in this repo: `com.aditya.outreach.plist:29-35` uses a single dictionary. Step 2 is what proves it.
 
-- [ ] **Step 2: Install, load, and READ THE SCHEDULE BACK**
+- [ ] **Step 2: Deploy steps 1, 2 and 3, BEFORE the plist is loaded**
+
+The spec's Deploy list is numbered and says "in this order" for a reason, and an earlier draft of this task inverted it: it loaded the plist (Deploy 4) and only then ran Deploy 1 to 3. Once the job is loaded, a scheduled fire can land in the middle of the remaining steps and run with no read token and no tables, writing exactly the errors into `data/replies.err.log` that Deploy step 5 then asks you to confirm are absent. Do these three first, with nothing scheduled.
+
+1. `GMAIL_OAUTH_READ_REFRESH_TOKEN` in `.env`; `GMAIL_OAUTH_REFRESH_TOKEN` unchanged; `SENDER_EMAIL` set.
+2. `npx tsx --env-file=.env src/cli.ts stranded` to reopen the database, then `sqlite3 data/outreach.db ".tables"` must list all three new tables and `SELECT count(*) FROM reply_poll_state` must be 1.
+3. **`npx tsx scripts/check-listener-fresh.ts --restart`.** Not optional and not deferrable. `com.aditya.outreach-listen` is `KeepAlive` true and holds its process for days; it executes `performApprovedSend`, which Task 7 modified, and `openDb` execs `schema.sql` only at open (`db.ts:19`), so `sent_threads` does not exist on that connection. Without the restart the listener runs the old code AND, once restarted into new code without a reopen, would throw `no such table` into the swallow. Re-run without `--restart` and confirm it reports fresh and exits 0. **This exact failure already happened once**, on 2026-08-04: three tasks shipped, 606 tests passed, and a live probe returned the old behavior.
+
+- [ ] **Step 3: Deploy step 4. Install, load, and READ THE SCHEDULE BACK**
 
 ```bash
 sed -e "s|REPLACE_WITH_NODE_PATH|$(which node)|" \
@@ -2310,15 +2631,15 @@ launchctl print gui/$(id -u)/com.aditya.outreach-replies | grep -i -A 20 'calend
 
 **Do not proceed until all four fire times appear.** `launchctl` is quiet about a plist it half-understood, and if only one interval registered, the job runs once a day while the `+4 hours` age tier assumes it runs four times. Paste the output into the commit body.
 
-- [ ] **Step 3: Run the rest of the deploy checklist**
+- [ ] **Step 4: Deploy step 5. One hand-run cycle**
 
-Spec Deploy steps 1, 2, 3 and 5, in order:
-1. `GMAIL_OAUTH_READ_REFRESH_TOKEN` in `.env`; `GMAIL_OAUTH_REFRESH_TOKEN` unchanged; `SENDER_EMAIL` set.
-2. `npx tsx --env-file=.env src/cli.ts stranded` to reopen the database, then `sqlite3 data/outreach.db ".tables"` must list all three new tables and `SELECT count(*) FROM reply_poll_state` must be 1.
-3. **`npx tsx scripts/check-listener-fresh.ts --restart`.** Not optional and not deferrable. `com.aditya.outreach-listen` is `KeepAlive` true and holds its process for days; it executes `performApprovedSend`, which Task 7 modified, and `openDb` execs `schema.sql` only at open (`db.ts:19`), so `sent_threads` does not exist on that connection. Without the restart the listener runs the old code AND, once restarted into new code without a reopen, would throw `no such table` into the swallow. Re-run without `--restart` and confirm it reports fresh and exits 0. **This exact failure already happened once**, on 2026-08-04: three tasks shipped, 606 tests passed, and a live probe returned the old behavior.
-5. One hand-run cycle, then read `data/replies.log`: the adopt count (`adopted 56 sends with no watch row` on the first run), the unresolvable count, an empty `data/replies.err.log`, `last_success_at` set and `consecutive_cycle_failures` 0.
+Run one cycle by hand, then read `data/replies.log`: the adopt count (`adopted N sends with no watch row`, where **N is the current `sent` event count** on the first run: it was 56 at the time of writing and only ever grows, so read it rather than expecting a literal), the unresolvable count, an empty `data/replies.err.log`, `last_success_at` set and `consecutive_cycle_failures` 0.
 
-- [ ] **Step 4: Commit**
+```bash
+sqlite3 data/outreach.db "SELECT count(*) FROM draft_events WHERE type='sent'"   # this is N
+```
+
+- [ ] **Step 5: Commit**
 
 ```bash
 git add scripts/com.aditya.outreach-replies.plist
@@ -2346,7 +2667,7 @@ npx vitest run --reporter=dot 2>&1 | tail -5
 npm run typecheck
 ```
 
-Exactly the 2 pre-existing `test/draft.test.ts` failures. No others.
+**633 + N passing, zero failures.** There is no allowed-failure list.
 
 - [ ] **Step 3: Live end-to-end (spec Verification 1)**
 
@@ -2370,7 +2691,7 @@ Thumbs up the `Reply from ...` message and confirm the hint arrives. Silence her
 npx tsx --env-file=.env src/cli.ts replies --backfill
 ```
 
-Report the actual numbers: how many of the 56 resolved to a `threadId`, how many threads already contain an inbound message, and the `kind` breakdown. **This is the payoff.** It either answers the motivating question immediately or proves nobody has answered yet.
+Report the actual numbers: how many of the `sent` events resolved to a `threadId`, how many threads already contain an inbound message, and the `kind` breakdown. **This is the payoff.** It either answers the motivating question immediately or proves nobody has answered yet.
 
 Read the result out loud with the caveat attached: the oldest send is about 7.7 days old and academics answer cold email on week-to-month timescales, so an early zero is not evidence that the hooks do not work. That is also why the close window is 60 days rather than 30.
 
@@ -2407,7 +2728,7 @@ Wait for one scheduled fire time and confirm `data/replies.log` gained a cycle w
 
 ## Self-Review
 
-**Spec coverage.** Change 1 → Task 11 (all three script changes) and Task 2 (`GMAIL_OAUTH_READ_REFRESH_TOKEN` consumption). Change 2 → Task 6 (`recordSentThread`, `adoptOrphanedSends`, the Gmail-shape guard) and Task 7 (the sender seam, `markSent`, both call sites, the placement outside the try). Change 3 → Task 1 (all three tables, the canonical timestamp) and Task 8 (`reply_poll_state`'s semantics). Change 4 → Task 3 (extraction and classification), Task 2 (`classifyFailure`), Task 6 (cadence, `rearmUnresolvable`), Task 9 (the conflict-ignoring insert, the per-thread transaction). Change 5 → Task 9 (lease, injected seams, dry-run, per-thread persistence), Task 10 (the error path), Task 12 (the plist). Change 6 → Task 4 (formats, coalescing, the name cap, the recognizer), Task 5 (the hint branch), Task 9 (notify-then-mark, the alarm). Change 7 → Task 2 (the boundary projection) and Task 9 (the logging rule). Verifications 0/0b/0c → Task 11 Step 6. Deploy 1 to 5 → Task 12 Steps 2 and 3. Verifications 1, 2, 2b → Task 13. Verifications 3 through 8 → Tasks 1 through 9's test steps. No spec section is unimplemented.
+**Spec coverage.** Change 1 → Task 11 (all three script changes, executed inside Task 0) and Task 2 (`GMAIL_OAUTH_READ_REFRESH_TOKEN` consumption). Change 2 → Task 6 (`recordSentThread`, `adoptOrphanedSends`, the Gmail-shape guard) and Task 7 (the sender seam, `markSent`, both call sites, the placement outside the try). Change 3 → Task 1 (all three tables, the canonical timestamp) and Task 8 (`reply_poll_state`'s semantics). Change 4 → Task 3 (extraction and classification), Task 2 (`classifyFailure`), Task 6 (cadence, `rearmUnresolvable`), Task 9 (the conflict-ignoring insert, the per-thread transaction). Change 5 → Task 9 (lease, injected seams, dry-run, per-thread persistence), Task 10 (the error path), Task 12 (the plist). Change 6 → Task 4 (formats, coalescing, the name cap, the recognizer), Task 5 (the hint branch), Task 9 (notify-then-mark, the alarm). Change 7 → Task 2 (the boundary projection) and Task 9 (the logging rule). Verifications 0/0b/0c → **Task 0** (Steps 2 to 4). Deploy 1 to 5 → Task 12 Steps 2, 3 and 4, in the spec's order. Verifications 1, 2, 2b → Task 13. Verifications 3 through 8 → Tasks 1 through 9's test steps. No spec section is unimplemented.
 
 **The five blockers, and where each is closed.**
 1. Conflict-ignoring insert → Task 1 (the constraint plus a `changes === 0` test), Task 9 (the statement, mutation 1).
@@ -2425,4 +2746,4 @@ Wait for one scheduled fire time and confirm `data/replies.log` gained a cycle w
 - **Task 9's `persistThread` must stay synchronous.** better-sqlite3 transactions do not hold across an `await`, so an `await` inside that function is silently not transactional. If a reviewer suggests awaiting inside it, that is the category error the spec names.
 - **Task 8's tests must not be moved to `':memory:'`.** They would pass and prove the opposite of what is needed: two `':memory:'` handles share nothing, which is exactly the property being tested for, so the test would go green under the module-variable bug.
 - **`sent_at` is read back into a `Date` in Task 9's cadence call.** `new Date('2026-08-04 10:00:00')` is parsed as **local time** by V8, not UTC. Append `'Z'` or parse explicitly; getting this wrong shifts every age tier by the local offset (7 hours in Arizona) and would not fail any test that also builds its expectation the same way. Assert one tier boundary against a hardcoded string, not against a round trip.
-- **The 2 pre-existing `test/draft.test.ts` failures.** Do not fix them here and do not let them mask a new one. Count failures, not just the pass total.
+- **There are no pre-existing failures.** An earlier draft of this plan and of the spec normalised 2 failures in `test/draft.test.ts` as expected background. They were fixed in `5927688` before this plan was written, and the measured baseline is 633/633. Count failures, not just the pass total, and treat any failure as caused here.
