@@ -133,3 +133,92 @@ CREATE TABLE IF NOT EXISTS seen_papers (
 
 CREATE INDEX IF NOT EXISTS idx_seen_status ON seen_papers(status);
 CREATE INDEX IF NOT EXISTS idx_seen_resume ON seen_papers(status, first_seen_at);
+
+-- Reply tracking (docs/superpowers/specs/2026-08-04-reply-tracking-design.md,
+-- Change 3). Every timestamp column below is 'YYYY-MM-DD HH:MM:SS' UTC, the
+-- exact form datetime('now') produces: no T, no Z, no fractional seconds, no
+-- offset. Written from TypeScript through src/db/time.ts, never
+-- Date#toISOString() directly.
+CREATE TABLE IF NOT EXISTS sent_threads (
+  draft_id INTEGER PRIMARY KEY REFERENCES drafts(id),
+  person_id INTEGER NOT NULL REFERENCES people(id),
+  sent_message_id TEXT NOT NULL,          -- materialized from draft_events.detail_json
+  thread_id TEXT,                         -- NULL until send-time capture or backfill
+  sent_at TEXT NOT NULL,                  -- 'YYYY-MM-DD HH:MM:SS' UTC. See above.
+  watch_state TEXT NOT NULL DEFAULT 'open'
+    CHECK(watch_state IN ('open','replied','closed_no_reply','unresolvable')),
+  last_polled_at TEXT,
+  -- Due time, not elapsed time. Survives missed cycles and wake coalescing:
+  -- a row that is overdue is simply picked up on the next run.
+  --
+  -- MUST be 'YYYY-MM-DD HH:MM:SS'. Written as ISO-with-Z this column silently
+  -- stops the poller forever: 'T' sorts above ' ', so a past due time never
+  -- satisfies `next_poll_at <= datetime('now')`. julianday() parses both, so a
+  -- cadence test cannot catch it.
+  next_poll_at TEXT NOT NULL DEFAULT (datetime('now')),
+  -- Counts ONLY failures attributable to THIS thread: a 404, or a per-thread
+  -- 4xx. A cycle-wide failure (expired refresh token, 429, 5xx, SQLITE_BUSY)
+  -- must never touch this column, because it hits every selected row at once
+  -- and five such cycles would mark the entire watch set unresolvable. Reset to
+  -- 0 on any successful poll. See Change 4.
+  poll_failures INTEGER NOT NULL DEFAULT 0,
+  -- Set when a human re-arms an unresolvable row. Kept so a row that has been
+  -- re-armed and failed again is visibly different from a fresh one.
+  rearmed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_threads_state ON sent_threads(watch_state, next_poll_at);
+CREATE INDEX IF NOT EXISTS idx_threads_thread ON sent_threads(thread_id);
+CREATE INDEX IF NOT EXISTS idx_threads_msg ON sent_threads(sent_message_id);
+
+CREATE TABLE IF NOT EXISTS replies (
+  id INTEGER PRIMARY KEY,
+  draft_id INTEGER NOT NULL REFERENCES drafts(id),
+  person_id INTEGER NOT NULL REFERENCES people(id),
+  gmail_message_id TEXT NOT NULL UNIQUE,  -- the idempotency key
+  thread_id TEXT NOT NULL,
+  from_address TEXT NOT NULL,             -- bare address, extracted from the From mailbox
+  -- From internalDate, never the Date: header. 'YYYY-MM-DD HH:MM:SS' UTC,
+  -- written through fromInternalDate(), not Date#toISOString().
+  received_at TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('human','auto_reply','bounce')),
+  detected_at TEXT DEFAULT (datetime('now')),
+  -- NULL until channel.notify() has returned successfully for this row. This
+  -- column is what makes "exactly one notification" implementable at all.
+  notified_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_replies_draft ON replies(draft_id);
+CREATE INDEX IF NOT EXISTS idx_replies_unnotified ON replies(notified_at) WHERE notified_at IS NULL;
+
+-- Cycle-level durable state. Exactly one row, enforced by the CHECK.
+--
+-- This table exists because the job is StartCalendarInterval with no KeepAlive,
+-- so EVERY cycle is a fresh short-lived process with no memory of the last one.
+-- Change 6 promises to notify "after 3 consecutive failed cycles". Without a
+-- durable counter that promise is unimplementable rather than merely untested:
+-- a whole-cycle failure that records nothing before exiting resets the count to
+-- zero on every run, so the alarm can never fire, and the silent-death mode the
+-- notification exists to catch is exactly the mode it would miss.
+--
+-- It also carries the run lease. launchd will not start a second copy of this
+-- job, but every verification in this spec hand-runs `outreach replies` while
+-- the scheduled job may be mid-cycle, and two concurrent cycles would both
+-- select the same due rows and both spend quota on them.
+CREATE TABLE IF NOT EXISTS reply_poll_state (
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  last_cycle_at TEXT,
+  last_success_at TEXT,
+  -- Incremented ONLY by a cycle-wide failure. Reset to 0 by any cycle that
+  -- completes. This is the counter the 3-cycle alarm reads.
+  consecutive_cycle_failures INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,                        -- err.message ONLY, never the object
+  -- Set after the failure notification is delivered, cleared on recovery, so
+  -- the alarm fires once per outage rather than once per cycle for days.
+  failure_notified_at TEXT,
+  -- The lease. A cycle claims it with a conditional UPDATE, the same shape as
+  -- beginSendAttempt (ledger.ts:219-250): SQLite serializes writers and the
+  -- WHERE clause carries the whole precondition, so there is no read-then-write
+  -- gap. The loser exits 0 immediately and says so.
+  lock_pid INTEGER,
+  lock_expires_at TEXT
+);
+INSERT OR IGNORE INTO reply_poll_state (id) VALUES (1);
