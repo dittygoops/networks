@@ -159,6 +159,73 @@ export function needsAddressTapbackHint(shortId: string): string {
   return `${shortId} needs a typed address, not a tapback. Reply "${shortId} to their@address.edu", or "${shortId} n" to skip.`;
 }
 
+// --- Reply-tracking notifications ----------------------------------------
+// Here, not in replies.ts, for the same reason formatNeedsAddressMessage is
+// here: the job that SENDS these and the channel that must recognise a TAPBACK
+// on them both need them, and they must not drift.
+//
+// Every one of these begins with literal text and cannot parse as a draft id.
+// draftIdFromReactedText (photonChannel.ts:135-138) turns any message whose
+// text starts /^\s*(d\d+):/ into a tapback-approvable draft, so `d19: Daniel
+// Kepple replied` would make a thumbs up on good news decode to `d19 y`. This
+// project has been bitten by that shape twice.
+export interface ReplyNotice {
+  shortId: string;
+  personName: string;
+  ageText: string;
+}
+
+// Coalescing bounds the message COUNT (at most 3 per cycle: replies, bounces,
+// failure). It does nothing about the LENGTH of one, and a burst day would
+// otherwise produce a single text listing thirty names. The caller must set
+// notified_at on EVERY covered row, including the ones folded into the tail,
+// or a 12-reply cycle re-notifies the unnamed 7 forever.
+export const MAX_NAMES_PER_NOTICE = 5;
+
+function nameList(rs: ReplyNotice[]): string {
+  const shown = rs.slice(0, MAX_NAMES_PER_NOTICE).map((r) => `${r.personName} (${r.shortId})`).join(', ');
+  const hidden = rs.length - Math.min(rs.length, MAX_NAMES_PER_NOTICE);
+  return hidden > 0 ? `${shown} and ${hidden} more` : shown;
+}
+
+export function formatHumanReplyNotice(rs: ReplyNotice[]): string {
+  if (rs.length === 0) return '';
+  if (rs.length === 1) {
+    const r = rs[0]!;
+    return `Reply from ${r.personName} (${r.shortId}), ${r.ageText}. Read it in Gmail.`;
+  }
+  return `${rs.length} replies: ${nameList(rs)}. Read them in Gmail.`;
+}
+
+export function formatBounceNotice(rs: ReplyNotice[]): string {
+  if (rs.length === 0) return '';
+  if (rs.length === 1) return `Bounced: ${rs[0]!.shortId} to ${rs[0]!.personName} did not deliver.`;
+  return `${rs.length} bounced: ${nameList(rs)}.`;
+}
+
+// err.message only. Never the error object: a GaxiosError carries its response
+// and request config as own enumerable properties, so console.error(e) prints
+// header values (From addresses, under format=metadata) and the full URL.
+export function formatPollFailureNotice(cycles: number, message: string): string {
+  return `Reply polling has failed ${cycles} cycles running: ${message}.`;
+}
+
+// A tapback on one of the above used to produce total silence: no `dN:` header
+// so draftIdFromReactedText returns null, and no NEEDS ADDRESS header so
+// needsAddressDraftId returns null too. Reacting to good news is the most
+// natural thing a human does with these messages, and silence is
+// indistinguishable from a dead listener.
+//
+// Unlike a needs-address message there is no typed command that would help, so
+// the hint says exactly that and stops. It begins with a letter, so it cannot
+// itself become an approval button.
+const REPLY_NOTICE = /^(Reply from |\d+ replies: |Bounced: |\d+ bounced: |Reply polling has failed )/;
+
+export function replyNoticeTapbackHint(text: string | undefined): string | null {
+  if (!REPLY_NOTICE.test((text ?? '').trim())) return null;
+  return 'Nothing to approve on a reply notification. Open Gmail to read it.';
+}
+
 export interface StubChannel extends ApprovalChannel {
   sent: OutboundDraftMessage[];
   notices: string[];
