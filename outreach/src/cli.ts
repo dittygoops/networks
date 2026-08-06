@@ -4,12 +4,18 @@
 import { basename } from 'node:path';
 import { readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
+import { fileURLToPath } from 'node:url';
 import { openDb, saveSelfFacts, replaceSelfFacts, factRows, getPerson } from './db/db.js';
 import { decide, markSendFailed, markSent, persistDraft, priorThreads } from './approval/ledger.js';
-import { recordSentThread } from './pipeline/sentThreads.js';
+import { recordSentThread, rearmUnresolvable } from './pipeline/sentThreads.js';
 import { createGmailApiSender } from './sender/gmail-api.js';
 import { createGmailSmtpSender } from './sender/gmail.js';
 import type { Sender } from './sender/types.js';
+import { createGmailReader, type GmailReader } from './sender/gmailReader.js';
+import { runReplyCycle } from './pipeline/replies.js';
+import { acquireLease, releaseLease } from './pipeline/replyState.js';
+import { parseShortId } from './approval/ids.js';
+import type { ApprovalChannel } from './approval/channel.js';
 
 // Pick the sender: Gmail API OAuth if configured (the path that works on ASU
 // Workspace, which blocks SMTP app passwords), else SMTP for personal accounts.
@@ -247,6 +253,132 @@ async function cmdListen(): Promise<void> {
   });
 }
 
+// Resolves thread_id for every legacy send that has none: one
+// users.messages.get per row (20 quota units each; 56 for the historical
+// sends this feature exists to backfill, the single largest quota spend in
+// the whole feature). Never assumes the first message in a thread has
+// id == threadId: that is widely observed and nowhere documented, so this
+// always asks (gmailReader.ts:threadIdForMessage). A single row's failure (a
+// deleted message, a transient fault) is logged and skipped, not fatal to the
+// rest of the backfill: one bad historical row must not block the other 55.
+async function backfillThreadIds(db: ReturnType<typeof openDb>, reader: GmailReader): Promise<number> {
+  const rows = db.prepare(
+    `SELECT draft_id AS draftId, sent_message_id AS sentMessageId
+       FROM sent_threads WHERE thread_id IS NULL AND watch_state = 'open'`,
+  ).all() as { draftId: number; sentMessageId: string }[];
+  let resolved = 0;
+  for (const row of rows) {
+    try {
+      const threadId = await reader.threadIdForMessage(row.sentMessageId);
+      if (threadId) {
+        db.prepare('UPDATE sent_threads SET thread_id = ? WHERE draft_id = ?').run(threadId, row.draftId);
+        resolved++;
+      }
+    } catch (e) {
+      console.log(
+        `backfill: could not resolve a thread id for draft ${row.draftId}: ${e instanceof Error ? e.message : 'unknown error'}`,
+      );
+    }
+  }
+  return resolved;
+}
+
+// `--rearm all` (or `--rearm` with nothing after it) means every unresolvable
+// row; `--rearm d19 d22` (or bare `19 22`) means only those drafts. Reuses
+// parseShortId so 'd19', 'D19' and bare '19' all work, the same ergonomics as
+// a tapback reply. undefined means "no filter", which is what
+// rearmUnresolvable (sentThreads.ts) treats as "all".
+function parseRearmIds(argv: string[]): number[] | undefined {
+  const idx = argv.indexOf('--rearm');
+  if (idx === -1) return undefined;
+  const rest = argv.slice(idx + 1).filter((a) => !a.startsWith('--'));
+  if (rest.length === 0 || rest[0] === 'all') return undefined;
+  const ids = rest.map(parseShortId).filter((n): n is number => n !== null);
+  return ids.length ? ids : undefined;
+}
+
+export interface RepliesSeams {
+  dbPath?: string;
+  createReader?: () => GmailReader;
+  lazyChannel?: () => Promise<ApprovalChannel>;
+}
+
+// `replies [--dry-run] [--backfill] [--rearm all|<draftId>...]`: poll every
+// due thread once, adopt orphaned sends, and notify on new human replies and
+// bounces. Every field of `seams` defaults to the real implementation, so
+// main's dispatch below calls cmdReplies(argv) exactly as it would with no
+// seams argument at all; the seam exists only so a test can prove what this
+// command does and does not connect to, without a real Gmail token or a real
+// Spectrum session.
+export async function cmdReplies(argv: string[], seams: RepliesSeams = {}): Promise<void> {
+  const dryRun = argv.includes('--dry-run');
+  const senderEmail = process.env.SENDER_EMAIL;
+  // Fail loud, with the remedy, exactly like createGmailApiSender
+  // (gmail-api.ts:33-37). Never degrade to a silent no-op: without this the
+  // job would treat every message as inbound, including Aditya's own
+  // follow-ups, and write fabricated ground truth into the exact table the
+  // whole evaluation section depends on.
+  if (!senderEmail) throw new Error('SENDER_EMAIL is not set; the reply poller refuses to start without it');
+
+  const db = openDb(seams.dbPath ?? DB_PATH);
+  const createReader = seams.createReader ?? createGmailReader;
+  const lazyChannel = seams.lazyChannel ?? (() => createPhotonChannel(photonOptionsFromEnv()));
+
+  // THE LEASE WRAPS EVERYTHING THIS COMMAND DOES, not just runReplyCycle.
+  // --backfill is up to 56 `messages.get` calls, the single largest spend in
+  // the whole feature, and it runs BEFORE the cycle. With the lease taken
+  // inside runReplyCycle instead, a hand-run `replies --backfill` during a
+  // scheduled cycle would spend the whole backfill and only then discover it
+  // lost the lease. --rearm returns before the cycle is even reached, so it
+  // would never be covered at all. Taking it here, before either branch,
+  // covers --rearm, --backfill and the cycle under one lock.
+  if (!acquireLease(db, process.pid, new Date())) {
+    console.log('another reply cycle holds the lease; exiting');
+    return;   // exit 0: not a success, not a failure. Touch no counters.
+  }
+
+  // A dry run constructs NO channel at all, and a quiet cycle never connects
+  // to Spectrum either. Both properties come from this being a FACTORY that
+  // nothing calls until there is something to say: passing `await
+  // lazyChannel()` eagerly here would connect to Spectrum on every
+  // non-dry-run cycle before runReplyCycle is even entered, which is exactly
+  // what spec Change 5 forbids, and no assertion inside runReplyCycle could
+  // see it happen. A second connected Spectrum client competes on the line
+  // carrying irreversible approvals.
+  let channel: ApprovalChannel | undefined;
+  const channelFactory = async (): Promise<ApprovalChannel> => (channel ??= await lazyChannel());
+
+  try {
+    if (argv.includes('--rearm')) {
+      console.log(`re-armed ${rearmUnresolvable(db, parseRearmIds(argv))} threads`);
+      return;
+    }
+
+    const reader = createReader();
+    if (argv.includes('--backfill')) {
+      const n = await backfillThreadIds(db, reader);
+      console.log(`backfilled ${n} thread ids`);
+    }
+
+    const summary = await runReplyCycle({
+      db, reader, senderEmail, dryRun,
+      leaseHeld: true,                                   // taken above, released below
+      channel: dryRun ? undefined : channelFactory,
+    });
+    console.log(JSON.stringify(summary, null, 2));
+  } catch (e) {
+    // cmdReplies owns its own catch and never lets a Gaxios error reach the
+    // top-level handler, where a bare console.error on the error object would
+    // print the response headers and the request URL into
+    // data/replies.err.log.
+    console.error(e instanceof Error ? e.message : 'unknown error');
+    process.exitCode = 1;
+  } finally {
+    releaseLease(db);
+    await channel?.close?.();   // the local, never the factory
+  }
+}
+
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
   if (command === 'persona') return runPersona(rest);
@@ -260,11 +392,12 @@ async function main(): Promise<void> {
     cmdStranded();
     return;
   }
+  if (command === 'replies') return cmdReplies(rest);
 
   const arg = rest[0];
   if (command !== 'add' || !arg) {
     console.error(
-      'usage: cli.ts add <arxiv-id>  |  cli.ts persona <doc-path...> [--answers <file.json>]  |  cli.ts loop [--dry-run]  |  cli.ts listen  |  cli.ts stranded',
+      'usage: cli.ts add <arxiv-id>  |  cli.ts persona <doc-path...> [--answers <file.json>]  |  cli.ts loop [--dry-run]  |  cli.ts listen  |  cli.ts stranded  |  cli.ts replies [--dry-run] [--backfill] [--rearm all|<draftId>...]',
     );
     process.exit(1);
   }
@@ -446,7 +579,20 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+// Only run main() when this file is the process entry point, not when it is
+// imported for its exports (cmdReplies, RepliesSeams). Without this guard,
+// importing cli.ts from a test runs the whole CLI as a side effect of module
+// load: process.argv is the test runner's, so it falls through to the usage
+// branch and calls process.exit(1) mid test run.
+const isEntryPoint = process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1];
+if (isEntryPoint) {
+  main().catch((e) => {
+    // .stack, not the object. A bare console.error on the error object
+    // appends its own enumerable properties, which on a GaxiosError means
+    // response.headers (From addresses under format=metadata) and config.url.
+    // Verified on Node 24. Keeping the stack preserves what every other
+    // command relies on for debugging and drops only the appended dump.
+    console.error(e instanceof Error ? (e.stack ?? e.message) : 'unknown error');
+    process.exit(1);
+  });
+}
