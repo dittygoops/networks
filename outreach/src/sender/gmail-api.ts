@@ -41,7 +41,7 @@ export function createGmailApiSender(opts?: {
   const gmail = google.gmail({ version: 'v1', auth });
 
   return {
-    async send(email: OutboundEmail): Promise<{ sentId: string }> {
+    async send(email: OutboundEmail): Promise<{ sentId: string; threadId?: string }> {
       // D3: fail closed before building the raw RFC 2822 message, which is
       // where a CR or LF in the subject would become a real extra header.
       assertSafeOutbound(email);
@@ -49,7 +49,7 @@ export function createGmailApiSender(opts?: {
         userId: 'me',
         requestBody: { raw: toRawMessage(email) },
       });
-      return { sentId: res.data.id ?? `gmail-${Date.now()}` };
+      return { sentId: res.data.id ?? `gmail-${Date.now()}`, threadId: res.data.threadId ?? undefined };
     },
   };
 }

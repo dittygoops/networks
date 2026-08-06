@@ -116,10 +116,19 @@ export function decide(
 
 // D7: the UPDATE and the audit record are one unit. A crash between them would
 // lose the only durable record of an irreversible email.
-export function markSent(db: DB, draftId: number, sentId: string): void {
+//
+// threadId is OPTIONAL and only widens the payload of an INSERT that already
+// happens inside this transaction, so it adds no new way for the transaction
+// to fail. The sent_threads watch row is deliberately NOT written here: see
+// recordSentThread in src/pipeline/sentThreads.ts and the caller in
+// performApprovedSend, which calls it AFTER this transaction commits.
+export function markSent(db: DB, draftId: number, sentId: string, threadId?: string): void {
   const txn = db.transaction((): void => {
     db.prepare("UPDATE drafts SET status = 'sent' WHERE id = ?").run(draftId);
-    logEvent(db, draftId, 'sent', { sentId });
+    // Keep the threadId ? conditional rather than always writing the key: the
+    // 56 historical events have no such key, and matching their shape when
+    // there is nothing to record keeps the log honest.
+    logEvent(db, draftId, 'sent', threadId ? { sentId, threadId } : { sentId });
   });
   txn();
 }

@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
 import { openDb, saveSelfFacts, replaceSelfFacts, factRows, getPerson } from './db/db.js';
 import { decide, markSendFailed, markSent, persistDraft, priorThreads } from './approval/ledger.js';
+import { recordSentThread } from './pipeline/sentThreads.js';
 import { createGmailApiSender } from './sender/gmail-api.js';
 import { createGmailSmtpSender } from './sender/gmail.js';
 import type { Sender } from './sender/types.js';
@@ -401,20 +402,37 @@ async function main(): Promise<void> {
         return;
       }
       const sender = makeSender();
+      let sentThreadInfo: { sentId: string; threadId?: string } | null = null;
       try {
-        const { sentId } = await sender.send({
+        const { sentId, threadId } = await sender.send({
           to: toAddr,
           from: process.env.SENDER_EMAIL ?? 'apgupta3@asu.edu',
           subject: draft.subject,
           body: draft.body,
           draftShortId: persisted.shortId,
         });
-        markSent(db, persisted.draftId, sentId);
+        markSent(db, persisted.draftId, sentId, threadId);
+        sentThreadInfo = { sentId, threadId };
         console.log(`SENT ${persisted.shortId} to ${toAddr} (${sentId})`);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         markSendFailed(db, persisted.draftId, msg);
         console.log(`send failed (${msg}); ${persisted.shortId} stays approved, re-run send later`);
+      }
+
+      // OUTSIDE the try, deliberately, and swallowed: see the identical
+      // comment in performApprovedSend (src/pipeline/loop.ts). This path
+      // bypasses beginSendAttempt entirely, so recordSentThread must not
+      // assume the invariants that give it its at-most-one-send property;
+      // that is why it is ON CONFLICT DO NOTHING.
+      if (sentThreadInfo) {
+        try {
+          recordSentThread(db, persisted.draftId, r.personId, sentThreadInfo.sentId, sentThreadInfo.threadId);
+        } catch (e) {
+          console.warn(
+            `recordSentThread failed for ${persisted.shortId}: ${e instanceof Error ? e.message : 'unknown error'}`,
+          );
+        }
       }
     } else if (answer === 's' || answer === 'skip') {
       const rl2 = createInterface({ input: process.stdin, output: process.stdout });

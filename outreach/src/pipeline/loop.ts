@@ -52,6 +52,7 @@ import type { RejectedCandidate } from './contacts.js';
 import type { OrchestrateResult } from './orchestrate.js';
 import { assertSafeOutbound, type Sender } from '../sender/types.js';
 import type { LLMClient } from '../llm/client.js';
+import { recordSentThread } from './sentThreads.js';
 
 // The subset of LoopDeps that acting on one reply actually needs. Split out
 // so `outreach listen` (src/pipeline/listen.ts) can call handleReply without
@@ -221,9 +222,11 @@ async function performApprovedSend(
   // Phase 2, the network. From here on, a failure is NOT retried automatically:
   // a timeout after Gmail accepted the message is indistinguishable from a
   // message Gmail never saw, and only one of those is safe to repeat.
+  let sentThreadInfo: { sentId: string; threadId?: string } | null = null;
   try {
-    const { sentId } = await deps.sender.send(outbound);
-    markSent(deps.db, draftId, sentId);
+    const { sentId, threadId } = await deps.sender.send(outbound);
+    markSent(deps.db, draftId, sentId, threadId);
+    sentThreadInfo = { sentId, threadId };
     summary.sent++;
     // Names the human, not just the address. A tapback is one tap, so a
     // mis-tap is easy in a way that typing "d25 y" was not, and the only
@@ -237,6 +240,28 @@ async function performApprovedSend(
     await deps.channel.notify(
       `${shortId} failed to send: ${msg}. Not retried automatically; check the Gmail Sent folder.`,
     );
+  }
+
+  // OUTSIDE the try, deliberately, and swallowed. Inside it, a throw here would
+  // land in the catch above, which calls markSendFailed and texts "failed to
+  // send" for an email that WENT OUT. A missing watch row is recoverable at
+  // zero cost by adoptOrphanedSends at the head of the next reply cycle; a
+  // send_failed event about a delivered email is not recoverable at all. The
+  // asymmetry decides it.
+  if (sentThreadInfo) {
+    const owner = deps.db.prepare('SELECT person_id AS personId FROM drafts WHERE id = ?').get(draftId) as
+      | { personId: number }
+      | undefined;
+    if (owner) {
+      try {
+        recordSentThread(deps.db, draftId, owner.personId, sentThreadInfo.sentId, sentThreadInfo.threadId);
+      } catch (e) {
+        // err.message only: a GaxiosError carries response headers and a
+        // request URL as own enumerable properties, and console.error(e) would
+        // print them.
+        console.warn(`recordSentThread failed for ${shortId}: ${e instanceof Error ? e.message : 'unknown error'}`);
+      }
+    }
   }
 }
 
