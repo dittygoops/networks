@@ -6,7 +6,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { assertApproverPhone, createPhotonChannel } from '../src/approval/photonChannel.js';
 import type { PhotonApp, PhotonDm, RawMessage } from '../src/approval/photonChannel.js';
-import { formatNeedsAddressMessage } from '../src/approval/channel.js';
+import { formatHumanReplyNotice, formatNeedsAddressMessage } from '../src/approval/channel.js';
 
 const APPROVER = '+15555550123';
 
@@ -409,6 +409,44 @@ describe('a tapback on the needs-address message', () => {
 
   // Unchanged behaviour, and it matters: the line may be shared, so a reaction
   // on anything else must never be reflected back.
+  it('still reflects nothing for a reaction on an ordinary status line', async () => {
+    const { channel, dmSend } = await channelFor([reaction('\u{1F44D}', 'd25 sent to jiaruizhao@cuhk.edu.hk.')]);
+    expect(await channel.captureReplies(200)).toEqual([]);
+    expect(dmSend).not.toHaveBeenCalled();
+  });
+});
+
+describe('a tapback on a reply notification', () => {
+  const NOTICE = formatHumanReplyNotice([{ shortId: 'd19', personName: 'Daniel Kepple', ageText: '2h ago' }]);
+
+  // The safety half. This message names a draft, so if it ever became
+  // approvable a thumbs up on good news would send something.
+  it('never becomes an approval', async () => {
+    const { channel } = await channelFor([reaction('\u{1F44D}', NOTICE)]);
+    expect(await channel.captureReplies(200)).toEqual([]);
+  });
+
+  // The usability half. Silence here is indistinguishable from a dead listener,
+  // which is the exact failure the needs-address hint branch was added to fix.
+  it('answers on-channel instead of going silent', async () => {
+    const { channel, dmSend } = await channelFor([reaction('\u{1F44D}', NOTICE)]);
+    await channel.captureReplies(200);
+    expect(dmSend).toHaveBeenCalledTimes(1);
+    const sent = String(dmSend.mock.calls[0]![0]);
+    expect(sent).toContain('Nothing to approve');
+    expect(/^\s*d\d+:/.test(sent)).toBe(false);
+  });
+
+  it('hints on the push path too, so batch and listener cannot drift', async () => {
+    const { channel, dmSend } = await channelFor([reaction('\u{1F44E}', NOTICE)]);
+    const seen: string[] = [];
+    await channel.streamReplies(async (r) => { seen.push(r.text); });
+    expect(seen).toEqual([]);
+    expect(dmSend).toHaveBeenCalledTimes(1);
+  });
+
+  // Unchanged, and it matters: the line may be shared, so a reaction on
+  // anything that is not one of ours must never be reflected back.
   it('still reflects nothing for a reaction on an ordinary status line', async () => {
     const { channel, dmSend } = await channelFor([reaction('\u{1F44D}', 'd25 sent to jiaruizhao@cuhk.edu.hk.')]);
     expect(await channel.captureReplies(200)).toEqual([]);

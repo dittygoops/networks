@@ -5,7 +5,7 @@
 import { Spectrum } from 'spectrum-ts';
 import { imessage } from 'spectrum-ts/providers';
 import type { ApprovalChannel, InboundReply, OutboundDraftMessage, StreamOutcome } from './channel.js';
-import { needsAddressDraftId, needsAddressTapbackHint } from './channel.js';
+import { needsAddressDraftId, needsAddressTapbackHint, replyNoticeTapbackHint } from './channel.js';
 
 export interface PhotonOptions {
   projectId: string;
@@ -157,6 +157,14 @@ function reactionToDecoded(content: NonNullable<RawMessage['content']>): Decoded
       // exists for it.
       console.log(`photonChannel: reaction on the needs-address message for ${needs}, replying with the syntax`);
       return { kind: 'hint', text: needsAddressTapbackHint(needs) };
+    }
+    const replyHint = replyNoticeTapbackHint(targetText);
+    if (replyHint) {
+      // Informational message: there is nothing to approve and, unlike a
+      // needs-address message, no typed command that would help either. Say so
+      // rather than going silent, because silence reads as a dead listener.
+      console.log('photonChannel: reaction on a reply notification, replying with a no-op hint');
+      return { kind: 'hint', text: replyHint };
     }
     // Reacting to a status line ("d25 sent to ...") or to anything else is a
     // normal human thing to do and must never be read as an instruction, and
