@@ -18,7 +18,10 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const SOURCES = ['src/pipeline/loop.ts', 'src/pipeline/listen.ts', 'src/cli.ts', 'src/pipeline/addressCorrection.ts'];
+const SOURCES = [
+  'src/pipeline/loop.ts', 'src/pipeline/listen.ts', 'src/cli.ts', 'src/pipeline/addressCorrection.ts',
+  'src/pipeline/replies.ts',
+];
 
 // Mirrors draftIdFromReactedText. A draft id followed by a colon is the token
 // that makes a message tapback-actionable.
